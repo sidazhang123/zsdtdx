@@ -50,7 +50,7 @@ def _build_meta(
         "batch_size": int(bench.TASK_BATCH_SIZE),
         "samples": list(samples),
         "date_range": "2018-01-01..2020-12-31",
-        "rule": "15 non-contiguous samples, each 1 day or max 2 consecutive weekdays; exclude months [1,2,10]",
+        "rule": "15 random windows, each 1-3 consecutive business days; exclude months [1,2,5,10]",
         "early_stop_enabled": bool(bench.ENABLE_EARLY_STOP),
         "benchmark_profile": profile,
         "taskset_file": str(taskset_path),

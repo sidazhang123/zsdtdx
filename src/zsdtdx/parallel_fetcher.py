@@ -2194,6 +2194,7 @@ class ParallelKlineFetcher:
         1. 支持“阻塞调用 + 实时队列”模式。
         边界条件：
         1. tasks 为空时返回空列表并发送 done 事件。
+        2. 同步模式固定在主进程内执行 chunk 调度，不使用多进程池。
         """
         self._validate_queue(queue)
         normalized_tasks = [_normalize_task_payload(item) for item in list(tasks or [])]
@@ -2213,25 +2214,16 @@ class ParallelKlineFetcher:
                 queue.put(done_payload)
             return outputs
 
-        force_single_process_parallel = bool(
-            int(self.num_processes) <= 1 and bool(self.task_chunk_force_parallel_when_single_process)
+        _emit_log(
+            "info",
+            (
+                "[Task Sync] 主进程 chunk 执行模式（不启用多进程池） "
+                f"(num_processes_config={self.num_processes}, "
+                f"inproc_workers={self.task_chunk_inproc_future_workers}, "
+                f"任务数={total_tasks})"
+            ),
         )
-        if int(self.num_processes) <= 1 and not force_single_process_parallel:
-            _emit_log("info", f"[Task Sync] 进程数不足，使用串行模式 (进程数: {self.num_processes}, 任务数: {total_tasks})")
-            iterator = self._iter_task_payloads_serial(normalized_tasks)
-        else:
-            if force_single_process_parallel:
-                _emit_log(
-                    "info",
-                    (
-                        "[Task Sync] 主进程 chunk 并发模式（不启用多进程） "
-                        f"(进程数: {self.num_processes}, inproc_workers: {self.task_chunk_inproc_future_workers}, 任务数: {total_tasks})"
-                    ),
-                )
-                iterator = self._iter_task_payloads_inproc_chunked(normalized_tasks)
-            else:
-                _emit_log("info", f"[Task Sync] 默认 chunk 并行模式 (进程数: {self.num_processes}, 任务数: {total_tasks})")
-                iterator = self._iter_task_payloads_parallel_chunked(normalized_tasks)
+        iterator = self._iter_task_payloads_inproc_chunked(normalized_tasks)
 
         for raw_payload in iterator:
             error_text = str(raw_payload.get("error") or "").strip()
@@ -2279,13 +2271,73 @@ class ParallelKlineFetcher:
         """
         self._validate_queue(queue)
         self._ensure_async_prewarm()
+        normalized_tasks = [_normalize_task_payload(item) for item in list(tasks or [])]
+        total_tasks = int(len(normalized_tasks))
+
+        def _run_async_worker() -> List[Dict[str, Any]]:
+            """
+            async 后台执行体：固定走进程池 chunk 并行路径。
+
+            输入：
+            1. 使用外层闭包变量 normalized_tasks/queue/preprocessor_operator。
+            输出：
+            1. 处理后的 task payload 列表。
+            用途：
+            1. 与 sync 主进程路径分离，确保 async 真正落到进程池并行执行。
+            边界条件：
+            1. tasks 为空时返回空列表并发送 done 事件。
+            """
+            outputs: List[Dict[str, Any]] = []
+            success_tasks = 0
+            failed_tasks = 0
+
+            if total_tasks <= 0:
+                done_payload = {
+                    "event": "done",
+                    "total_tasks": 0,
+                    "success_tasks": 0,
+                    "failed_tasks": 0,
+                }
+                if queue is not None:
+                    queue.put(done_payload)
+                return outputs
+
+            _emit_log(
+                "info",
+                (
+                    "[Task Async] 进程池 chunk 执行模式 "
+                    f"(num_processes={self.num_processes}, "
+                    f"inproc_workers={self.task_chunk_inproc_future_workers}, "
+                    f"任务数={total_tasks})"
+                ),
+            )
+            iterator = self._iter_task_payloads_parallel_chunked(normalized_tasks)
+
+            for raw_payload in iterator:
+                error_text = str(raw_payload.get("error") or "").strip()
+                if error_text:
+                    failed_tasks += 1
+                else:
+                    success_tasks += 1
+                processed_payload = self._apply_preprocessor_operator(raw_payload, preprocessor_operator)
+                if processed_payload is None:
+                    continue
+                outputs.append(processed_payload)
+                if queue is not None:
+                    queue.put(processed_payload)
+
+            done_payload = {
+                "event": "done",
+                "total_tasks": int(total_tasks),
+                "success_tasks": int(success_tasks),
+                "failed_tasks": int(failed_tasks),
+            }
+            if queue is not None:
+                queue.put(done_payload)
+            return outputs
+
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="zsdtdx_stock_kline_async")
-        future = executor.submit(
-            self.fetch_stock_tasks_sync,
-            tasks=list(tasks or []),
-            queue=queue,
-            preprocessor_operator=preprocessor_operator,
-        )
+        future = executor.submit(_run_async_worker)
 
         def _cleanup(_future: Future) -> None:
             try:

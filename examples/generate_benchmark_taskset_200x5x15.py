@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Tuple
 import sync_async_benchmark_1000x5x15 as bench
 
 TASKSET_FILENAME = "benchmark_taskset_200x5x15.json"
-SAMPLE_SEED = 20260228
+SAMPLE_SEED = int(bench.SAMPLE_SEED)
 
 
 def _taskset_hash(tasks: List[Dict[str, str]]) -> str:
@@ -86,4 +86,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
