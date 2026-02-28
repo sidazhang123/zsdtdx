@@ -273,7 +273,7 @@ class BaseSocketClient(object):
             if bindport is not None:
                 self.client.bind((bindip, bindport))
             self.client.connect((ip, port))
-        except socket.timeout as e:
+        except socket.timeout:
             # print(str(e))
             log.debug("connection expired")
             self.client.close()
@@ -281,7 +281,7 @@ class BaseSocketClient(object):
             if self.raise_exception:
                 raise TdxConnectionError("connection timeout error")
             return False
-        except Exception as e:
+        except Exception:
             try:
                 self.client.close()
             except Exception:

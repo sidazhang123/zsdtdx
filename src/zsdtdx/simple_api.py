@@ -526,15 +526,19 @@ def get_stock_kline(
     from zsdtdx import get_client, get_stock_kline, StockKlineTask
     
     with get_client() as client:
+        # sync 模式可传入队列，边产出边消费（也可不传，仅用返回值）。
         q = py_queue.Queue()
         result = get_stock_kline(
             task=[
+                # 使用任务对象写法（推荐，字段校验更明确）
                 StockKlineTask(code="600000", freq="d", start_time="2026-02-13", end_time="2026-02-13"),
+                # 也支持 dict 写法
                 {"code": "000001", "freq": "60", "start_time": "2026-02-13", "end_time": "2026-02-14"},
             ],
             queue=q,
             mode="sync",
         )
+        # result 为完整 payload 列表；q 中也会收到相同 data 事件和最终 done 事件
         print(result)
     ```
 
@@ -548,10 +552,11 @@ def get_stock_kline(
             mode="async",
         )
         while True:
+            # 实时读取 data 事件，直到 done
             event = job.queue.get(timeout=20)
             if event.get("event") == "done":
                 break
-            # event="data" 时可按 task/rows/error 逐条处理
+            # event="data" 时可按 task/rows/error 增量处理
             print(event.get("task"), event.get("error"))
         # 等待后台任务完全结束并传播异常
         job.result()
@@ -615,14 +620,15 @@ def get_future_kline(
     from zsdtdx import get_client, get_future_kline
     
     with get_client() as client:
-        # 获取多个期货的多周期数据
+        # 获取多个期货、多个周期的数据，返回一个合并 DataFrame
         df = get_future_kline(
             codes=["CU", "AL"], 
             freq=["d", "60"],
             start_time="2026-02-01", 
             end_time="2026-02-13"
         )
-        print(df)  # 单个 DataFrame 包含所有数据
+        # df 已按统一字段规范输出，可直接过滤 code/freq 继续处理
+        print(df)
     ```
 
     返回:

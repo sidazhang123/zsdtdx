@@ -84,8 +84,7 @@ class GetInstrumentBars(BaseParser):
 
         #pkg = bytearray.fromhex("ff 23")
 
-        #count
-        last_value = 0x00f00000
+        # count
         pkg.extend(struct.pack('<B9sHHIH', market, code, category, 1, start, count))
                                                                 # 这个1还不确定是什么作用，疑似和是否复权有关
         self.send_pkg = pkg

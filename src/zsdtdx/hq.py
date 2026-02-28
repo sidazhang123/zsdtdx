@@ -19,7 +19,6 @@ from collections import OrderedDict
 import pandas as pd
 
 from zsdtdx.base_socket_client import BaseSocketClient, update_last_ack_time
-from zsdtdx.log import log
 from zsdtdx.params import TDXParams
 from zsdtdx.parser.get_company_info_category import GetCompanyInfoCategory
 from zsdtdx.parser.get_company_info_content import GetCompanyInfoContent
@@ -417,8 +416,6 @@ class TdxHq_API(BaseSocketClient):
             if code[0] in ['5', '6', '9'] or code[:3] in ["009", "126", "110", "201", "202", "203", "204"]:
                 return 1
             return 0
-        # 新版一劳永逸偷懒写法zzz
-        market_code = 1 if str(code)[0] == '6' else 0
         # https://github.com/rainx/zsdtdx/issues/33
         # 0 - 深圳， 1 - 上海
 
@@ -429,4 +426,3 @@ class TdxHq_API(BaseSocketClient):
             .set_index('date', drop=False, inplace=False)\
             .drop(['year', 'month', 'day', 'hour', 'minute', 'datetime'], axis=1)[start_date:end_date]
         return data.assign(date=data['date'].apply(lambda x: str(x)[0:10]))
-

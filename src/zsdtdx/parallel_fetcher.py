@@ -424,24 +424,226 @@ def _ensure_worker_client_context():
         return _worker_client_context
 
 
-def _worker_warmup_probe(hold_seconds: float = 0.15) -> Dict[str, Any]:
+def _format_host_port(host: str, port: int) -> str:
+    """
+    组装 host:port 字符串。
+
+    输入：
+    1. host: 主机地址。
+    2. port: 端口号。
+    输出：
+    1. 标准化 host:port 字符串。
+    用途：
+    1. 统一预热阶段 host 标识格式，便于主进程与 worker 共享映射。
+    边界条件：
+    1. host 会 strip；port 非法时由调用方保证不传入。
+    """
+    return f"{str(host).strip()}:{int(port)}"
+
+
+def _summarize_worker_std_host_distribution(worker_std_host_map: Dict[int, str]) -> Dict[str, int]:
+    """
+    汇总 worker 到标准行情 host 的分布统计。
+
+    输入：
+    1. worker_std_host_map: worker_pid -> active_std_host 映射。
+    输出：
+    1. host -> worker_count 统计字典。
+    用途：
+    1. 在 prewarm 摘要中观察 worker 连接是否明显集中在少数 IP。
+    边界条件：
+    1. 空映射返回空字典；空 host 会被自动忽略。
+    """
+    counter: Dict[str, int] = {}
+    for raw_host in list(worker_std_host_map.values()):
+        host = str(raw_host or "").strip()
+        if host == "":
+            continue
+        counter[host] = int(counter.get(host, 0)) + 1
+    return {host: int(counter[host]) for host in sorted(counter.keys())}
+
+
+def _probe_valid_standard_hosts_for_prewarm(config_path: Optional[str]) -> List[str]:
+    """
+    探测标准行情 host 池中的可连接 host 列表（主进程）。
+
+    输入：
+    1. config_path: 配置文件路径；None 时走默认配置。
+    输出：
+    1. 按配置顺序返回可连接的标准行情 host 列表。
+    用途：
+    1. 为 async 预热阶段提供“可用 host 候选池”，用于 worker 分散建连。
+    边界条件：
+    1. 当探测失败或全部不可连时返回空列表，不中断预热主流程。
+    """
+    client = UnifiedTdxClient(config_path=config_path)
+    try:
+        pool = getattr(client, "std_pool", None)
+        if pool is None:
+            return []
+        hosts = list(getattr(pool, "hosts", []) or [])
+        connector = getattr(pool, "_connect_to_index", None)
+        if not callable(connector):
+            ensure_connected = getattr(pool, "ensure_connected", None)
+            get_active_host = getattr(pool, "get_active_host", None)
+            if callable(ensure_connected) and callable(get_active_host) and bool(ensure_connected()):
+                active = str(get_active_host() or "").strip()
+                return [active] if active else []
+            return []
+
+        valid_hosts: List[str] = []
+        seen_hosts: set[str] = set()
+        for index, item in enumerate(hosts):
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                continue
+            host = _format_host_port(str(item[0]), int(item[1]))
+            try:
+                ok = bool(connector(int(index)))
+            except Exception:
+                ok = False
+            if ok and host not in seen_hosts:
+                seen_hosts.add(host)
+                valid_hosts.append(host)
+        return valid_hosts
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _build_worker_standard_host_assignment(
+    warmed_pids: set[int],
+    valid_standard_hosts: List[str],
+) -> Dict[int, str]:
+    """
+    生成 worker -> 标准行情 host 分配计划（轮询）。
+
+    输入：
+    1. warmed_pids: 已探测到的 worker pid 集合。
+    2. valid_standard_hosts: 可连接标准行情 host 列表。
+    输出：
+    1. pid -> host 映射字典。
+    用途：
+    1. 在 prewarm 后让各 worker 尽量分散到不同有效 host。
+    边界条件：
+    1. host 数小于 worker 数时会循环复用 host。
+    2. 任一输入为空时返回空映射。
+    """
+    normalized_hosts = [str(item).strip() for item in list(valid_standard_hosts or []) if str(item).strip()]
+    normalized_pids = sorted({int(pid) for pid in set(warmed_pids or set()) if int(pid) > 0})
+    if not normalized_hosts or not normalized_pids:
+        return {}
+
+    assignment: Dict[int, str] = {}
+    host_count = int(len(normalized_hosts))
+    for idx, pid in enumerate(normalized_pids):
+        assignment[int(pid)] = str(normalized_hosts[idx % host_count])
+    return assignment
+
+
+def _switch_worker_standard_host(preferred_standard_host: Optional[str]) -> Dict[str, Any]:
+    """
+    在当前 worker 进程尝试切换标准行情连接到指定 host。
+
+    输入：
+    1. preferred_standard_host: 期望连接的标准行情 host（host:port）。
+    输出：
+    1. host 切换结果字典（当前 host、目标 host、是否命中目标）。
+    用途：
+    1. 支持 prewarm 阶段按计划让不同 worker 尽量连接不同标准行情 IP。
+    边界条件：
+    1. 目标 host 为空或不存在时保持当前连接并返回未命中状态。
+    2. 切换失败不抛错，返回当前 host，由主进程统计分布后再决定是否重试。
+    """
+    context_client = _ensure_worker_client_context()
+    pool = getattr(context_client, "std_pool", None)
+    get_active_host = getattr(pool, "get_active_host", None)
+    active_before = str(get_active_host() or "").strip() if callable(get_active_host) else ""
+
+    target_host = str(preferred_standard_host or "").strip()
+    switched = False
+    active_after = active_before
+    matched = False
+    if target_host != "" and pool is not None:
+        hosts = list(getattr(pool, "hosts", []) or [])
+        host_index_map: Dict[str, int] = {}
+        for index, item in enumerate(hosts):
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                continue
+            host_index_map[_format_host_port(str(item[0]), int(item[1]))] = int(index)
+
+        connector = getattr(pool, "_connect_to_index", None)
+        target_index = host_index_map.get(target_host)
+        if target_index is not None and callable(connector):
+            try:
+                switched = bool(connector(int(target_index)))
+            except Exception:
+                switched = False
+
+        if callable(get_active_host):
+            active_after = str(get_active_host() or "").strip()
+        matched = bool(active_after == target_host)
+
+    return {
+        "active_std_host_before": active_before,
+        "active_std_host": active_after,
+        "target_std_host": target_host,
+        "std_host_switched": bool(switched),
+        "std_host_matched": bool(matched),
+    }
+
+
+def _worker_warmup_probe(
+    hold_seconds: float = 0.15,
+    preferred_standard_host: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     worker 预热探针：确保常驻连接已建立并返回当前进程 pid。
 
     输入：
     1. hold_seconds: 探针持有时长（秒），用于提高任务分发到不同 worker 的概率。
+    2. preferred_standard_host: 期望绑定的标准行情 host（host:port，可选）。
     输出：
-    1. 预热结果字典，至少包含 `pid`。
+    1. 预热结果字典，包含 `pid` 与标准行情 host 状态。
     用途：
-    1. 在启动阶段触发每个 worker 的首次建连。
+    1. 在启动阶段触发每个 worker 的首次建连，并可按需切换到指定标准 host。
     边界条件：
     1. 建连失败时异常上抛，由主进程聚合并判定启动是否失败。
     """
-    _ensure_worker_client_context()
+    host_state = _switch_worker_standard_host(preferred_standard_host)
     hold = max(0.0, min(float(hold_seconds), 1.0))
     if hold > 0:
         time.sleep(hold)
-    return {"pid": int(os.getpid())}
+    return {"pid": int(os.getpid()), **host_state}
+
+
+def _worker_apply_standard_host_assignment(
+    pid_to_standard_host: Dict[int, str],
+    hold_seconds: float = 0.05,
+) -> Dict[str, Any]:
+    """
+    worker 执行标准行情 host 定向分配任务。
+
+    输入：
+    1. pid_to_standard_host: pid -> host 的分配计划。
+    2. hold_seconds: 任务持有时长（秒）。
+    输出：
+    1. 包含 pid、目标 host、实际 host 的执行结果字典。
+    用途：
+    1. 在主进程完成 worker 探测后，按 pid 精确推动 host 分散绑定。
+    边界条件：
+    1. 当前 pid 未命中分配计划时，仅返回现状，不做主动切换。
+    """
+    current_pid = int(os.getpid())
+    target_host = str((pid_to_standard_host or {}).get(current_pid, "")).strip()
+    payload = _worker_warmup_probe(
+        hold_seconds=float(hold_seconds),
+        preferred_standard_host=target_host if target_host else None,
+    )
+    payload["planned_std_host"] = target_host
+    payload["assignment_applied"] = bool(target_host)
+    return payload
 
 
 def prewarm_parallel_fetcher(
@@ -450,6 +652,7 @@ def prewarm_parallel_fetcher(
     timeout_seconds: float = 60.0,
     max_rounds: int = 3,
     target_workers: Optional[int] = None,
+    spread_standard_hosts: bool = False,
 ) -> Dict[str, Any]:
     """
     预热并行抓取器：强制拉起进程池并建立 worker 常驻连接。
@@ -459,6 +662,7 @@ def prewarm_parallel_fetcher(
     2. timeout_seconds: 预热总超时时间（秒）。
     3. max_rounds: 预热轮次上限。
     4. target_workers: 可选目标进程数；不传时按当前 fetcher 的 num_processes。
+    5. spread_standard_hosts: 是否在 async 预热中对标准行情有效 host 做分散绑定。
     输出：
     1. 预热统计摘要（目标进程数、已预热进程数、pid 列表、耗时等）。
     用途：
@@ -476,7 +680,10 @@ def prewarm_parallel_fetcher(
 
     started_at = time.monotonic()
     warmed_pids: set[int] = set()
+    worker_std_host_map: Dict[int, str] = {}
+    valid_standard_hosts: List[str] = []
     round_errors: list[str] = []
+    assignment_errors: list[str] = []
     rounds_used = 0
 
     _emit_log(
@@ -487,9 +694,31 @@ def prewarm_parallel_fetcher(
             "require_all_workers": bool(require_all_workers),
             "timeout_seconds": float(timeout_budget),
             "max_rounds": int(rounds_limit),
+            "spread_standard_hosts": bool(spread_standard_hosts),
         },
     )
     executor = _get_global_process_pool(target_workers)
+    if bool(spread_standard_hosts):
+        try:
+            valid_standard_hosts = _probe_valid_standard_hosts_for_prewarm(config_path=_active_config_path)
+        except Exception as exc:
+            round_errors.append(f"probe valid standard hosts failed: {exc}")
+            valid_standard_hosts = []
+        if valid_standard_hosts:
+            _emit_log(
+                "info",
+                "[Parallel] 标准行情有效IP探测完成",
+                {
+                    "valid_standard_host_count": int(len(valid_standard_hosts)),
+                    "valid_standard_hosts": list(valid_standard_hosts),
+                },
+            )
+        else:
+            _emit_log(
+                "warning",
+                "[Parallel] 标准行情有效IP探测为空，回退默认预热策略",
+                {"spread_standard_hosts": bool(spread_standard_hosts)},
+            )
 
     for round_idx in range(1, rounds_limit + 1):
         rounds_used = round_idx
@@ -500,7 +729,17 @@ def prewarm_parallel_fetcher(
             break
 
         probe_count = max(target_workers * 2, target_workers)
-        futures = [executor.submit(_worker_warmup_probe, 0.15) for _ in range(probe_count)]
+        if spread_standard_hosts and valid_standard_hosts:
+            futures = [
+                executor.submit(
+                    _worker_warmup_probe,
+                    0.15,
+                    valid_standard_hosts[(round_idx + dispatch_idx) % len(valid_standard_hosts)],
+                )
+                for dispatch_idx in range(probe_count)
+            ]
+        else:
+            futures = [executor.submit(_worker_warmup_probe, 0.15) for _ in range(probe_count)]
         try:
             for future in as_completed(futures, timeout=remaining):
                 try:
@@ -508,6 +747,9 @@ def prewarm_parallel_fetcher(
                     pid = int(payload.get("pid", 0))
                     if pid > 0:
                         warmed_pids.add(pid)
+                        active_std_host = str(payload.get("active_std_host", "")).strip()
+                        if active_std_host:
+                            worker_std_host_map[pid] = active_std_host
                 except Exception as exc:
                     round_errors.append(str(exc))
         except TimeoutError:
@@ -525,10 +767,75 @@ def prewarm_parallel_fetcher(
                 "target_workers": int(target_workers),
                 "warmed_workers": int(len(warmed_pids)),
                 "warmed_pids": sorted(warmed_pids),
+                "std_host_distribution": _summarize_worker_std_host_distribution(worker_std_host_map),
             },
         )
         if len(warmed_pids) >= target_workers:
             break
+
+    assignment_plan: Dict[int, str] = {}
+    assignment_rounds_used = 0
+    assignment_applied_pids: set[int] = set()
+    if spread_standard_hosts and valid_standard_hosts and warmed_pids:
+        assignment_plan = _build_worker_standard_host_assignment(
+            warmed_pids=set(warmed_pids),
+            valid_standard_hosts=list(valid_standard_hosts),
+        )
+        if assignment_plan:
+            for assignment_round in range(1, rounds_limit + 1):
+                assignment_rounds_used = assignment_round
+                elapsed = time.monotonic() - started_at
+                remaining = timeout_budget - elapsed
+                if remaining <= 0:
+                    assignment_errors.append("worker host assignment timeout before round dispatch")
+                    break
+
+                probe_count = max(target_workers * 2, target_workers)
+                futures = [
+                    executor.submit(_worker_apply_standard_host_assignment, assignment_plan, 0.05)
+                    for _ in range(probe_count)
+                ]
+                try:
+                    for future in as_completed(futures, timeout=remaining):
+                        try:
+                            payload = future.result()
+                            pid = int(payload.get("pid", 0))
+                            if pid <= 0:
+                                continue
+                            if pid in assignment_plan:
+                                assignment_applied_pids.add(pid)
+                            active_std_host = str(payload.get("active_std_host", "")).strip()
+                            if active_std_host:
+                                worker_std_host_map[pid] = active_std_host
+                        except Exception as exc:
+                            assignment_errors.append(str(exc))
+                except TimeoutError:
+                    assignment_errors.append("worker host assignment round timeout")
+                finally:
+                    for future in futures:
+                        if not future.done():
+                            future.cancel()
+
+                distribution = _summarize_worker_std_host_distribution(worker_std_host_map)
+                mismatch_count = 0
+                for pid, host in assignment_plan.items():
+                    current_host = str(worker_std_host_map.get(int(pid), "")).strip()
+                    if current_host != str(host).strip():
+                        mismatch_count += 1
+
+                _emit_log(
+                    "info",
+                    "[Parallel] worker 标准行情IP分散分配轮次完成",
+                    {
+                        "round": int(assignment_round),
+                        "planned_workers": int(len(assignment_plan)),
+                        "applied_workers": int(len(assignment_applied_pids)),
+                        "mismatch_workers": int(mismatch_count),
+                        "std_host_distribution": distribution,
+                    },
+                )
+                if len(assignment_applied_pids) >= len(assignment_plan) and mismatch_count <= 0:
+                    break
 
     elapsed_total = round(time.monotonic() - started_at, 3)
     summary: Dict[str, Any] = {
@@ -538,9 +845,20 @@ def prewarm_parallel_fetcher(
         "elapsed_seconds": float(elapsed_total),
         "rounds_used": int(rounds_used),
         "require_all_workers": bool(require_all_workers),
+        "spread_standard_hosts": bool(spread_standard_hosts),
     }
+    if spread_standard_hosts:
+        summary["valid_standard_host_count"] = int(len(valid_standard_hosts))
+        summary["valid_standard_hosts"] = list(valid_standard_hosts)
+        summary["std_worker_host_distribution"] = _summarize_worker_std_host_distribution(worker_std_host_map)
+    if assignment_plan:
+        summary["std_host_assignment_plan"] = {str(pid): host for pid, host in sorted(assignment_plan.items())}
+        summary["std_host_assignment_rounds_used"] = int(assignment_rounds_used)
+        summary["std_host_assignment_applied_workers"] = int(len(assignment_applied_pids))
     if round_errors:
         summary["errors"] = round_errors[:10]
+    if assignment_errors:
+        summary["assignment_errors"] = assignment_errors[:10]
 
     if require_all_workers and len(warmed_pids) < target_workers:
         message = (
@@ -1241,9 +1559,6 @@ class ParallelKlineFetcher:
             default=2,
             minimum=1,
         )
-        self.task_chunk_force_parallel_when_single_process = bool(
-            parallel_cfg.get("task_chunk_force_parallel_when_single_process", False)
-        )
         self.task_chunk_max_inflight_multiplier = self._safe_int_config(
             parallel_cfg.get("task_chunk_max_inflight_multiplier"),
             default=2,
@@ -1262,6 +1577,9 @@ class ParallelKlineFetcher:
             parallel_cfg.get("auto_prewarm_max_rounds"),
             default=3,
             minimum=1,
+        )
+        self.auto_prewarm_spread_standard_hosts = bool(
+            parallel_cfg.get("auto_prewarm_spread_standard_hosts", False)
         )
         
         # 自动计算进程数：CPU物理核心数 * 1.5，不需要用户配置
@@ -1514,6 +1832,7 @@ class ParallelKlineFetcher:
                     "require_all_workers": bool(self.auto_prewarm_require_all_workers),
                     "timeout_seconds": float(self.auto_prewarm_timeout_seconds),
                     "max_rounds": int(self.auto_prewarm_max_rounds),
+                    "spread_standard_hosts": bool(self.auto_prewarm_spread_standard_hosts),
                 },
             )
             try:
@@ -1522,6 +1841,7 @@ class ParallelKlineFetcher:
                     timeout_seconds=float(self.auto_prewarm_timeout_seconds),
                     max_rounds=int(self.auto_prewarm_max_rounds),
                     target_workers=int(target_workers),
+                    spread_standard_hosts=bool(self.auto_prewarm_spread_standard_hosts),
                 )
             except Exception:
                 self._auto_prewarm_last_success = False

@@ -87,7 +87,7 @@ class GetCompanyInfoCategory(BaseParser):
                 b = b[0: p]
             try:
                 n = b.decode("gbk")
-            except Exception as e:
+            except Exception:
                 n = "unkown_str"
             return n
 
@@ -105,4 +105,3 @@ class GetCompanyInfoCategory(BaseParser):
             category.append(entry)
 
         return category
-

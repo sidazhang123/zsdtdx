@@ -99,10 +99,6 @@ parallel:
   # 取值: 正整数
   # 影响: 每个进程一次最多并发执行的 chunk 数。
   task_chunk_inproc_future_workers: 2
-  # 单进程时是否仍启用主进程内 chunk 并发链路（进程内 future 并发）。
-  # 取值: true/false
-  # 影响: true 时即使 num_processes=1 也不会启用多进程，仅在当前主进程内并发。
-  task_chunk_force_parallel_when_single_process: false
   # 父进程提交 chunk 批次的在飞窗口倍率。
   # 取值: 正整数
   # 影响: 在飞 future 上限 = 进程数 × 该倍率。
@@ -123,6 +119,10 @@ parallel:
   # 取值: 正整数
   # 影响: 每轮会向进程池提交探针任务以拉齐 worker 预热状态。
   auto_prewarm_max_rounds: 3
+  # async 自动预热时是否让各 worker 尽量分散连接到不同标准行情有效 IP。
+  # 取值: true/false
+  # 影响: true 时会先探测标准行情有效 IP，再按 worker 轮询分配，降低单 IP 集中压力。
+  auto_prewarm_spread_standard_hosts: false
 
 pagination:
   # 标准行情 get_security_list 单页数量。

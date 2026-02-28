@@ -14,7 +14,6 @@
 # coding=utf-8
 
 from zsdtdx.base_socket_client import BaseSocketClient, update_last_ack_time
-from zsdtdx.log import log
 from zsdtdx.parser.ex_get_history_instrument_bars_range import (
     GetHistoryInstrumentBarsRange,
 )
@@ -256,4 +255,3 @@ class TdxExHq_API(BaseSocketClient):
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
         self.get_instrument_count()
-

@@ -45,8 +45,6 @@ class GetInstrumentCount(BaseParser):
         边界条件：
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
-        pos = 0
         (num,) = struct.unpack("<I", body_buf[19: 19+4])
         return num
-
 

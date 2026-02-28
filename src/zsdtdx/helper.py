@@ -71,14 +71,9 @@ def get_volume(ivol):
     1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
     """
     logpoint = ivol >> (8 * 3)
-    hheax = ivol >> (8 * 3);  # [3]
     hleax = (ivol >> (8 * 2)) & 0xff;  # [2]
     lheax = (ivol >> 8) & 0xff;  # [1]
     lleax = ivol & 0xff;  # [0]
-
-    dbl_1 = 1.0
-    dbl_2 = 2.0
-    dbl_128 = 128.0
 
     dwEcx = logpoint * 2 - 0x7f;
     dwEdx = logpoint * 2 - 0x86;
@@ -97,7 +92,6 @@ def get_volume(ivol):
     dbl_xmm4 = 0
     if hleax > 0x80:
         tmpdbl_xmm3 = 0.0
-        tmpdbl_xmm1 = 0.0
         dwtmpeax = dwEdx + 1
         tmpdbl_xmm3 = pow(2.0, dwtmpeax)
         dbl_xmm0 = pow(2.0, dwEdx) * 128.0

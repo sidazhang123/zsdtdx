@@ -1,6 +1,6 @@
 # zsdtdx 交接文档（工程维护）
 
-更新时间：2026-02-28
+更新时间：2026-03-01
 
 ## 1. 接管基线
 
@@ -32,14 +32,14 @@
 3. async 模式下，父进程通过 `ProcessPoolExecutor.submit(_fetch_chunk_bundle, ...)` 派发 bundle。
 4. worker 进程内通过 `ThreadPoolExecutor` 并发执行 chunk。
 5. chunk 内通过 `unified_client.get_stock_kline_rows_for_chunk_tasks(...)` 拉取并复用缓存。
-6. 结果事件通过队列实时返回，最终追加 `event=done`。
+6. 主进程按 bundle 完成顺序归集结果并写入队列，最终追加 `event=done`。
 
 ## 5. sync/async 当前语义
 
 1. sync：主进程内执行，不要求多进程；可启用主进程 chunk 并发（配置控制）。
 2. sync：返回值为合并后的 `list[payload]`，队列可选。
 3. async：后台任务立即返回 `StockKlineJob`。
-4. async：任意进程/任意完成的 future 会尽快产出到队列。
+4. async：队列产出粒度为“bundle 回收后逐 payload 写入”，不是 worker 内 chunk 完成即跨进程直推。
 5. async：建议消费端按 `queue.get(timeout=20)` 持续读取，直到 `event=done`。
 
 ## 6. 关键配置项（`config.yaml.parallel`）
@@ -47,11 +47,11 @@
 1. `task_chunk_cache_min_tasks`
 2. `task_chunk_inproc_future_workers`
 3. `task_chunk_max_inflight_multiplier`
-4. `task_chunk_force_parallel_when_single_process`
-5. `auto_prewarm_on_async`
-6. `auto_prewarm_require_all_workers`
-7. `auto_prewarm_timeout_seconds`
-8. `auto_prewarm_max_rounds`
+4. `auto_prewarm_on_async`
+5. `auto_prewarm_require_all_workers`
+6. `auto_prewarm_timeout_seconds`
+7. `auto_prewarm_max_rounds`
+8. `auto_prewarm_spread_standard_hosts`
 
 ## 7. 文档联动约束
 
@@ -71,3 +71,11 @@
 1. 小样本：`10 code * 2 freq * 3 time` 验证功能正确性。
 2. 中样本：`200 * 5 * 15` 比较 sync/async 总耗时与失败率。
 3. 队列保障：async 消费端用 `timeout=20s` 验证连续返回与 done 收敛。
+
+## 10. 发布流程（PyPI）
+
+1. 更新版本号：`pyproject.toml` 与 `src/zsdtdx/__init__.py` 保持一致。
+2. 清理产物目录：删除 `dist/` 与旧 `*.egg-info`。
+3. 构建：`py -m build`。
+4. 校验：`py -m twine check dist/*`。
+5. 上传：`py -m twine upload dist/*`（使用用户目录下 `.pypirc` 的 token）。

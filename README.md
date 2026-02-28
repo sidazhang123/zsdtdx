@@ -72,6 +72,7 @@ with get_client() as client:
 - async（多进程）：
   - 父进程将 bundle 提交给 `ProcessPoolExecutor`。
   - worker 进程内再以 `ThreadPoolExecutor` 并发 chunk（上限由 `task_chunk_inproc_future_workers` 控制）。
+  - 队列结果以“bundle 回收”为触发点写入（非 worker 内单 chunk 直接跨进程推送）。
 - sync（单进程）：
   - 不启用多进程时，在主进程内直接并发 chunk future。
 
@@ -91,8 +92,8 @@ with get_client(config_path=r"D:\\configs\\zsdtdx.yaml") as client:
   - `task_chunk_cache_min_tasks`
   - `task_chunk_inproc_future_workers`
   - `task_chunk_max_inflight_multiplier`
-  - `task_chunk_force_parallel_when_single_process`
   - `auto_prewarm_on_async`
+  - `auto_prewarm_spread_standard_hosts`
 
 ## API 概览
 

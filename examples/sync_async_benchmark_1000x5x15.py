@@ -238,14 +238,14 @@ def _capture_fetcher_baseline(fetcher: Any) -> Dict[str, Any]:
             "task_chunk_inproc_future_workers": _safe_int(
                 getattr(fetcher, "task_chunk_inproc_future_workers", 2), 2
             ),
-            "task_chunk_force_parallel_when_single_process": bool(
-                getattr(fetcher, "task_chunk_force_parallel_when_single_process", False)
-            ),
             "task_chunk_max_inflight_multiplier": _safe_int(
                 getattr(fetcher, "task_chunk_max_inflight_multiplier", 2), 2
             ),
             "task_chunk_cache_min_tasks": _safe_int(getattr(fetcher, "task_chunk_cache_min_tasks", 3), 3),
             "auto_prewarm_on_async": bool(getattr(fetcher, "auto_prewarm_on_async", True)),
+            "auto_prewarm_spread_standard_hosts": bool(
+                getattr(fetcher, "auto_prewarm_spread_standard_hosts", False)
+            ),
         }
     return dict(_FETCHER_BASELINE)
 
@@ -482,25 +482,26 @@ def _configure_fetcher_for_mode(fetcher: Any, mode: str, async_process_workers: 
     fetcher.num_processes = int(target_workers)
     fetcher.task_chunk_cache_min_tasks = int(baseline["task_chunk_cache_min_tasks"])
     fetcher.task_chunk_max_inflight_multiplier = int(baseline["task_chunk_max_inflight_multiplier"])
-    fetcher.task_chunk_force_parallel_when_single_process = bool(
-        baseline["task_chunk_force_parallel_when_single_process"]
-    )
     fetcher.task_chunk_inproc_future_workers = int(baseline["task_chunk_inproc_future_workers"])
 
     # async 档位保留自动预热；sync 档位关闭自动预热避免额外预热开销干扰统计。
     if mode_key == "async":
         fetcher.auto_prewarm_on_async = bool(baseline["auto_prewarm_on_async"])
+        fetcher.auto_prewarm_spread_standard_hosts = bool(
+            baseline.get("auto_prewarm_spread_standard_hosts", False)
+        )
     else:
         fetcher.auto_prewarm_on_async = False
+        fetcher.auto_prewarm_spread_standard_hosts = False
 
     return {
         "mode": mode_key,
         "num_processes": int(fetcher.num_processes),
         "task_chunk_cache_min_tasks": int(fetcher.task_chunk_cache_min_tasks),
         "task_chunk_inproc_future_workers": int(fetcher.task_chunk_inproc_future_workers),
-        "task_chunk_force_parallel_when_single_process": bool(fetcher.task_chunk_force_parallel_when_single_process),
         "task_chunk_max_inflight_multiplier": int(fetcher.task_chunk_max_inflight_multiplier),
         "auto_prewarm_on_async": bool(fetcher.auto_prewarm_on_async),
+        "auto_prewarm_spread_standard_hosts": bool(fetcher.auto_prewarm_spread_standard_hosts),
     }
 
 
@@ -523,19 +524,17 @@ def configure_sync_chunk_sequential_no_future(fetcher: Any, process_workers: Opt
         fetcher.num_processes = max(1, int(process_workers))
     fetcher.task_chunk_cache_min_tasks = int(baseline["task_chunk_cache_min_tasks"])
     fetcher.task_chunk_max_inflight_multiplier = int(baseline["task_chunk_max_inflight_multiplier"])
-    fetcher.task_chunk_force_parallel_when_single_process = bool(
-        baseline["task_chunk_force_parallel_when_single_process"]
-    )
     fetcher.task_chunk_inproc_future_workers = 1
     fetcher.auto_prewarm_on_async = False
+    fetcher.auto_prewarm_spread_standard_hosts = False
     return {
         "mode": "sync",
         "num_processes": int(fetcher.num_processes),
         "task_chunk_cache_min_tasks": int(fetcher.task_chunk_cache_min_tasks),
         "task_chunk_inproc_future_workers": int(fetcher.task_chunk_inproc_future_workers),
-        "task_chunk_force_parallel_when_single_process": bool(fetcher.task_chunk_force_parallel_when_single_process),
         "task_chunk_max_inflight_multiplier": int(fetcher.task_chunk_max_inflight_multiplier),
         "auto_prewarm_on_async": bool(fetcher.auto_prewarm_on_async),
+        "auto_prewarm_spread_standard_hosts": bool(fetcher.auto_prewarm_spread_standard_hosts),
         "sync_chunk_policy": "sequential_inproc_no_future",
     }
 
