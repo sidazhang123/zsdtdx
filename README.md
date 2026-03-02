@@ -92,7 +92,12 @@ with get_client(config_path=r"D:\\configs\\zsdtdx.yaml") as client:
   - `task_chunk_cache_min_tasks`
   - `task_chunk_inproc_future_workers`
   - `task_chunk_max_inflight_multiplier`
+  - `chunk_reconnect_on_unavailable`
+  - `chunk_reconnect_max_attempts`
   - `auto_prewarm_on_async`
+  - `auto_prewarm_require_all_workers`
+  - `auto_prewarm_timeout_seconds`
+  - `auto_prewarm_max_rounds`
   - `auto_prewarm_spread_standard_hosts`
 
 ## API 概览

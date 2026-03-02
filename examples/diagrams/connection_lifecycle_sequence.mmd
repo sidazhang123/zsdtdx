@@ -1,0 +1,83 @@
+﻿%%{init: {
+  "theme": "default",
+  "sequence": {
+    "actorMargin": 90,
+    "diagramMarginX": 90,
+    "diagramMarginY": 40,
+    "messageMargin": 40,
+    "boxMargin": 16,
+    "boxTextMargin": 8,
+    "noteMargin": 12,
+    "noteAlign": "left"
+  },
+  "flowchart": {
+    "useMaxWidth": false,
+    "htmlLabels": true,
+    "curve": "basis"
+  }
+}}%%
+sequenceDiagram
+autonumber
+participant U as 压测脚本
+participant API as get_stock_kline(async)
+participant F as ParallelKlineFetcher
+participant PP as ProcessPool(P个worker)
+participant W as Worker进程
+participant WM as Worker主线程
+participant WT as Worker内chunk线程
+participant C as UnifiedTdxClient
+participant SP as std_pool
+participant EP as ex_pool
+
+U->>API: 一次性提交全量tasks
+API->>F: fetch_stock_tasks_async()
+F->>F: _ensure_async_prewarm()
+
+alt 首次调用或进程池epoch变化
+  F->>PP: prewarm_parallel_fetcher(P, W)
+  loop 每个worker
+    PP->>W: _worker_warmup_probe()
+    W->>WM: _ensure_worker_client_context()
+    WM->>C: __enter__()
+    C->>SP: ensure_connected()（主线程建std连接）
+    C->>EP: ensure_connected()（主线程建ex连接）
+    alt W > 1
+      WM->>WT: _prewarm_worker_chunk_executor_connections(W)
+      loop 预热线程池
+        WT->>SP: ensure_connected()（线程本地std连接）
+        WT->>EP: ensure_connected()（线程本地ex连接）
+      end
+    end
+  end
+else 已预热
+  F-->>F: 跳过
+end
+
+F->>PP: submit _fetch_chunk_bundle(...inproc_workers=W)
+PP->>W: 执行bundle
+W->>WM: _ensure_worker_client_context()（复用）
+alt W<=1 或 bundle仅1个chunk
+  WM->>WM: 串行 _fetch_one_task_chunk
+else W>1 且多chunk
+  WM->>WT: _get_worker_chunk_executor(W)（进程级复用线程池）
+  par 每个chunk
+    WT->>SP: pool.call(...) 或
+    WT->>EP: pool.call(...)
+  end
+end
+
+opt 命中“连接不可用”且允许重建
+  WT->>SP: reset_thread_connection(reconnect=True)
+  Note right of SP: 先disconnect旧socket，再新建
+end
+
+W->>WM: _cleanup_worker_dead_thread_connections()
+Note right of WM: 只清理“已退出线程”连接，不动alive线程
+
+opt worker退出 / 强制回收
+  W->>WM: _close_worker_client_context()
+  WM->>WM: _shutdown_worker_chunk_executor()
+  WM->>C: __exit__ / close()
+  C->>SP: close()（关该进程该pool所有线程连接）
+  C->>EP: close()（同上）
+end

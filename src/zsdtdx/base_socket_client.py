@@ -3,14 +3,14 @@
 
 职责：
 1. 提供底层Socket通信能力，封装TCP连接管理。
-2. 实现心跳保活、自动重试、流量统计等功能。
+2. 实现心跳保活、流量统计等功能。
 3. 提供统一请求/响应处理框架。
 4. 通过atexit注册清理函数，确保程序退出时关闭残留连接。
 
 边界：
 1. 本模块为底层模块，不处理业务逻辑（如市场路由、分页等）。
 2. 所有子类应实现setup()方法完成协议初始化。
-3. 连接异常时根据配置决定是否重试或抛出异常。
+3. 连接异常时根据 `raise_exception` 配置决定返回空值或抛出异常。
 """
 
 # coding=utf-8
@@ -81,9 +81,9 @@ def update_last_ack_time(func):
     输出：
     1. 返回包装后的调用函数。
     用途：
-    1. 在每次请求前更新时间戳，并在失败时按策略重试。
+    1. 在每次请求前更新时间戳，并统一处理失败返回。
     边界条件：
-    1. `auto_retry` 与 `raise_exception` 决定失败重试与异常抛出行为。
+    1. 当 `raise_exception=True` 时，失败会抛出 `TdxFunctionCallError`。
     """
 
     @functools.wraps(func)
@@ -95,39 +95,21 @@ def update_last_ack_time(func):
         输出：
         1. 返回原函数结果；失败时可能返回 `None` 或抛异常。
         用途：
-        1. 执行底层请求并在异常时按重试策略自动恢复。
+        1. 执行底层请求并处理异常结果。
         边界条件：
-        1. 当 `raise_exception=True` 且多次重试失败时抛 `TdxFunctionCallError`。
+        1. 当 `raise_exception=True` 且请求失败时抛 `TdxFunctionCallError`。
         """
         self.last_ack_time = time.time()
         log.debug("last ack time update to " + str(self.last_ack_time))
-        current_exception = None
         try:
             ret = func(self, *args, **kw)
         except Exception as e:
-            current_exception = e
             log.debug("hit exception on req exception is " + str(e))
-            if self.auto_retry:
-                for time_interval in self.retry_strategy.gen():
-                    try:
-                        time.sleep(time_interval)
-                        self.disconnect()
-                        self.connect(self.ip, self.port)
-                        ret = func(self, *args, **kw)
-                        if ret:
-                            return ret
-                    except Exception as retry_e:
-                        current_exception = retry_e
-                        log.debug(
-                            "hit exception on *retry* req exception is " + str(retry_e))
-
-                log.debug("perform auto retry on req ")
-
             self.last_transaction_failed = True
             ret = None
             if self.raise_exception:
                 to_raise = TdxFunctionCallError("calling function error")
-                to_raise.original_exception = current_exception if current_exception else None
+                to_raise.original_exception = e
                 raise to_raise
         """
         如果raise_exception=True 抛出异常
@@ -135,45 +117,6 @@ def update_last_ack_time(func):
         """
         return ret
     return wrapper
-
-
-class RetryStrategy(object):
-    @classmethod
-    def gen(cls):
-        """
-        输入：
-        1. 无显式输入参数。
-        输出：
-        1. 返回值语义由函数实现定义；无返回时为 `None`。
-        用途：
-        1. 执行 `gen` 对应的协议处理、数据解析或调用适配逻辑。
-        边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
-        """
-        raise NotImplementedError("need to override")
-
-
-class DefaultRetryStrategy(RetryStrategy):
-    """
-    默认的重试策略，您可以通过写自己的重试策略替代本策略, 改策略主要实现gen方法，该方法是一个生成器，
-    返回下次重试的间隔时间, 单位为秒，我们会使用 time.sleep在这里同步等待之后进行重新connect,然后再重新发起
-    源请求，直到gen结束。
-    """
-    @classmethod
-    def gen(cls):
-        # 默认重试4次 ... 时间间隔如下
-        """
-        输入：
-        1. 无显式输入参数。
-        输出：
-        1. 返回值语义由函数实现定义；无返回时为 `None`。
-        用途：
-        1. 执行 `gen` 对应的协议处理、数据解析或调用适配逻辑。
-        边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
-        """
-        for time_interval in [0.1, 0.5, 1, 2]:
-            yield time_interval
 
 
 class TrafficStatSocket(socket.socket):
@@ -213,17 +156,17 @@ class BaseSocketClient(object):
     
     职责：
     1. 管理TCP连接的生命周期（建立、断开、心跳）。
-    2. 提供自动重试和异常处理机制。
+    2. 提供异常处理机制。
     3. 通过atexit注册确保程序退出时清理连接。
     
     边界：
     1. 子类需实现setup()方法完成协议初始化。
-    2. 连接异常时根据auto_retry和raise_exception配置决定行为。
+    2. 连接异常时根据raise_exception配置决定行为。
     """
 
-    def __init__(self, multithread=False, heartbeat=False, auto_retry=False, raise_exception=False):
+    def __init__(self, multithread=False, heartbeat=False, raise_exception=False):
         """
-        输入：是否多线程、是否启用心跳、是否自动重试、是否抛出异常
+        输入：是否多线程、是否启用心跳、是否抛出异常
         输出：无
         用途：初始化客户端
         边界：注册到全局清理列表，确保程序退出时自动关闭
@@ -243,8 +186,6 @@ class BaseSocketClient(object):
         self.last_transaction_failed = False
         self.ip = None
         self.port = None
-        self.auto_retry = auto_retry
-        self.retry_strategy = DefaultRetryStrategy()
         self.raise_exception = raise_exception
         
         # 注册到全局清理列表

@@ -1,4 +1,3 @@
-
 """统一封装 zsdtdx 的高层客户端，屏蔽分页、市场和连接细节。"""
 
 from __future__ import annotations
@@ -10,6 +9,7 @@ import math
 import re
 import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -18,9 +18,8 @@ import yaml
 
 from zsdtdx.exhq import TdxExHq_API
 from zsdtdx.hq import TdxHq_API
-from zsdtdx.wrapper.network_policy import enforce_no_proxy, get_proxy_env_snapshot
 
-_PACKAGE_DIR = Path(__file__).resolve().parents[1]
+_PACKAGE_DIR = Path(__file__).resolve().parent
 _DEFAULT_CONFIG_PATH = _PACKAGE_DIR / "config.yaml"
 
 
@@ -56,6 +55,8 @@ class PersistentFailoverPool:
         
         # P0改造：线程本地存储
         self._local = threading.local()
+        self._thread_registry_lock = threading.Lock()
+        self._thread_registry: Dict[int, Dict[str, Any]] = {}
         
         # 全局统计和hosts需要锁保护
         self._stats_lock = threading.Lock()
@@ -71,11 +72,77 @@ class PersistentFailoverPool:
         self._used_hosts_lock = threading.Lock()
         self._global_used_hosts = set()
 
+    def _prune_dead_thread_data(self):
+        """
+        清理已退出线程的连接数据并关闭残留连接。
+
+        输入：
+        1. 无显式输入参数。
+        输出：
+        1. 无返回值。
+        用途：
+        1. 避免 thread-local 所在线程结束后遗留未关闭 socket/heartbeat。
+        边界条件：
+        1. 清理过程中的断开异常会被忽略，确保调用链稳定。
+        """
+        stale_data_list: List[Dict[str, Any]] = []
+        with self._thread_registry_lock:
+            stale_idents: List[int] = []
+            for ident, entry in list(self._thread_registry.items()):
+                thread_ref = entry.get("thread_ref")
+                thread_obj = thread_ref() if callable(thread_ref) else None
+                if thread_obj is not None and bool(thread_obj.is_alive()):
+                    continue
+                stale_idents.append(int(ident))
+
+            for ident in stale_idents:
+                entry = self._thread_registry.pop(int(ident), None)
+                if not isinstance(entry, dict):
+                    continue
+                data = entry.get("data")
+                if isinstance(data, dict):
+                    stale_data_list.append(data)
+
+        for data in stale_data_list:
+            self._disconnect_api(data.get("api"))
+            data["api"] = None
+            data["active_index"] = -1
+
+    def cleanup_dead_thread_connections(self):
+        """
+        对外暴露的死线程连接清理入口。
+
+        输入：
+        1. 无显式输入参数。
+        输出：
+        1. 无返回值。
+        用途：
+        1. 允许上层在批次边界主动回收已退出线程遗留的连接。
+        边界条件：
+        1. 重复调用安全；无死线程时无副作用。
+        """
+        self._prune_dead_thread_data()
+
     def _get_thread_data(self):
         """获取当前线程的连接数据。"""
-        if not hasattr(self._local, 'data'):
-            self._local.data = {'api': None, 'active_index': -1}
-        return self._local.data
+        self._prune_dead_thread_data()
+        data = getattr(self._local, "data", None)
+        if not isinstance(data, dict):
+            data = {"api": None, "active_index": -1}
+            self._local.data = data
+
+        current_thread = threading.current_thread()
+        thread_ident = int(current_thread.ident or 0)
+        if thread_ident <= 0:
+            thread_ident = int(id(current_thread))
+        with self._thread_registry_lock:
+            entry = self._thread_registry.get(thread_ident)
+            if not isinstance(entry, dict) or entry.get("data") is not data:
+                self._thread_registry[thread_ident] = {
+                    "data": data,
+                    "thread_ref": weakref.ref(current_thread),
+                }
+        return data
 
     def _disconnect_api(self, api_obj):
         """输入 API 对象，输出无；用于安全断开；断开异常会忽略。"""
@@ -89,7 +156,6 @@ class PersistentFailoverPool:
     def _connect_to_index(self, index: int) -> bool:
         """输入 host 索引，输出连接结果；用于切换连接；连接失败返回 False。"""
         host, port = self.hosts[index]
-        enforce_no_proxy()
         api = self.api_cls(**self.api_kwargs)
         try:
             ok = api.connect(host, port, time_out=self.connect_timeout)
@@ -127,6 +193,31 @@ class PersistentFailoverPool:
         """输入无，输出连接是否可用；用于外部预连接；失败返回 False。"""
         return self._ensure_connected()
 
+    def reset_thread_connection(self, reconnect: bool = True) -> bool:
+        """
+        重置当前线程连接并按需重连。
+
+        输入：
+        1. reconnect: 是否在重置后立即尝试重连。
+        输出：
+        1. bool，True 表示重置（及可选重连）成功。
+        用途：
+        1. 在“当前线程连接已失效”场景下，仅修复当前线程连接，避免影响其他线程。
+        边界条件：
+        1. 仅作用于线程本地连接；不会关闭其他线程中的活跃连接。
+        """
+        thread_data = self._get_thread_data()
+        old_api = thread_data["api"]
+        thread_data["api"] = None
+        thread_data["active_index"] = -1
+        self._disconnect_api(old_api)
+        if not bool(reconnect):
+            return True
+        try:
+            return bool(self._ensure_connected())
+        except Exception:
+            return False
+
     def _rotate(self) -> bool:
         """输入无，输出轮换结果；用于失败切换；无可用 host 返回 False。"""
         with self._stats_lock:
@@ -152,7 +243,6 @@ class PersistentFailoverPool:
 
     def _invoke(self, method_name: str, allow_none: bool, *args, **kwargs):
         """输入方法参数，输出调用结果；用于统一单次调用；None 按 allow_none 处理。"""
-        enforce_no_proxy()
         thread_data = self._get_thread_data()
         result = getattr(thread_data['api'], method_name)(*args, **kwargs)
         if result is None:
@@ -244,11 +334,42 @@ class PersistentFailoverPool:
             return self._global_stats.copy()
 
     def close(self):
-        """输入无，输出无；用于释放连接；重复调用安全。"""
-        thread_data = self._get_thread_data()
-        self._disconnect_api(thread_data['api'])
-        thread_data['api'] = None
-        thread_data['active_index'] = -1
+        """
+        输入无，输出无；用于释放连接；重复调用安全。
+
+        输入：
+        1. 无显式输入参数。
+        输出：
+        1. 无返回值。
+        用途：
+        1. 关闭该池在所有线程中建立过的连接，防止跨线程残留 socket。
+        边界条件：
+        1. 连接关闭异常会被忽略；关闭后线程再次调用会自动重建连接状态。
+        """
+        self._prune_dead_thread_data()
+        tracked_data: List[Dict[str, Any]] = []
+        with self._thread_registry_lock:
+            for entry in self._thread_registry.values():
+                if not isinstance(entry, dict):
+                    continue
+                data = entry.get("data")
+                if isinstance(data, dict):
+                    tracked_data.append(data)
+            self._thread_registry.clear()
+
+        current_data = getattr(self._local, "data", None)
+        if isinstance(current_data, dict):
+            tracked_data.append(current_data)
+
+        seen: set[int] = set()
+        for data in tracked_data:
+            token = int(id(data))
+            if token in seen:
+                continue
+            seen.add(token)
+            self._disconnect_api(data.get("api"))
+            data["api"] = None
+            data["active_index"] = -1
 
 
 class UnifiedTdxClient:
@@ -288,8 +409,6 @@ class UnifiedTdxClient:
         resolved_config_path = self._resolve_config_path(config_path)
         self.config_path = str(resolved_config_path)
         self.config = self._load_config(resolved_config_path)
-        if self.config.get("network", {}).get("force_no_proxy", True):
-            enforce_no_proxy()
 
         self.pagination = self.config.get("pagination", {})
         self.output_cfg = self.config.get("output", {})
@@ -301,15 +420,14 @@ class UnifiedTdxClient:
 
         pool_cfg = self.config.get("pool", {})
         connect_timeout = float(pool_cfg.get("connect_timeout", 1.5))
-        max_retry = int(pool_cfg.get("max_retry", 6))
+        max_retry = int(pool_cfg.get("max_retry", 3))
         same_connection_retry_times = int(pool_cfg.get("same_connection_retry_times", 2))
-        same_connection_retry_interval_ms = int(pool_cfg.get("same_connection_retry_interval_ms", 100))
-        same_host_reconnect_times = int(pool_cfg.get("same_host_reconnect_times", 1))
-        same_host_reconnect_interval_ms = int(pool_cfg.get("same_host_reconnect_interval_ms", 200))
+        same_connection_retry_interval_ms = int(pool_cfg.get("same_connection_retry_interval_ms", 800))
+        same_host_reconnect_times = int(pool_cfg.get("same_host_reconnect_times", 3))
+        same_host_reconnect_interval_ms = int(pool_cfg.get("same_host_reconnect_interval_ms", 50))
         api_kwargs = {
             "multithread": True,
             "heartbeat": bool(pool_cfg.get("heartbeat", True)),
-            "auto_retry": bool(pool_cfg.get("auto_retry", False)),
             "raise_exception": False,
         }
 
@@ -559,22 +677,13 @@ class UnifiedTdxClient:
         return market_name in target_market_names
 
     def _is_hk_stock_ex_no_df(self, market: int, code: str) -> bool:
-        """输入扩展市场与代码，输出是否港股；用于无 DataFrame 路由；默认按5位数字过滤。"""
+        """输入扩展市场与代码，输出是否港股；用于无 DataFrame 路由；固定按5位数字过滤。"""
         if not self._is_hk_market_ex_no_df(int(market)):
             return False
         raw_code = str(code).strip()
         if not raw_code.isdigit():
             return False
-        raw_lengths = self.market_rules.get("include_hk_code_lengths", [5])
-        valid_lengths = set()
-        for item in raw_lengths:
-            try:
-                valid_lengths.add(int(item))
-            except Exception:
-                continue
-        if not valid_lengths:
-            valid_lengths = {5}
-        return len(raw_code) in valid_lengths
+        return len(raw_code) == 5
 
     def _stock_code_with_prefix_no_df(self, source: str, market: int, code: str) -> str:
         """输入来源市场与代码，输出前缀代码；用于无 DataFrame 输出；未知来源回退原代码。"""
@@ -595,7 +704,7 @@ class UnifiedTdxClient:
         if self._stock_route and not refresh:
             return
 
-        security_page = int(self.pagination.get("standard_security_list_page_size", 1000))
+        security_page = int(self.pagination.get("standard_security_list_page_size", 800))
         route: Dict[str, Dict[str, Any]] = {}
 
         for market in [0, 1]:
@@ -1190,22 +1299,13 @@ class UnifiedTdxClient:
         return market_name in target_market_names
 
     def _is_hk_stock_ex(self, market: int, code: str) -> bool:
-        """输入扩展市场与代码，输出是否港股；用于股票路由；默认按5位数字代码过滤。"""
+        """输入扩展市场与代码，输出是否港股；用于股票路由；固定按5位数字代码过滤。"""
         if not self._is_hk_market_ex(int(market)):
             return False
         raw_code = str(code).strip()
         if not raw_code.isdigit():
             return False
-        raw_lengths = self.market_rules.get("include_hk_code_lengths", [5])
-        valid_lengths = set()
-        for item in raw_lengths:
-            try:
-                valid_lengths.add(int(item))
-            except Exception:
-                continue
-        if not valid_lengths:
-            valid_lengths = {5}
-        return len(raw_code) in valid_lengths
+        return len(raw_code) == 5
 
     def _stock_code_with_prefix(self, source: str, market: int, code: str) -> str:
         """输入来源市场与代码，输出带交易所前缀代码；用于统一股票输出；未知来源回退原代码。"""
@@ -1390,7 +1490,7 @@ class UnifiedTdxClient:
         if self._instrument_cache is not None and not refresh:
             return self._instrument_cache
 
-        page_size = int(self.pagination.get("extended_instrument_info_page_size", 1000))
+        page_size = int(self.pagination.get("extended_instrument_info_page_size", 800))
         start = 0
         rows: List[Dict[str, Any]] = []
 
@@ -1413,7 +1513,7 @@ class UnifiedTdxClient:
                 return self._stock_df.copy()
             return self._stock_df.to_dict(orient="records")
 
-        security_page = int(self.pagination.get("standard_security_list_page_size", 1000))
+        security_page = int(self.pagination.get("standard_security_list_page_size", 800))
         records = []
 
         for market in [0, 1]:
@@ -2285,7 +2385,6 @@ class UnifiedTdxClient:
         return {
             "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
             "config_path": self.config_path,
-            "proxy_env": json.dumps(get_proxy_env_snapshot(), ensure_ascii=False),
             "std_active_host": self.std_pool.get_active_host(),
             "ex_active_host": self.ex_pool.get_active_host(),
             "std_used_hosts": json.dumps(self.std_pool.get_used_hosts(), ensure_ascii=False),
@@ -2299,6 +2398,22 @@ class UnifiedTdxClient:
             "std_rotations": int(std_stats.get("rotations", 0)),
             "ex_rotations": int(ex_stats.get("rotations", 0)),
         }
+
+    def cleanup_dead_thread_connections(self):
+        """
+        输入无，输出无；用于回收已退出线程遗留连接；重复调用安全。
+
+        输入：
+        1. 无显式输入参数。
+        输出：
+        1. 无返回值。
+        用途：
+        1. 在并发批次边界主动清理线程生命周期结束后未显式关闭的连接。
+        边界条件：
+        1. 任一连接池清理异常会向上抛出，由调用方决定是否吞掉异常。
+        """
+        self.std_pool.cleanup_dead_thread_connections()
+        self.ex_pool.cleanup_dead_thread_connections()
 
     def close(self):
         """输入无，输出无；用于关闭连接池；重复调用安全。"""

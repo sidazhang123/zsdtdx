@@ -5,6 +5,7 @@ __pycache__/
 # Build artifacts
 build/
 dist/
+dist_v*/
 *.egg-info/
 
 # Virtual environments
@@ -16,6 +17,14 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.idea/
 
 # Local temp
 .tmp_pytdx_meta/
+examples/*_run.log
+examples/*_result.json
+examples/benchmark_taskset_1000x5x15.json
+examples/pytdx_standard_hosts_probe_result.json
+examples/async_1000x5x15_connection_check_result.json
+examples/diagrams/*.svg
+examples/diagrams/*.png

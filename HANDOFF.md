@@ -1,20 +1,20 @@
 # zsdtdx 交接文档（工程维护）
 
-更新时间：2026-03-01
+更新时间：2026-03-02
 
 ## 1. 接管基线
 
 1. 对外入口：`src/zsdtdx/simple_api.py` 的 `get_*` 系列函数。
 2. 推荐调用方式：`with get_client() as client:` 中复用同一上下文。
 3. 并行核心：`src/zsdtdx/parallel_fetcher.py`。
-4. 数据封装核心：`src/zsdtdx/wrapper/unified_client.py`。
+4. 数据封装核心：`src/zsdtdx/unified_client.py`。
 5. 配置入口：`src/zsdtdx/config.yaml`。
 
 ## 2. 分层结构
 
 1. API 层：`simple_api.py`
 2. 并行层：`parallel_fetcher.py`
-3. 封装层：`wrapper/unified_client.py`
+3. 封装层：`unified_client.py`
 4. 协议层：`parser/*.py`
 5. 网络层：`base_socket_client.py`
 
@@ -47,11 +47,13 @@
 1. `task_chunk_cache_min_tasks`
 2. `task_chunk_inproc_future_workers`
 3. `task_chunk_max_inflight_multiplier`
-4. `auto_prewarm_on_async`
-5. `auto_prewarm_require_all_workers`
-6. `auto_prewarm_timeout_seconds`
-7. `auto_prewarm_max_rounds`
-8. `auto_prewarm_spread_standard_hosts`
+4. `chunk_reconnect_on_unavailable`
+5. `chunk_reconnect_max_attempts`
+6. `auto_prewarm_on_async`
+7. `auto_prewarm_require_all_workers`
+8. `auto_prewarm_timeout_seconds`
+9. `auto_prewarm_max_rounds`
+10. `auto_prewarm_spread_standard_hosts`
 
 ## 7. 文档联动约束
 
@@ -61,7 +63,7 @@
 
 ## 8. 常见风险与排障
 
-1. 连接风险：hosts 不可达会导致全链路失败，先检查 `hosts.*` 与 `network.force_no_proxy`。
+1. 连接风险：hosts 不可达会导致全链路失败，先检查 `hosts.*` 连通性与配置内容。
 2. 超时风险：并行总超时触发后会回收未完成 future；确认 `parallel_total_timeout_seconds` 与任务规模匹配。
 3. 吞吐异常：优先检查 `task_chunk_inproc_future_workers`、`task_chunk_max_inflight_multiplier`。
 4. 进程残留：测试脚本结束后应确认无残留 python 进程。

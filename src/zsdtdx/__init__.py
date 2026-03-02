@@ -1,4 +1,4 @@
-﻿"""zsdtdx 对外导出入口。"""
+"""zsdtdx 对外导出入口。"""
 
 from zsdtdx.simple_api import (
     StockKlineTask,
@@ -15,9 +15,9 @@ from zsdtdx.simple_api import (
     get_supported_markets,
 )
 from zsdtdx.parallel_fetcher import StockKlineJob
-from zsdtdx.wrapper.unified_client import UnifiedTdxClient
+from zsdtdx.unified_client import UnifiedTdxClient
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "__version__",
@@ -36,3 +36,4 @@ __all__ = [
     "get_runtime_failures",
     "get_runtime_metadata",
 ]
+

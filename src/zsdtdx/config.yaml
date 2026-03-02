@@ -10,12 +10,6 @@
 #      - "v2"
 # 4) 字符串中包含 ":" 等特殊字符时建议加双引号。
 
-network:
-  # 是否强制无代理直连。
-  # 取值: true/false
-  # 影响: true 时会在运行时清理代理环境变量，所有行情请求不走代理。
-  force_no_proxy: true
-
 client:
   # with get_client(...) 进入时是否预连接标准/扩展连接池。
   # 取值: true/false
@@ -53,28 +47,23 @@ pool:
   connect_timeout: 1.5
   # 封装层单次调用总重试预算（含同连接重试/同host重连/轮换IP）。
   # 取值: 正整数，建议 >= 1
-  max_retry: 6
+  max_retry: 3
   # 同一连接上的快速重试次数（不重连）。
   # 取值: 非负整数
   same_connection_retry_times: 2
   # 同一连接快速重试间隔（毫秒）。
   # 取值: 非负整数
-  same_connection_retry_interval_ms: 100
+  same_connection_retry_interval_ms: 800
   # 同一 host 重连尝试次数（disconnect -> connect 同 host）。
   # 取值: 非负整数
-  same_host_reconnect_times: 1
+  same_host_reconnect_times: 3
   # 同一 host 重连间隔（毫秒）。
   # 取值: 非负整数
-  same_host_reconnect_interval_ms: 200
+  same_host_reconnect_interval_ms: 50
   # 是否开启底层心跳线程。
   # 取值: true/false
   # 影响: true 可降低长时间空闲断连概率。
   heartbeat: true
-  # 是否开启底层 zsdtdx auto_retry。
-  # 取值: true/false
-  # 影响: true 时底层异常会自行 disconnect+reconnect；通常建议 false，
-  #      由封装层统一控制重试与 IP 轮换，避免双重重试带来额外抖动。
-  auto_retry: false
 
 parallel:
   # 单次并行抓取的总超时（秒）。
@@ -94,15 +83,23 @@ parallel:
   # chunk 级缓存启用阈值（以 get_stock_kline(task) 任务链路计）。
   # 取值: 正整数
   # 影响: 当 code+freq 的 chunk 任务数达到阈值时启用轻量缓存。
-  task_chunk_cache_min_tasks: 3
+  task_chunk_cache_min_tasks: 2
   # worker 进程内 chunk 级 future 并发数。
   # 取值: 正整数
   # 影响: 每个进程一次最多并发执行的 chunk 数。
-  task_chunk_inproc_future_workers: 2
+  task_chunk_inproc_future_workers: 3
   # 父进程提交 chunk 批次的在飞窗口倍率。
   # 取值: 正整数
   # 影响: 在飞 future 上限 = 进程数 × 该倍率。
   task_chunk_max_inflight_multiplier: 2
+  # chunk 命中“连接不可用”错误时，是否在 worker 当前线程重建标准连接后重试。
+  # 取值: true/false
+  # 影响: true 时可降低长任务尾部因连接失效导致的批量失败。
+  chunk_reconnect_on_unavailable: true
+  # chunk 命中“连接不可用”后，线程级重建连接的最大重试次数。
+  # 取值: 非负整数
+  # 影响: 每个 chunk 最多额外重试 N 次，避免无限重试拖慢整体吞吐。
+  chunk_reconnect_max_attempts: 1
   # async 调用时是否自动预热进程池与 worker 常驻连接。
   # 取值: true/false
   # 影响: true 时 async 首次调用会自动触发 prewarm，降低冷启动抖动。
@@ -127,10 +124,10 @@ parallel:
 pagination:
   # 标准行情 get_security_list 单页数量。
   # 取值: 正整数
-  standard_security_list_page_size: 1000
+  standard_security_list_page_size: 800
   # 扩展行情 get_instrument_info 单页数量。
   # 取值: 正整数
-  extended_instrument_info_page_size: 1000
+  extended_instrument_info_page_size: 800
   # 标准行情 K线单页数量（get_security_bars）。
   # 取值: 正整数，常用 800
   standard_kline_page_size: 800
@@ -151,9 +148,6 @@ market_rules:
   # 识别港股市场使用的扩展市场名称集合。
   include_hk_market_names:
     - "港股通"
-  # 港股代码长度集合（仅数字代码）。
-  include_hk_code_lengths:
-    - 5
   # 深圳 A 股前缀集合（标准市场）。
   stock_prefix_sz:
     - "000"

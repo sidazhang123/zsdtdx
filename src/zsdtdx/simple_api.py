@@ -17,12 +17,12 @@ import queue as std_queue
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import pandas as pd
 
 from zsdtdx.parallel_fetcher import StockKlineJob, get_fetcher, set_active_config_path
-from zsdtdx.wrapper.unified_client import UnifiedTdxClient
+from zsdtdx.unified_client import UnifiedTdxClient
 
 _DEFAULT_CONFIG_PATH = str(Path(__file__).resolve().with_name("config.yaml"))
 _ACTIVE_CONFIG_PATH: Optional[str] = None
@@ -353,35 +353,6 @@ def _call_with_client(func: Callable[[UnifiedTdxClient], Any]) -> Any:
             client.close()
 
 
-def _iter_with_client(iterator_factory: Callable[[UnifiedTdxClient], Iterator[Any]]) -> Iterator[Any]:
-    """
-    在统一客户端上下文中创建迭代器。
-
-    输入：
-    1. iterator_factory: 以 client 为参数的迭代器工厂函数。
-    输出：
-    1. 可迭代对象。
-    用途：
-    1. 预留给需要流式返回的接口，统一处理资源释放。
-    边界条件：
-    1. 无活动上下文时，会包装生成器并在迭代结束后关闭 client。
-    """
-    client, need_close = _borrow_client()
-    iterator = iterator_factory(client)
-    if not need_close:
-        return iterator
-
-    def _gen():
-        """生成器包装，确保迭代结束后关闭客户端。"""
-        try:
-            for item in iterator:
-                yield item
-        finally:
-            client.close()
-
-    return _gen()
-
-
 def get_client(
     config_path: Optional[str] = None,
     separate_instance: bool = False,
@@ -406,7 +377,7 @@ def get_client(
 
     返回示例:
     ```python
-    <zsdtdx.wrapper.unified_client.UnifiedTdxClient object at 0x...>
+    <zsdtdx.unified_client.UnifiedTdxClient object at 0x...>
     ```
 
     边界条件:
@@ -840,3 +811,4 @@ __all__ = [
     "get_runtime_failures",
     "get_runtime_metadata",
 ]
+

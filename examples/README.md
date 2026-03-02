@@ -74,7 +74,7 @@ def preprocess(payload: dict) -> dict | None:
 1. `get_stock_kline(task)` 会将同 `code+freq` 的任务归并为一个 chunk。  
 2. chunk 内任务会按 `start_time` 从早到晚执行，以提升缓存命中率。  
 3. 结果按“完成顺序”回收，不保证与输入任务顺序一致。  
-4. 当 chunk 任务数达到 `parallel.task_chunk_cache_min_tasks`（默认 `3`）时，会启用 chunk 级轻量缓存。  
+4. 当 chunk 任务数达到 `parallel.task_chunk_cache_min_tasks`（默认 `2`）时，会启用 chunk 级轻量缓存。  
 
 ## 6. 兼容说明
 
@@ -92,3 +92,12 @@ def preprocess(payload: dict) -> dict | None:
 `python examples/benchmark_async_200x5x15.py`
 5. 一键完整对比并输出综合分析结论（调起以上 3 个脚本）：
 `python examples/benchmark_full_compare_200x5x15.py`
+
+## 8. 1000x5x15 连通性检查脚本
+
+1. 生成 1000x5x15 固定任务集：
+`python examples/generate_benchmark_taskset_1000x5x15.py`
+2. 探测标准行情 host 可用性：
+`python examples/probe_pytdx_standard_hosts.py`
+3. 按配置执行 async 连通性检查：
+`python examples/run_async_1000x5x15_check_connection.py`

@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------------------
+# async 1000*5*15 “连接不可用”检查脚本配置
+# 对应脚本: examples/run_async_1000x5x15_check_connection.py
+# ---------------------------------------------------------------------------
+
+task:
+  # 优先复用预生成任务集文件（避免运行时再次调用 get_stock_code_name 拉代码表）
+  use_taskset_file_first: true
+  # taskset 文件名（相对 examples 目录）
+  taskset_filename: "benchmark_taskset_1000x5x15.json"
+  # 设为 true 时，若 taskset 文件不存在则直接失败，不回退运行时动态构建
+  taskset_required: true
+  # 股票数量（默认 1000）
+  stock_count: 1000
+  # 频率列表（默认 5 档）
+  freqs:
+    - "15"
+    - "30"
+    - "60"
+    - "d"
+    - "w"
+  # 时间样本数（默认 15）
+  sample_count: 15
+  # 样本随机种子（固定后可复现）
+  sample_seed: 20260228
+
+run:
+  # 调度策略固定为 single_full_call：脚本始终一次性提交全量任务给 get_stock_kline。
+  # get_stock_kline 内部会自行进行 chunk 分片与并发调度。
+  # 总预算秒数（0 表示不限制）
+  total_budget_seconds: 0
+  # job.result 超时秒数（0 表示不设置超时）
+  job_result_timeout_seconds: 0
+  # 慢批次阈值（秒），仅用于标记
+  slow_batch_threshold_seconds: 20
+  # 是否在正式跑批前做一次支持市场连通性预检
+  run_preflight_supported_markets: true
+  # 每批最多保留多少条错误样本
+  max_error_samples_per_batch: 8
+  # 目标错误关键字（命中任一即判定 target_error_hit）
+  target_error_keywords:
+    - "进程内执行一些任务后连接不可用"
+    - "连接不可用"
+    - "无可用连接"
+    - "BrokenProcessPool"
+    - "process pool is not usable anymore"
+    - "A child process terminated abruptly"
+
+fetcher:
+  # async 进程数（0 表示使用 fetcher 默认并自动做最小进程数保护）
+  async_process_workers: 0
+
+  # 并行总超时（秒）
+  parallel_total_timeout_seconds: 300
+  # future.result 超时（秒）
+  parallel_result_timeout_seconds: 600
+
+  # chunk 参数
+  task_chunk_cache_min_tasks: 2
+  task_chunk_inproc_future_workers: 2
+  task_chunk_max_inflight_multiplier: 2
+
+  # async 自动预热参数
+  auto_prewarm_on_async: true
+  auto_prewarm_timeout_seconds: 60
+  auto_prewarm_max_rounds: 3
+  auto_prewarm_require_all_workers: true
+  auto_prewarm_spread_standard_hosts: false
+
+output:
+  # 结果文件（保存到 examples 目录）
+  result_filename: "async_1000x5x15_connection_check_result.json"
