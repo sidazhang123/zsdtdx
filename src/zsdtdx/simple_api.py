@@ -4,28 +4,46 @@
 1. 对外暴露 get_* 风格 API，隐藏连接池、市场路由、分页与并行调度细节。
 2. 统一 task 输入格式（code/freq/start_time/end_time）并完成时间窗口标准化。
 3. 提供同步/异步两种股票 K 线任务获取模式。
+4. 暴露并行进程池生命周期管理入口（prewarm/restart/destroy）。
 
-调用约定（推荐）：
-1. 先进入 `with get_client() as client:`。
-2. 在同一个 with 块内连续调用多个 `get_*` 函数。
-3. async 模式通过 `job.queue` 持续消费结果，直到收到 `event="done"`。
+调用约定：
+1. 程序启动阶段先调用 `set_config_path()` 设置配置路径；后续各接口无需重复传参。
+2. 若未调用 `set_config_path()`，首次调用相关接口会打印提醒并回退到包内默认配置。
+3. 进入 `with get_client() as client:` 后，可在同一个 with 块连续调用多个“主进程 API”（如 `get_supported_markets`、`get_stock_latest_price`、`get_stock_kline(mode="sync")`）复用主进程连接。
+4. `get_stock_kline(mode="async")` 的数据抓取在并行 worker 进程内执行，worker 会独立创建并复用自己的连接，不复用 `with get_client()` 的主进程连接。
+5. async 模式通过 `job.queue` 持续消费结果，直到收到 `event="done"`。
+6. 对 async 冷启动敏感场景可在启动阶段手动调用 `prewarm_parallel_fetcher()`；异常恢复可调用 `restart_parallel_fetcher()`；进程退出前可调用 `destroy_parallel_fetcher()`。
 """
 
 from __future__ import annotations
 
 import queue as std_queue
-from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import pandas as pd
 
-from zsdtdx.parallel_fetcher import StockKlineJob, get_fetcher, set_active_config_path
+from zsdtdx.helper import (
+    call_with_client as _call_with_client,
+    normalize_future_time_window as _normalize_future_time_window,
+    normalize_task_input as _normalize_task_input,
+    normalize_task_time_window as _normalize_task_time_window,
+    parse_task_datetime as _parse_task_datetime,
+)
+from zsdtdx.parallel_fetcher import (
+    StockKlineJob,
+    destroy_parallel_fetcher as _destroy_parallel_fetcher,
+    force_restart_parallel_fetcher as _force_restart_parallel_fetcher,
+    get_fetcher,
+    prewarm_parallel_fetcher as _prewarm_parallel_fetcher,
+    set_active_config_path,
+)
 from zsdtdx.unified_client import UnifiedTdxClient
 
 _DEFAULT_CONFIG_PATH = str(Path(__file__).resolve().with_name("config.yaml"))
 _ACTIVE_CONFIG_PATH: Optional[str] = None
+_DEFAULT_CONFIG_NOTICE_PRINTED: bool = False
 _TASK_FREQ_MAP: Dict[str, str] = {
     "d": "d",
     "w": "w",
@@ -39,132 +57,6 @@ _TASK_FREQ_MAP: Dict[str, str] = {
     "5": "5",
     "5min": "5",
 }
-
-
-def _parse_task_datetime(raw_value: Any) -> tuple[datetime, str]:
-    """
-    解析任务时间字符串并返回 `(datetime, format_key)`。
-
-    输入：
-    1. raw_value: 原始时间值，支持 str/date/datetime。
-    输出：
-    1. `(parsed_datetime, format_key)`；format_key 用于后续按原风格回写字符串。
-    用途：
-    1. 统一 task 时间解析逻辑，避免各入口重复处理。
-    边界条件：
-    1. 空字符串或无法识别的时间格式会抛出 ValueError。
-    """
-    raw = str(raw_value or "").strip()
-    if raw == "":
-        raise ValueError("时间不能为空")
-
-    format_pairs = [
-        ("%Y-%m-%d %H:%M:%S", "ymd_hms_dash"),
-        ("%Y-%m-%d %H:%M", "ymd_hm_dash"),
-        ("%Y-%m-%d", "ymd_dash"),
-        ("%Y/%m/%d %H:%M:%S", "ymd_hms_slash"),
-        ("%Y/%m/%d %H:%M", "ymd_hm_slash"),
-        ("%Y/%m/%d", "ymd_slash"),
-    ]
-    for fmt, key in format_pairs:
-        try:
-            return datetime.strptime(raw, fmt), key
-        except Exception:
-            continue
-
-    normalized = raw.replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except Exception:
-        raise ValueError(f"非法时间: {raw_value}") from None
-
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone().replace(tzinfo=None)
-    return parsed, "iso"
-
-
-def _format_task_datetime(parsed: datetime, format_key: str) -> str:
-    """
-    按 format_key 将 datetime 回写为字符串。
-
-    输入：
-    1. parsed: 已解析时间。
-    2. format_key: 原始格式标识（如 ymd_hms_dash、iso）。
-    输出：
-    1. 格式化后的时间字符串。
-    用途：
-    1. 在标准化时间后保持调用方原有格式风格。
-    边界条件：
-    1. 未知 format_key 会回退到 `%Y-%m-%d %H:%M:%S`。
-    """
-    if format_key == "ymd_hms_dash":
-        return parsed.strftime("%Y-%m-%d %H:%M:%S")
-    if format_key == "ymd_dash":
-        return parsed.strftime("%Y-%m-%d")
-    if format_key == "ymd_slash":
-        return parsed.strftime("%Y/%m/%d")
-    if format_key == "ymd_hm_dash":
-        return parsed.strftime("%Y-%m-%d %H:%M")
-    if format_key == "ymd_hm_slash":
-        return parsed.strftime("%Y/%m/%d %H:%M")
-    if format_key == "ymd_hms_slash":
-        return parsed.strftime("%Y/%m/%d %H:%M:%S")
-    if format_key == "iso":
-        return parsed.isoformat(timespec="seconds")
-    return parsed.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _normalize_task_time_window(start_time: Any, end_time: Any) -> tuple[str, str]:
-    """
-    标准化股票任务时间窗口。
-
-    输入：
-    1. start_time/end_time: 原始时间值，支持 str/date/datetime。
-    输出：
-    1. 标准化后的 `(start_time, end_time)` 字符串元组。
-    用途：
-    1. 为股票 task 提供统一时间语义，避免日期型输入产生歧义。
-    边界条件：
-    1. 日期入参会映射为 start=09:30:00、end=16:00:00。
-    """
-    start_dt, start_fmt = _parse_task_datetime(start_time)
-    end_dt, end_fmt = _parse_task_datetime(end_time)
-
-    if start_fmt in {"ymd_dash", "ymd_slash"}:
-        start_dt = start_dt.replace(hour=9, minute=30, second=0, microsecond=0)
-        start_fmt = "ymd_hms_slash" if start_fmt == "ymd_slash" else "ymd_hms_dash"
-    if end_fmt in {"ymd_dash", "ymd_slash"}:
-        end_dt = end_dt.replace(hour=16, minute=0, second=0, microsecond=0)
-        end_fmt = "ymd_hms_slash" if end_fmt == "ymd_slash" else "ymd_hms_dash"
-
-    return _format_task_datetime(start_dt, start_fmt), _format_task_datetime(end_dt, end_fmt)
-
-
-def _normalize_future_time_window(start_time: Any, end_time: Any) -> tuple[str, str]:
-    """
-    标准化期货任务时间窗口。
-
-    输入：
-    1. start_time/end_time: 原始时间值，支持 str/date/datetime。
-    输出：
-    1. 标准化后的 `(start_time, end_time)` 字符串元组。
-    用途：
-    1. 统一期货 K 线时间过滤口径。
-    边界条件：
-    1. 日期入参会映射为 start=09:00:00、end=15:00:00。
-    """
-    start_dt, start_fmt = _parse_task_datetime(start_time)
-    end_dt, end_fmt = _parse_task_datetime(end_time)
-
-    if start_fmt in {"ymd_dash", "ymd_slash"}:
-        start_dt = start_dt.replace(hour=9, minute=0, second=0, microsecond=0)
-        start_fmt = "ymd_hms_slash" if start_fmt == "ymd_slash" else "ymd_hms_dash"
-    if end_fmt in {"ymd_dash", "ymd_slash"}:
-        end_dt = end_dt.replace(hour=15, minute=0, second=0, microsecond=0)
-        end_fmt = "ymd_hms_slash" if end_fmt == "ymd_slash" else "ymd_hms_dash"
-
-    return _format_task_datetime(start_dt, start_fmt), _format_task_datetime(end_dt, end_fmt)
-
 
 @dataclass
 class StockKlineTask:
@@ -266,101 +158,95 @@ class StockKlineTask:
         return task
 
 
-def _normalize_task_input(task: List[Any]) -> List[Dict[str, str]]:
+def _apply_active_config_path(config_path: str) -> str:
     """
-    标准化 task 列表输入。
+    解析并激活 simple_api 的全局配置路径。
 
-    输入：
-    1. task: list/tuple，元素为 dict 或 StockKlineTask。
-    输出：
-    1. 标准化 task 字典列表。
-    用途：
-    1. 统一 get_stock_kline 的任务输入口径。
-    边界条件：
-    1. 空列表、非列表或非法元素会抛 ValueError。
+    输入:
+    - config_path: 待激活配置路径（支持相对/绝对路径）。
+
+    输出:
+    - 解析后的绝对配置路径字符串。
+
+    边界条件:
+    - 配置路径不存在、YAML 非法或 hosts 配置无效时会抛出异常。
     """
-    if not isinstance(task, (list, tuple)):
-        raise ValueError("task 必须是列表，元素为 dict 或 StockKlineTask")
-    normalized: List[Dict[str, str]] = []
-    for item in list(task):
-        if isinstance(item, StockKlineTask):
-            normalized.append(item.to_dict())
-            continue
-        normalized.append(StockKlineTask.from_dict(item).to_dict())
-    if not normalized:
-        raise ValueError("task 列表不能为空")
-    return normalized
+    global _ACTIVE_CONFIG_PATH
 
-
-def _resolve_active_config_path(config_path: Optional[str]) -> str:
-    """
-    解析当前生效配置路径。
-
-    输入：
-    1. config_path: 可选显式路径。
-    输出：
-    1. 当前应使用的配置路径字符串。
-    用途：
-    1. 在 simple_api 层实现“显式优先、上下文复用、默认兜底”。
-    边界条件：
-    1. 未传参时按 `_ACTIVE_CONFIG_PATH -> 默认配置` 顺序回退。
-    """
     requested = str(config_path or "").strip()
-    if requested:
-        return requested
-    if _ACTIVE_CONFIG_PATH:
-        return str(_ACTIVE_CONFIG_PATH)
-    return _DEFAULT_CONFIG_PATH
+    if requested == "":
+        raise ValueError("config_path 不能为空")
 
-
-def _borrow_client() -> tuple[UnifiedTdxClient, bool]:
-    """
-    获取可用客户端并返回是否需要自动关闭。
-
-    输入：
-    1. 无显式输入参数。
-    输出：
-    1. `(client, need_close)`。
-    用途：
-    1. 统一处理“上下文复用”和“临时实例自动释放”。
-    边界条件：
-    1. 有活动上下文时不会新建客户端。
-    """
-    context_client = UnifiedTdxClient.get_active_context_client()
-    if context_client is not None:
-        return context_client, False
-    return get_client(), True
-
-
-def _call_with_client(func: Callable[[UnifiedTdxClient], Any]) -> Any:
-    """
-    在统一客户端上下文中执行回调。
-
-    输入：
-    1. func: 以 `UnifiedTdxClient` 为参数的回调。
-    输出：
-    1. 回调执行结果。
-    用途：
-    1. 为非迭代接口提供统一资源管理。
-    边界条件：
-    1. 临时创建的客户端会在 finally 中关闭。
-    """
-    client, need_close = _borrow_client()
+    client = UnifiedTdxClient(config_path=requested)
+    resolved_path = str(client.config_path)
     try:
-        return func(client)
-    finally:
-        if need_close:
-            client.close()
+        client.close()
+    except Exception:
+        pass
+
+    _ACTIVE_CONFIG_PATH = resolved_path
+    set_active_config_path(resolved_path)
+    return resolved_path
+
+
+def _ensure_active_config_ready(caller_name: str) -> str:
+    """
+    确保 simple_api 全局配置已就绪。
+
+    输入:
+    - caller_name: 触发方名称，用于默认配置提醒文本。
+
+    输出:
+    - 当前生效配置路径字符串。
+
+    边界条件:
+    - 若用户未显式设置配置，会自动回退到包内默认配置并打印一次提醒。
+    """
+    global _DEFAULT_CONFIG_NOTICE_PRINTED
+
+    if _ACTIVE_CONFIG_PATH:
+        set_active_config_path(_ACTIVE_CONFIG_PATH)
+        return str(_ACTIVE_CONFIG_PATH)
+
+    default_path = _apply_active_config_path(config_path=_DEFAULT_CONFIG_PATH)
+    if not _DEFAULT_CONFIG_NOTICE_PRINTED:
+        print(
+            f"[zsdtdx.simple_api] {caller_name} 未先调用 set_config_path()，"
+            f"当前使用默认配置: {default_path}"
+        )
+        _DEFAULT_CONFIG_NOTICE_PRINTED = True
+    return default_path
+
+
+def set_config_path(config_path: str) -> str:
+    """
+    设置 simple_api 全局配置路径（主进程与并行 worker 统一生效）。
+
+    输入:
+    - config_path: 配置文件路径（建议在程序启动阶段调用一次）。
+
+    输出:
+    - 解析后的绝对配置路径字符串。
+
+    调用示例:
+    ```python
+    from zsdtdx import set_config_path
+
+    set_config_path(r"D:\\configs\\zsdtdx.yaml")
+    ```
+
+    边界条件:
+    - 配置非法时会直接抛出异常，调用方可在启动阶段尽早失败。
+    """
+    return _apply_active_config_path(config_path=config_path)
 
 
 def get_client(
-    config_path: Optional[str] = None,
     separate_instance: bool = False,
 ) -> UnifiedTdxClient:
     """获取客户端实例。
 
     输入:
-    - config_path: 配置文件路径；仅需初始化时设置一次。
     - separate_instance: 是否强制新建独立客户端实例；为 True 时忽略当前 with 上下文并创建新实例。
 
     输出:
@@ -368,7 +254,7 @@ def get_client(
 
     调用示例:
     ```python
-    # 推荐：一个 with 中复用同一 client，避免重复建连。
+    # 一个 with 中复用同一 client，避免重复建连。
     with get_client() as client:
         markets = get_supported_markets(return_df=True)
         stock_map = get_stock_code_name()
@@ -380,19 +266,20 @@ def get_client(
     <zsdtdx.unified_client.UnifiedTdxClient object at 0x...>
     ```
 
+    作用边界:
+    - 该 client 仅管理“当前主进程”上下文中的连接生命周期（进入 with 预连接，退出 with 自动 close）。
+    - `get_stock_kline(mode="async")` 的 worker 连接由并行抓取器在 worker 进程内独立维护，不与此处返回的主进程 client 共用连接对象。
+
     边界条件:
-    - 若在 with 上下文中且本次未显式传参，会优先返回当前上下文客户端。
+    - 若用户未显式调用 `set_config_path()`，会回退到默认配置并打印一次提醒。
+    - 若在 with 上下文中且 `separate_instance=False`，会优先返回当前上下文客户端。
     - outside-with 直接调用会返回独立客户端实例，建议配合 with 或显式调用 close()。
     """
-    global _ACTIVE_CONFIG_PATH
-
     active_context_client = UnifiedTdxClient.get_active_context_client()
-    if active_context_client is not None and not separate_instance and str(config_path or "").strip() == "":
+    if active_context_client is not None and not separate_instance:
         return active_context_client
 
-    new_path = _resolve_active_config_path(config_path)
-    _ACTIVE_CONFIG_PATH = new_path
-    set_active_config_path(new_path)
+    new_path = _ensure_active_config_ready(caller_name="get_client")
     return UnifiedTdxClient(config_path=new_path)
 
 
@@ -414,7 +301,11 @@ def get_supported_markets(return_df: Optional[bool] = None):
     [{"market": 0, "name": "深圳", "source": "std"}, {"market": 1, "name": "上海", "source": "std"}]
     ```
     """
-    return _call_with_client(lambda client: client.get_supported_markets(return_df=return_df))
+    return _call_with_client(
+        lambda client: client.get_supported_markets(return_df=return_df),
+        get_active_context_client=UnifiedTdxClient.get_active_context_client,
+        build_client=lambda: get_client(),
+    )
 
 
 def get_stock_code_name(use_cache: bool = True) -> Dict[str, str]:
@@ -444,7 +335,11 @@ def get_stock_code_name(use_cache: bool = True) -> Dict[str, str]:
     {"sh.600000": "浦发银行", "sz.000001": "平安银行"}
     ```
     """
-    return _call_with_client(lambda client: client.get_stock_code_name_map(use_cache=use_cache))
+    return _call_with_client(
+        lambda client: client.get_stock_code_name_map(use_cache=use_cache),
+        get_active_context_client=UnifiedTdxClient.get_active_context_client,
+        build_client=lambda: get_client(),
+    )
 
 
 def get_all_future_list(return_df: Optional[bool] = None, use_cache: bool = True):
@@ -468,7 +363,11 @@ def get_all_future_list(return_df: Optional[bool] = None, use_cache: bool = True
     [{"code": "CU2603", "name": "沪铜2603", "market_name": "上海期货", "source": "ex"}]
     ```
     """
-    return _call_with_client(lambda client: client.get_all_future_list(return_df=return_df, use_cache=use_cache))
+    return _call_with_client(
+        lambda client: client.get_all_future_list(return_df=return_df, use_cache=use_cache),
+        get_active_context_client=UnifiedTdxClient.get_active_context_client,
+        build_client=lambda: get_client(),
+    )
 
 
 def get_stock_kline(
@@ -480,28 +379,41 @@ def get_stock_kline(
     """获取股票 K 线任务结果（任务化输入，支持同步/异步与队列实时回传）。
 
     调用前置约定:
-    - 请先进入 `with get_client() as client:`；
-      一个 with 块内可连续调用多个 `get_*` 函数。
+    - `mode="sync"`：可进入 `with get_client() as client:` 在主进程复用连接并统一资源释放。
+    - `mode="async"`：可直接调用；async 抓取使用 worker 进程内独立连接。
+      若同一流程还要连续调用主进程 `get_*` 接口，可把这些主进程调用放在 with 块内执行。
 
     输入:
     - task: 任务列表，元素是 `StockKlineTask` 或 dict，模板字段:
       `{code, freq, start_time, end_time}`。
-    - queue: 可选队列，需支持 `put()`；sync 模式可传入，async 模式不传时会自动创建并挂到返回 job.queue。
+    - queue: 可选队列，需支持 `put()`。
+      - `mode="sync"` 且不传 queue：仅通过返回值拿到结果。
+      - `mode="sync"` 且传 queue：返回值仍是完整结果列表，同时会向 queue 增量写入 data/done 事件。
+      - `mode="async"` 且不传 queue：函数会自动创建 queue 并挂到返回的 `job.queue`。
+      - `mode="async"` 且传 queue：返回的 `job.queue` 即该 queue。
     - preprocessor_operator: 可选预处理函数，签名 `f(payload)->dict|None`；
       返回 None 或空 dict 时该条结果不入队也不进入返回值。
     - mode: `"sync"` 或 `"async"`，默认 `"async"`。sync 阻塞直到完成；async 立即返回句柄。
 
-    调用示例（sync，阻塞直到完成）:
+    调用示例（写法一：with 主进程上下文 + sync + 其它接口）:
     ```python
     import queue as py_queue
-    from zsdtdx import get_client, get_stock_kline, StockKlineTask
+    from zsdtdx import (
+        StockKlineTask,
+        get_client,
+        get_stock_kline,
+        get_stock_latest_price,
+        get_supported_markets,
+    )
     
     with get_client() as client:
+        markets = get_supported_markets(return_df=True)
+        prices = get_stock_latest_price(["600000", "000001"])
         # sync 模式可传入队列，边产出边消费（也可不传，仅用返回值）。
         q = py_queue.Queue()
         result = get_stock_kline(
             task=[
-                # 使用任务对象写法（推荐，字段校验更明确）
+                # 使用任务对象写法，字段校验更明确
                 StockKlineTask(code="600000", freq="d", start_time="2026-02-13", end_time="2026-02-13"),
                 # 也支持 dict 写法
                 {"code": "000001", "freq": "60", "start_time": "2026-02-13", "end_time": "2026-02-14"},
@@ -509,19 +421,26 @@ def get_stock_kline(
             queue=q,
             mode="sync",
         )
+        print(len(markets), prices)
         # result 为完整 payload 列表；q 中也会收到相同 data 事件和最终 done 事件
         print(result)
     ```
 
-    调用示例（async，实时消费队列）:
+    调用示例（写法二：async 独立进程池调用 + prewarm/restart/destroy）:
     ```python
-    from zsdtdx import get_client, get_stock_kline
+    from zsdtdx import (
+        destroy_parallel_fetcher,
+        get_stock_kline,
+        prewarm_parallel_fetcher,
+        restart_parallel_fetcher,
+    )
 
-    with get_client() as client:
-        job = get_stock_kline(
-            task=[{"code": "600000", "freq": "d", "start_time": "2026-02-13", "end_time": "2026-02-13"}],
-            mode="async",
-        )
+    prewarm_parallel_fetcher(require_all_workers=True, timeout_seconds=60, max_rounds=3)
+    job = get_stock_kline(
+        task=[{"code": "600000", "freq": "d", "start_time": "2026-02-13", "end_time": "2026-02-13"}],
+        mode="async",
+    )
+    try:
         while True:
             # 实时读取 data 事件，直到 done
             event = job.queue.get(timeout=20)
@@ -531,11 +450,26 @@ def get_stock_kline(
             print(event.get("task"), event.get("error"))
         # 等待后台任务完全结束并传播异常
         job.result()
+    except Exception:
+        # 任务执行链路出现持续异常时，可强制重启并重建 worker 连接
+        restart_parallel_fetcher(prewarm=True, prewarm_timeout_seconds=60, max_rounds=3)
+        raise
+    finally:
+        # 服务停机或脚本结束前主动销毁进程池
+        destroy_parallel_fetcher()
     ```
 
+    连接生命周期说明:
+    - `mode="sync"`：主要使用主进程连接；with 结束会关闭主进程 client 连接。
+    - `mode="async"`：主要使用 worker 连接；with 结束不会直接关闭 worker 连接，worker 连接由并行抓取器按进程池生命周期管理。
+
     返回:
-    - mode="sync": 返回 `list[task_payload]`。
-    - mode="async": 返回 `StockKlineJob`，并可通过 `job.queue` 持续消费实时结果。
+    - mode="sync": 始终返回 `list[task_payload]`（无论是否传 queue）。
+      - 未传 queue：结果仅在返回值中。
+      - 传了 queue：结果既在返回值中，也会同步推送到 queue。
+    - mode="async": 始终返回 `StockKlineJob`（无论是否传 queue）。
+      - 未传 queue：可从自动创建的 `job.queue` 消费事件。
+      - 传了 queue：可从传入的 queue（即 `job.queue`）消费事件。
     - task_payload 结构:
       `{"event":"data","task":{...},"rows":[...],"error":str|None,"worker_pid":int}`。
     - 队列最终会额外推送 done 事件:
@@ -546,7 +480,8 @@ def get_stock_kline(
     if preprocessor_operator is not None and not callable(preprocessor_operator):
         raise ValueError("preprocessor_operator 必须是可调用对象")
 
-    normalized_tasks = _normalize_task_input(task)
+    _ensure_active_config_ready(caller_name="get_stock_kline")
+    normalized_tasks = _normalize_task_input(task=task, task_cls=StockKlineTask)
     mode_key = str(mode or "async").strip().lower()
 
     fetcher = get_fetcher()
@@ -564,6 +499,94 @@ def get_stock_kline(
             preprocessor_operator=preprocessor_operator,
         )
     raise ValueError("mode 仅支持 'sync' 或 'async'")
+
+
+def prewarm_parallel_fetcher(
+    require_all_workers: bool = True,
+    timeout_seconds: float = 60.0,
+    max_rounds: int = 3,
+    target_workers: Optional[int] = None,
+    spread_standard_hosts: bool = False,
+) -> Dict[str, Any]:
+    """
+    手动预热 async 并行抓取进程池与 worker 常驻连接。
+
+    输入:
+    - require_all_workers: 是否要求目标 worker 全部预热成功。
+    - timeout_seconds: 预热总超时（秒）。
+    - max_rounds: 预热轮次上限。
+    - target_workers: 目标进程数；不传时使用当前 fetcher 配置。
+    - spread_standard_hosts: 是否在预热时分散 worker 到不同标准行情 host。
+
+    输出:
+    - 预热摘要字典（目标进程数、已预热进程数、pid 列表、耗时等）。
+
+    什么时候调用:
+    - 服务启动阶段：希望把 async 首次冷启动成本前移。
+    - 压测/批跑前：希望先确认 worker 建连健康再开始任务。
+
+    边界条件:
+    - 默认 `require_all_workers=True`；若预热不足会抛 RuntimeError。
+    """
+    _ensure_active_config_ready(caller_name="prewarm_parallel_fetcher")
+    return _prewarm_parallel_fetcher(
+        require_all_workers=bool(require_all_workers),
+        timeout_seconds=float(timeout_seconds),
+        max_rounds=int(max_rounds),
+        target_workers=target_workers,
+        spread_standard_hosts=bool(spread_standard_hosts),
+    )
+
+
+def restart_parallel_fetcher(
+    prewarm: bool = True,
+    prewarm_timeout_seconds: float = 60.0,
+    max_rounds: int = 3,
+) -> Dict[str, Any]:
+    """
+    强制重启 async 并行抓取进程池（终止旧 worker 并按需预热）。
+
+    输入:
+    - prewarm: 重启后是否立即预热新池。
+    - prewarm_timeout_seconds: 重启后预热总超时（秒）。
+    - max_rounds: 重启后预热轮次上限。
+
+    输出:
+    - 重启摘要字典（旧 pid、终止结果、预热摘要、耗时等）。
+
+    什么时候调用:
+    - 出现连续 timeout/连接异常，怀疑 worker 状态异常时。
+    - 需要快速回收并重建 worker 连接状态时。
+
+    边界条件:
+    - 即便旧池不存在也会返回摘要，不抛错。
+    """
+    _ensure_active_config_ready(caller_name="restart_parallel_fetcher")
+    return _force_restart_parallel_fetcher(
+        prewarm=bool(prewarm),
+        prewarm_timeout_seconds=float(prewarm_timeout_seconds),
+        max_rounds=int(max_rounds),
+    )
+
+
+def destroy_parallel_fetcher() -> Dict[str, Any]:
+    """
+    销毁 async 并行抓取进程池并释放 worker 资源。
+
+    输入:
+    - 无显式输入参数。
+
+    输出:
+    - 销毁摘要字典（是否存在旧池、旧 worker 数、销毁后版本号、耗时）。
+
+    什么时候调用:
+    - 长驻服务优雅停机前，主动释放 worker 与连接资源。
+    - 短脚本结束前，避免保留并行进程池到解释器退出阶段。
+
+    边界条件:
+    - 进程池不存在时安全返回，不抛错。
+    """
+    return _destroy_parallel_fetcher()
 
 
 def get_future_kline(
@@ -608,9 +631,10 @@ def get_future_kline(
 
     并行模式说明:
     - 入口策略: 进程数 > 1 时默认并行；进程数不足时自动串行
-    - 进程数: 自动计算 = int(CPU物理核心数 × 1.5)，至少2个进程
+    - 进程数: 自动计算 = int(CPU物理核心数 × process_count_core_multiplier)，至少2个进程
+      （`process_count_core_multiplier` 位于 `config.yaml.parallel`，默认 1.5）
     - 全局进程池: 首次并行调用时创建（约2-3秒开销），后续调用复用，程序退出时统一关闭
-    - 推荐分批: 100个期货×5周期=500任务/批
+    - 建议分批: 100个期货×5周期=500任务/批
 
     注意事项:
     - 返回的是单个合并后的 DataFrame，不是迭代器
@@ -678,7 +702,9 @@ def get_company_info(code: str, category: Optional[List[str]] = None, return_df:
     ```
     """
     return _call_with_client(
-        lambda client: client.get_company_info_content(code=code, category=category, return_df=return_df)
+        lambda client: client.get_company_info_content(code=code, category=category, return_df=return_df),
+        get_active_context_client=UnifiedTdxClient.get_active_context_client,
+        build_client=lambda: get_client(),
     )
 
 
@@ -716,7 +742,11 @@ def get_stock_latest_price(codes: Optional[Any] = None) -> Dict[str, Optional[fl
     {"600000": 9.98, "09988": 158.5}
     ```
     """
-    return _call_with_client(lambda client: client.get_stock_latest_price(codes=codes))
+    return _call_with_client(
+        lambda client: client.get_stock_latest_price(codes=codes),
+        get_active_context_client=UnifiedTdxClient.get_active_context_client,
+        build_client=lambda: get_client(),
+    )
 
 
 def get_future_latest_price(codes: Optional[Any] = None) -> Dict[str, Optional[float]]:
@@ -751,7 +781,11 @@ def get_future_latest_price(codes: Optional[Any] = None) -> Dict[str, Optional[f
     {"ALL8": 23610.0, "CU2603": 102330.0}
     ```
     """
-    return _call_with_client(lambda client: client.get_future_latest_price(codes=codes))
+    return _call_with_client(
+        lambda client: client.get_future_latest_price(codes=codes),
+        get_active_context_client=UnifiedTdxClient.get_active_context_client,
+        build_client=lambda: get_client(),
+    )
 
 
 def get_runtime_failures() -> pd.DataFrame:
@@ -772,7 +806,11 @@ def get_runtime_failures() -> pd.DataFrame:
     [{"task": "stock_kline", "code": "999999", "freq": "d", "reason": "code_not_found"}]
     ```
     """
-    return _call_with_client(lambda client: client.get_failures_df())
+    return _call_with_client(
+        lambda client: client.get_failures_df(),
+        get_active_context_client=UnifiedTdxClient.get_active_context_client,
+        build_client=lambda: get_client(),
+    )
 
 
 def get_runtime_metadata() -> Dict[str, Any]:
@@ -793,17 +831,25 @@ def get_runtime_metadata() -> Dict[str, Any]:
     {"config_path": "<auto>", "std_active_host": "120.76.1.198:7709"}
     ```
     """
-    return _call_with_client(lambda client: client.get_runtime_metadata())
+    return _call_with_client(
+        lambda client: client.get_runtime_metadata(),
+        get_active_context_client=UnifiedTdxClient.get_active_context_client,
+        build_client=lambda: get_client(),
+    )
 
 
 __all__ = [
     "StockKlineTask",
     "StockKlineJob",
+    "set_config_path",
     "get_client",
     "get_supported_markets",
     "get_stock_code_name",
     "get_all_future_list",
     "get_stock_kline",
+    "prewarm_parallel_fetcher",
+    "restart_parallel_fetcher",
+    "destroy_parallel_fetcher",
     "get_future_kline",
     "get_company_info",
     "get_stock_latest_price",

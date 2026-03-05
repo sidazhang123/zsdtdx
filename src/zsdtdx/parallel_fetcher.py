@@ -231,6 +231,32 @@ def _shutdown_global_pool():
         _global_pool_epoch += 1
 
 
+def destroy_parallel_fetcher() -> Dict[str, Any]:
+    """
+    主动销毁并行抓取器的全局进程池（公开入口）。
+
+    输入：
+    1. 无显式输入参数。
+    输出：
+    1. 销毁摘要（是否存在旧池、旧 worker 数、销毁后版本号、耗时）。
+    用途：
+    1. 在长驻服务优雅停机或短脚本结束前主动释放并行 worker 资源。
+    边界条件：
+    1. 当进程池尚未创建时安全返回，不抛错。
+    """
+    started_at = time.monotonic()
+    with _global_pool_lock:
+        existed = _global_process_pool is not None
+        old_workers = int(_global_pool_max_workers)
+    _shutdown_global_pool()
+    return {
+        "existed": bool(existed),
+        "old_workers": int(old_workers),
+        "pool_epoch": int(_snapshot_pool_epoch()),
+        "elapsed_seconds": round(time.monotonic() - started_at, 3),
+    }
+
+
 atexit.register(_shutdown_global_pool)
 
 
@@ -1219,19 +1245,27 @@ def is_future_code(code: str) -> bool:
     return base_code in FUTURE_PATTERNS
 
 
-def get_optimal_process_count() -> int:
+def get_optimal_process_count(core_multiplier: float = 1.5) -> int:
     """
     计算并发抓取推荐进程数。
 
     输入：
-    1. 无显式输入参数。
+    1. core_multiplier: 物理核心数倍率（默认 1.5）。
     输出：
-    1. 推荐进程数（`max(2, int(物理核心数 * 1.5))`）。
+    1. 推荐进程数（`max(2, int(物理核心数 * core_multiplier))`）。
     用途：
-    1. 为 I/O 密集型行情抓取提供默认并发基线。
+    1. 为 I/O 密集型行情抓取提供可配置的默认并发基线。
     边界条件：
     1. 无法获取物理核心数时会回退到 `os.cpu_count()`。
+    2. core_multiplier 非法或 <=0 时回退为 1.5。
     """
+    try:
+        multiplier = float(core_multiplier)
+    except Exception:
+        multiplier = 1.5
+    if multiplier <= 0:
+        multiplier = 1.5
+
     if psutil is not None:
         physical_cores = psutil.cpu_count(logical=False)
         if physical_cores is None or physical_cores < 1:
@@ -1240,7 +1274,7 @@ def get_optimal_process_count() -> int:
         # 没有 psutil 时，使用 os.cpu_count()
         physical_cores = os.cpu_count() or 4
     
-    optimal = int(physical_cores * 1.5)
+    optimal = int(physical_cores * multiplier)
     return max(2, optimal)  # 至少2个进程
 
 
@@ -1978,9 +2012,15 @@ class ParallelKlineFetcher:
             default=1,
             minimum=0,
         )
-        
-        # 自动计算进程数：CPU物理核心数 * 1.5，不需要用户配置
-        self.num_processes = get_optimal_process_count()
+        self.process_count_core_multiplier = self._safe_float_config(
+            parallel_cfg.get("process_count_core_multiplier"),
+            default=1.5,
+            minimum=0.1,
+        )
+        # 自动计算进程数：CPU物理核心数 * 配置倍率（默认 1.5）
+        self.num_processes = get_optimal_process_count(
+            core_multiplier=self.process_count_core_multiplier
+        )
         self._auto_prewarm_lock = threading.Lock()
         self._auto_prewarm_last_epoch: int = -1
         self._auto_prewarm_last_workers: int = 0

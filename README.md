@@ -10,11 +10,21 @@ pip install zsdtdx
 
 ## simple_api 快速开始
 
+### 0) 启动阶段设置配置路径
+
+```python
+from zsdtdx import set_config_path
+
+set_config_path(r"D:\\configs\\zsdtdx.yaml")
+```
+
 ### 1) sync 模式（阻塞返回）
 
 ```python
 import queue as py_queue
-from zsdtdx import StockKlineTask, get_client, get_stock_kline
+from zsdtdx import StockKlineTask, get_client, get_stock_kline, set_config_path
+
+set_config_path(r"D:\\configs\\zsdtdx.yaml")
 
 with get_client() as client:
     q = py_queue.Queue()
@@ -32,8 +42,11 @@ with get_client() as client:
 ### 2) async 模式（队列实时消费）
 
 ```python
-from zsdtdx import get_client, get_stock_kline
+from zsdtdx import get_client, get_stock_kline, set_config_path
 
+set_config_path(r"D:\\configs\\zsdtdx.yaml")
+
+# 写法一：如果还要在主进程调用其它 get_* 接口
 with get_client() as client:
     job = get_stock_kline(
         task=[{"code": "600000", "freq": "d", "start_time": "2026-02-01", "end_time": "2026-02-14"}],
@@ -49,6 +62,42 @@ with get_client() as client:
 
     # 等待后台任务结束并传播异常
     job.result()
+
+# 写法二：仅发起 async 任务时可不进入 with
+job = get_stock_kline(
+    task=[{"code": "600000", "freq": "d", "start_time": "2026-02-01", "end_time": "2026-02-14"}],
+    mode="async",
+)
+```
+
+### 3) async 进程池生命周期管理（可选）
+
+```python
+from zsdtdx import (
+    destroy_parallel_fetcher,
+    prewarm_parallel_fetcher,
+    restart_parallel_fetcher,
+    set_config_path,
+)
+
+set_config_path(r"D:\\configs\\zsdtdx.yaml")
+
+# 1) 启动预热（可选）：把 async 冷启动成本前移
+prewarm_summary = prewarm_parallel_fetcher(
+    require_all_workers=True,
+    timeout_seconds=60,
+    max_rounds=3,
+)
+
+# 2) 运行期重启（可选）：出现连续 timeout/连接异常时快速回收 worker
+restart_summary = restart_parallel_fetcher(
+    prewarm=True,
+    prewarm_timeout_seconds=60,
+    max_rounds=3,
+)
+
+# 3) 主动销毁（可选）：服务优雅停机或短脚本收尾时释放进程池
+destroy_summary = destroy_parallel_fetcher()
 ```
 
 ## 关键行为说明
@@ -64,6 +113,13 @@ with get_client() as client:
 - 队列事件结构：
   - 数据事件：`{"event":"data","task":{...},"rows":[...],"error":str|None,"worker_pid":int}`
   - 完成事件：`{"event":"done","total_tasks":...,"success_tasks":...,"failed_tasks":...}`
+- 连接生命周期边界：
+  - `with get_client()` 管理的是主进程 client 连接生命周期。
+  - `mode="async"` 的 worker 连接由并行抓取器独立维护；`with` 结束不会直接关闭 worker 连接。
+- 进程池管理建议：
+  - `prewarm_parallel_fetcher()`：启动阶段或批量任务前调用，降低首批任务抖动。
+  - `restart_parallel_fetcher()`：出现连续 timeout/连接不可用时调用，重建 worker 状态。
+  - `destroy_parallel_fetcher()`：停机或脚本结束前调用，主动释放并行资源。
 
 ## 并行模型（task 链路）
 
@@ -78,17 +134,17 @@ with get_client() as client:
 
 ## 配置说明
 
-- 默认读取包内 `config.yaml`。
-- 可显式指定配置路径：
+- 建议在程序启动阶段调用 `set_config_path(...)` 一次，后续所有 `simple_api` 函数统一使用这份配置。
+- 若未调用 `set_config_path(...)`，首次调用相关接口会打印提醒，并回退到包内默认 `config.yaml`。
 
 ```python
-from zsdtdx import get_client
+from zsdtdx import set_config_path
 
-with get_client(config_path=r"D:\\configs\\zsdtdx.yaml") as client:
-    ...
+set_config_path(r"D:\\configs\\zsdtdx.yaml")
 ```
 
 - 常用并行配置位于 `config.yaml.parallel`：
+  - `process_count_core_multiplier`
   - `task_chunk_cache_min_tasks`
   - `task_chunk_inproc_future_workers`
   - `task_chunk_max_inflight_multiplier`
@@ -102,11 +158,15 @@ with get_client(config_path=r"D:\\configs\\zsdtdx.yaml") as client:
 
 ## API 概览
 
+- `set_config_path`
 - `get_client`
 - `get_supported_markets`
 - `get_stock_code_name`
 - `get_all_future_list`
 - `get_stock_kline`
+- `prewarm_parallel_fetcher`
+- `restart_parallel_fetcher`
+- `destroy_parallel_fetcher`
 - `get_future_kline`
 - `get_company_info`
 - `get_stock_latest_price`
