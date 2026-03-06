@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zsdtdx"
-version = "1.1.0"
+version = "1.1.1"
 description = "Unified wrapper around pytdx-style market data APIs."
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
@@ -23,13 +23,5 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 
-[tool.setuptools]
-package-dir = { "" = "src" }
-include-package-data = true
-
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["zsdtdx*"]
-
-[tool.setuptools.package-data]
-zsdtdx = ["config.yaml"]
+[tool.setuptools.dynamic]
+version = {attr = "zsdtdx.__version__"}

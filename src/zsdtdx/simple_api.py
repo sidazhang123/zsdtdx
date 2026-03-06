@@ -9,7 +9,7 @@
 调用约定：
 1. 程序启动阶段先调用 `set_config_path()` 设置配置路径；后续各接口无需重复传参。
 2. 若未调用 `set_config_path()`，首次调用相关接口会打印提醒并回退到包内默认配置。
-3. 进入 `with get_client() as client:` 后，可在同一个 with 块连续调用多个“主进程 API”（如 `get_supported_markets`、`get_stock_latest_price`、`get_stock_kline(mode="sync")`）复用主进程连接。
+3. 进入 `with get_client():` 后，可在同一个 with 块连续调用多个“主进程 API”（如 `get_supported_markets`、`get_stock_latest_price`、`get_stock_kline(mode="sync")`）复用主进程连接。
 4. `get_stock_kline(mode="async")` 的数据抓取在并行 worker 进程内执行，worker 会独立创建并复用自己的连接，不复用 `with get_client()` 的主进程连接。
 5. async 模式通过 `job.queue` 持续消费结果，直到收到 `event="done"`。
 6. 对 async 冷启动敏感场景可在启动阶段手动调用 `prewarm_parallel_fetcher()`；异常恢复可调用 `restart_parallel_fetcher()`；进程退出前可调用 `destroy_parallel_fetcher()`。
@@ -25,6 +25,9 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import pandas as pd
 
 from zsdtdx.helper import (
+    _apply_active_config_path,
+    _ensure_active_config_ready,
+    _DEFAULT_CONFIG_PATH,
     call_with_client as _call_with_client,
     normalize_future_time_window as _normalize_future_time_window,
     normalize_task_input as _normalize_task_input,
@@ -41,9 +44,6 @@ from zsdtdx.parallel_fetcher import (
 )
 from zsdtdx.unified_client import UnifiedTdxClient
 
-_DEFAULT_CONFIG_PATH = str(Path(__file__).resolve().with_name("config.yaml"))
-_ACTIVE_CONFIG_PATH: Optional[str] = None
-_DEFAULT_CONFIG_NOTICE_PRINTED: bool = False
 _TASK_FREQ_MAP: Dict[str, str] = {
     "d": "d",
     "w": "w",
@@ -137,13 +137,13 @@ class StockKlineTask:
         """
         从字典构造任务对象并执行校验。
 
-        输入：
+        输入:
         1. raw: 包含 code/freq/start_time/end_time 的字典。
-        输出：
+        输出:
         1. `StockKlineTask` 实例。
-        用途：
+        用途:
         1. 兼容 dict 任务输入并统一校验行为。
-        边界条件：
+        边界条件:
         1. raw 不是 dict 时抛 ValueError。
         """
         if not isinstance(raw, dict):
@@ -156,66 +156,6 @@ class StockKlineTask:
         )
         task.validate()
         return task
-
-
-def _apply_active_config_path(config_path: str) -> str:
-    """
-    解析并激活 simple_api 的全局配置路径。
-
-    输入:
-    - config_path: 待激活配置路径（支持相对/绝对路径）。
-
-    输出:
-    - 解析后的绝对配置路径字符串。
-
-    边界条件:
-    - 配置路径不存在、YAML 非法或 hosts 配置无效时会抛出异常。
-    """
-    global _ACTIVE_CONFIG_PATH
-
-    requested = str(config_path or "").strip()
-    if requested == "":
-        raise ValueError("config_path 不能为空")
-
-    client = UnifiedTdxClient(config_path=requested)
-    resolved_path = str(client.config_path)
-    try:
-        client.close()
-    except Exception:
-        pass
-
-    _ACTIVE_CONFIG_PATH = resolved_path
-    set_active_config_path(resolved_path)
-    return resolved_path
-
-
-def _ensure_active_config_ready(caller_name: str) -> str:
-    """
-    确保 simple_api 全局配置已就绪。
-
-    输入:
-    - caller_name: 触发方名称，用于默认配置提醒文本。
-
-    输出:
-    - 当前生效配置路径字符串。
-
-    边界条件:
-    - 若用户未显式设置配置，会自动回退到包内默认配置并打印一次提醒。
-    """
-    global _DEFAULT_CONFIG_NOTICE_PRINTED
-
-    if _ACTIVE_CONFIG_PATH:
-        set_active_config_path(_ACTIVE_CONFIG_PATH)
-        return str(_ACTIVE_CONFIG_PATH)
-
-    default_path = _apply_active_config_path(config_path=_DEFAULT_CONFIG_PATH)
-    if not _DEFAULT_CONFIG_NOTICE_PRINTED:
-        print(
-            f"[zsdtdx.simple_api] {caller_name} 未先调用 set_config_path()，"
-            f"当前使用默认配置: {default_path}"
-        )
-        _DEFAULT_CONFIG_NOTICE_PRINTED = True
-    return default_path
 
 
 def set_config_path(config_path: str) -> str:
@@ -255,7 +195,7 @@ def get_client(
     调用示例:
     ```python
     # 一个 with 中复用同一 client，避免重复建连。
-    with get_client() as client:
+    with get_client():
         markets = get_supported_markets(return_df=True)
         stock_map = get_stock_code_name()
         prices = get_stock_latest_price(["600000", "000001"])
@@ -287,12 +227,12 @@ def get_supported_markets(return_df: Optional[bool] = None):
     """获取标准+扩展行情支持的市场列表。
 
     调用前置约定:
-    - 请先进入 `with get_client() as client:`；
+    - 请先进入 `with get_client():`；
       一个 with 块内可连续调用多个 `get_*` 函数。
 
     调用示例:
     ```python
-    with get_client() as client:
+    with get_client():
         df = get_supported_markets(return_df=True)
     ```
 
@@ -312,7 +252,7 @@ def get_stock_code_name(use_cache: bool = True) -> Dict[str, str]:
     """获取统一股票代码名称字典。
 
     调用前置约定:
-    - 请先进入 `with get_client() as client:`；
+    - 请先进入 `with get_client():`；
       一个 with 块内可连续调用多个 `get_*` 函数。
 
     输入:
@@ -326,7 +266,7 @@ def get_stock_code_name(use_cache: bool = True) -> Dict[str, str]:
 
     调用示例:
     ```python
-    with get_client() as client:
+    with get_client():
         stock_map = get_stock_code_name()
     ```
 
@@ -346,7 +286,7 @@ def get_all_future_list(return_df: Optional[bool] = None, use_cache: bool = True
     """获取统一商品期货列表（郑州/大连/上海/广州）。
 
     调用前置约定:
-    - 请先进入 `with get_client() as client:`；
+    - 请先进入 `with get_client():`；
       一个 with 块内可连续调用多个 `get_*` 函数。
 
     输入:
@@ -354,7 +294,7 @@ def get_all_future_list(return_df: Optional[bool] = None, use_cache: bool = True
 
     调用示例:
     ```python
-    with get_client() as client:
+    with get_client():
         future_df = get_all_future_list(return_df=True)
     ```
 
@@ -379,21 +319,8 @@ def get_stock_kline(
     """获取股票 K 线任务结果（任务化输入，支持同步/异步与队列实时回传）。
 
     调用前置约定:
-    - `mode="sync"`：可进入 `with get_client() as client:` 在主进程复用连接并统一资源释放。
-    - `mode="async"`：可直接调用；async 抓取使用 worker 进程内独立连接。
-      若同一流程还要连续调用主进程 `get_*` 接口，可把这些主进程调用放在 with 块内执行。
-
-    输入:
-    - task: 任务列表，元素是 `StockKlineTask` 或 dict，模板字段:
-      `{code, freq, start_time, end_time}`。
-    - queue: 可选队列，需支持 `put()`。
-      - `mode="sync"` 且不传 queue：仅通过返回值拿到结果。
-      - `mode="sync"` 且传 queue：返回值仍是完整结果列表，同时会向 queue 增量写入 data/done 事件。
-      - `mode="async"` 且不传 queue：函数会自动创建 queue 并挂到返回的 `job.queue`。
-      - `mode="async"` 且传 queue：返回的 `job.queue` 即该 queue。
-    - preprocessor_operator: 可选预处理函数，签名 `f(payload)->dict|None`；
-      返回 None 或空 dict 时该条结果不入队也不进入返回值。
-    - mode: `"sync"` 或 `"async"`，默认 `"async"`。sync 阻塞直到完成；async 立即返回句柄。
+    - `mode="sync"`：可进入 `with get_client():` 在主进程复用连接并统一资源释放。
+    - `mode="async"`：使用多进程内的独立连接，不依赖get_client()。
 
     调用示例（写法一：with 主进程上下文 + sync + 其它接口）:
     ```python
@@ -406,10 +333,10 @@ def get_stock_kline(
         get_supported_markets,
     )
     
-    with get_client() as client:
+    with get_client():
         markets = get_supported_markets(return_df=True)
         prices = get_stock_latest_price(["600000", "000001"])
-        # sync 模式可传入队列，边产出边消费（也可不传，仅用返回值）。
+        # sync 模式可传入队列，边产出边消费；也可不传，待所有结果归集后返回。
         q = py_queue.Queue()
         result = get_stock_kline(
             task=[
@@ -501,22 +428,12 @@ def get_stock_kline(
     raise ValueError("mode 仅支持 'sync' 或 'async'")
 
 
-def prewarm_parallel_fetcher(
-    require_all_workers: bool = True,
-    timeout_seconds: float = 60.0,
-    max_rounds: int = 3,
-    target_workers: Optional[int] = None,
-    spread_standard_hosts: bool = False,
-) -> Dict[str, Any]:
+def prewarm_parallel_fetcher() -> Dict[str, Any]:
     """
     手动预热 async 并行抓取进程池与 worker 常驻连接。
 
-    输入:
-    - require_all_workers: 是否要求目标 worker 全部预热成功。
-    - timeout_seconds: 预热总超时（秒）。
-    - max_rounds: 预热轮次上限。
-    - target_workers: 目标进程数；不传时使用当前 fetcher 配置。
-    - spread_standard_hosts: 是否在预热时分散 worker 到不同标准行情 host。
+    使用 config 中的 parallel.auto_prewarm_* 参数（config 来源：用户 set_config_path() 后使用用户提供的配置文件，如果没有调用则使用包内默认配置文件 config.yaml）。
+    若 config 读取失败，则使用内部兜底值。
 
     输出:
     - 预热摘要字典（目标进程数、已预热进程数、pid 列表、耗时等）。
@@ -526,9 +443,18 @@ def prewarm_parallel_fetcher(
     - 压测/批跑前：希望先确认 worker 建连健康再开始任务。
 
     边界条件:
-    - 默认 `require_all_workers=True`；若预热不足会抛 RuntimeError。
+    - 默认从 config 读取参数；若 config 读取失败则使用兜底值。
+    - 若预热不足会抛 RuntimeError。
     """
     _ensure_active_config_ready(caller_name="prewarm_parallel_fetcher")
+    fetcher = get_fetcher()
+    # 从 config 读取参数，兜底到内部默认值
+    require_all_workers = getattr(fetcher, 'auto_prewarm_require_all_workers', True)
+    timeout_seconds = getattr(fetcher, 'auto_prewarm_timeout_seconds', 60.0)
+    max_rounds = getattr(fetcher, 'auto_prewarm_max_rounds', 3)
+    spread_standard_hosts = getattr(fetcher, 'auto_prewarm_spread_standard_hosts', False)
+    # target_workers 没有对应的 config 参数，使用 None（让内部决定）
+    target_workers = None
     return _prewarm_parallel_fetcher(
         require_all_workers=bool(require_all_workers),
         timeout_seconds=float(timeout_seconds),
@@ -598,7 +524,7 @@ def get_future_kline(
     """获取商品期货 K 线（支持多周期并行获取，返回合并后的 DataFrame）。
 
     调用前置约定:
-    - 请先进入 `with get_client() as client:`；
+    - 请先进入 `with get_client():`；
       一个 with 块内可连续调用多个 `get_*` 函数。
 
     输入:
@@ -613,7 +539,7 @@ def get_future_kline(
     ```python
     from zsdtdx import get_client, get_future_kline
     
-    with get_client() as client:
+    with get_client():
         # 获取多个期货、多个周期的数据，返回一个合并 DataFrame
         df = get_future_kline(
             codes=["CU", "AL"], 
@@ -653,7 +579,7 @@ def get_future_kline(
     
     # 标准化 codes
     if codes is None:
-        with get_client() as client:
+        with get_client():
             codes = list(client.get_all_future_list(return_df=True)["code"].tolist())
     elif isinstance(codes, str):
         codes = [codes]
@@ -683,7 +609,7 @@ def get_company_info(code: str, category: Optional[List[str]] = None, return_df:
     """获取单只股票公司信息。
 
     调用前置约定:
-    - 请先进入 `with get_client() as client:`；
+    - 请先进入 `with get_client():`；
       一个 with 块内可连续调用多个 `get_*` 函数。
 
     输入:
@@ -692,7 +618,7 @@ def get_company_info(code: str, category: Optional[List[str]] = None, return_df:
 
     调用示例:
     ```python
-    with get_client() as client:
+    with get_client():
         info_df = get_company_info(code="689009", category=["最新提示", "公司概况"], return_df=True)
     ```
 
@@ -712,7 +638,7 @@ def get_stock_latest_price(codes: Optional[Any] = None) -> Dict[str, Optional[fl
     """获取股票实时最新价字典。
 
     调用前置约定:
-    - 请先进入 `with get_client() as client:`；
+    - 请先进入 `with get_client():`；
       一个 with 块内可连续调用多个 `get_*` 函数。
 
     输入:
@@ -723,17 +649,17 @@ def get_stock_latest_price(codes: Optional[Any] = None) -> Dict[str, Optional[fl
     调用示例:
     - 1个code:
     ```python
-    with get_client() as client:
+    with get_client():
         one = get_stock_latest_price("600000")
     ```
     - 2个code:
     ```python
-    with get_client() as client:
+    with get_client():
         two = get_stock_latest_price(["600000", "09988"])
     ```
     - 全部code:
     ```python
-    with get_client() as client:
+    with get_client():
         all_prices = get_stock_latest_price()
     ```
 
@@ -753,7 +679,7 @@ def get_future_latest_price(codes: Optional[Any] = None) -> Dict[str, Optional[f
     """获取商品期货实时最新价字典。
 
     调用前置约定:
-    - 请先进入 `with get_client() as client:`；
+    - 请先进入 `with get_client():`；
       一个 with 块内可连续调用多个 `get_*` 函数。
 
     输入:
@@ -762,17 +688,17 @@ def get_future_latest_price(codes: Optional[Any] = None) -> Dict[str, Optional[f
     调用示例:
     - 1个code:
     ```python
-    with get_client() as client:
+    with get_client():
         one = get_future_latest_price("CU2603")
     ```
     - 2个code:
     ```python
-    with get_client() as client:
+    with get_client():
         two = get_future_latest_price(["AL", "CU2603"])
     ```
     - 全部code:
     ```python
-    with get_client() as client:
+    with get_client():
         all_prices = get_future_latest_price()
     ```
 
@@ -792,12 +718,12 @@ def get_runtime_failures() -> pd.DataFrame:
     """获取运行期失败/无数据明细。
 
     调用前置约定:
-    - 请先进入 `with get_client() as client:`；
+    - 请先进入 `with get_client():`；
       一个 with 块内可连续调用多个 `get_*` 函数。
 
     调用示例:
     ```python
-    with get_client() as client:
+    with get_client():
         failures = get_runtime_failures()
     ```
 
@@ -817,12 +743,12 @@ def get_runtime_metadata() -> Dict[str, Any]:
     """获取运行元数据快照。
 
     调用前置约定:
-    - 请先进入 `with get_client() as client:`；
+    - 请先进入 `with get_client():`；
       一个 with 块内可连续调用多个 `get_*` 函数。
 
     调用示例:
     ```python
-    with get_client() as client:
+    with get_client():
         meta = get_runtime_metadata()
     ```
 

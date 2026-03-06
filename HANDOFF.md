@@ -1,6 +1,6 @@
 # zsdtdx 交接文档（工程维护）
 
-更新时间：2026-03-02
+更新时间：2026-03-06
 
 ## 1. 接管基线
 
@@ -48,6 +48,11 @@
 2. `task_chunk_inproc_future_workers`
 3. `task_chunk_max_inflight_multiplier`
 4. `chunk_reconnect_on_unavailable`
+5. `auto_prewarm_on_async`
+6. `auto_prewarm_require_all_workers`
+7. `auto_prewarm_timeout_seconds`
+8. `auto_prewarm_max_rounds`
+9. `auto_prewarm_spread_standard_hosts`
 5. `chunk_reconnect_max_attempts`
 6. `auto_prewarm_on_async`
 7. `auto_prewarm_require_all_workers`

@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.1.1 - 2026-03-06
+
+### Summary
+1. `prewarm_parallel_fetcher` 函数签名简化：移除参数要求，内部直接从 config 读取 `parallel.auto_prewarm_*` 参数（优先使用用户 `set_config_path()` 设置的配置文件，否则使用包内默认 `config.yaml`）。若 config 读取失败，则使用内部兜底值。
+2. README 更新：移除函数参数描述，强调 config 驱动调用方式。
+
 ## v1.1.0 - 2026-03-02
 
 ### Summary

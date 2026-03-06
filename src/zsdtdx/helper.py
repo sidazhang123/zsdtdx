@@ -15,9 +15,14 @@
 
 import struct
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Type
 
 import six
+
+# imported inside functions to avoid circular dependency
+# from zsdtdx.parallel_fetcher import set_active_config_path
+# from zsdtdx.unified_client import UnifiedTdxClient
 
 
 #### XXX: 分析了一下，貌似是类似utf-8的编码方式保存有符号数字
@@ -407,3 +412,75 @@ def call_with_client(
     finally:
         if need_close:
             client.close()
+
+
+# Global variables for config management
+_DEFAULT_CONFIG_PATH = str(Path(__file__).resolve().with_name("config.yaml"))
+_ACTIVE_CONFIG_PATH: Optional[str] = None
+_DEFAULT_CONFIG_NOTICE_PRINTED: bool = False
+
+
+def _apply_active_config_path(config_path: str) -> str:
+    """
+    解析并激活 simple_api 的全局配置路径。
+
+    输入:
+    - config_path: 待激活配置路径（支持相对/绝对路径）。
+
+    输出:
+    - 解析后的绝对配置路径字符串。
+
+    边界条件:
+    - 配置路径不存在、YAML 非法或 hosts 配置无效时会抛出异常。
+    """
+    global _ACTIVE_CONFIG_PATH
+
+    requested = str(config_path or "").strip()
+    if requested == "":
+        raise ValueError("config_path 不能为空")
+
+    # import here to avoid circular imports
+    from zsdtdx.unified_client import UnifiedTdxClient
+    from zsdtdx.parallel_fetcher import set_active_config_path
+
+    client = UnifiedTdxClient(config_path=requested)
+    resolved_path = str(client.config_path)
+    try:
+        client.close()
+    except Exception:
+        pass
+
+    _ACTIVE_CONFIG_PATH = resolved_path
+    set_active_config_path(resolved_path)
+    return resolved_path
+
+
+def _ensure_active_config_ready(caller_name: str) -> str:
+    """
+    确保 simple_api 全局配置已就绪。
+
+    输入:
+    - caller_name: 触发方名称，用于默认配置提醒文本。
+
+    输出:
+    - 当前生效配置路径字符串。
+
+    边界条件:
+    - 若用户未显式设置配置，会自动回退到包内默认配置并打印一次提醒。
+    """
+    global _DEFAULT_CONFIG_NOTICE_PRINTED
+
+    if _ACTIVE_CONFIG_PATH:
+        # avoid circular import
+        from zsdtdx.parallel_fetcher import set_active_config_path
+        set_active_config_path(_ACTIVE_CONFIG_PATH)
+        return str(_ACTIVE_CONFIG_PATH)
+
+    default_path = _apply_active_config_path(config_path=_DEFAULT_CONFIG_PATH)
+    if not _DEFAULT_CONFIG_NOTICE_PRINTED:
+        print(
+            f"[zsdtdx.simple_api] {caller_name} 未先调用 set_config_path()，"
+            f"当前使用默认配置: {default_path}"
+        )
+        _DEFAULT_CONFIG_NOTICE_PRINTED = True
+    return default_path
