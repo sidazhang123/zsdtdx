@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.1.4 - 2026-03-13
+
+### Summary
+1. 修复 Windows 下并行抓取 worker 进程无法继承 `set_config_path()` 用户配置路径的问题，避免 worker 意外回退到包内默认 `config.yaml`。
+2. 当活动配置路径发生变化时，主动销毁旧进程池，确保后续重建的 worker 全部使用最新配置。
+
 ## v1.1.3 - 2026-03-13
 
 ### Summary

@@ -199,7 +199,8 @@ def _get_global_process_pool(max_workers: int) -> ProcessPoolExecutor:
             _global_pool_max_workers = max_workers
             _global_process_pool = ProcessPoolExecutor(
                 max_workers=max_workers,
-                initializer=_init_worker
+                initializer=_init_worker,
+                initargs=(_active_config_path,)
             )
             _global_pool_epoch += 1
             _emit_log("info", f"[Parallel] 创建全局进程池 (workers: {max_workers})")
@@ -1207,19 +1208,22 @@ FUTURE_PATTERNS = {
 }
 
 
-def _init_worker():
+def _init_worker(config_path: Optional[str] = None):
     """
     worker 进程初始化钩子。
 
     输入：
-    1. 无显式输入参数。
+    1. config_path: 主进程传入的活动配置路径；Windows spawn 模式下必须通过此参数传递。
     输出：
     1. 无返回值。
     用途：
-    1. 注册 worker 退出清理逻辑。
+    1. 在 worker 进程中设置活动配置路径，注册退出清理逻辑。
     边界条件：
     1. atexit 注册失败时会降级忽略，避免阻断 worker 启动。
     """
+    global _active_config_path
+    if config_path is not None:
+        _active_config_path = config_path
     try:
         atexit.register(_close_worker_client_context)
     except Exception:
@@ -3297,9 +3301,13 @@ def set_active_config_path(config_path: Optional[str]) -> None:
     """设置并行抓取器和 worker 使用的活动配置路径。"""
     global _active_config_path, _fetcher
     normalized = str(config_path or "").strip() or None
+    old_path = _active_config_path
     _active_config_path = normalized
     if _fetcher is not None and _fetcher.config_path != normalized:
         _fetcher = ParallelKlineFetcher(config_path=normalized)
+    # 配置路径变更时销毁旧进程池，下次使用时按新配置重建
+    if old_path != normalized:
+        _shutdown_global_pool()
 
 
 def get_fetcher() -> ParallelKlineFetcher:
