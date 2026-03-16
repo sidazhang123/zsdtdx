@@ -573,18 +573,18 @@ parallel:
   # 取值: 正浮点数（建议 0.5~3.0）
   # 影响: 倍率越大并发越高，吞吐可能提升，但 CPU/内存占用也会上升。
   process_count_core_multiplier: 1.5
-  # 单次并行抓取的总超时（秒）。
+  # [仅供 get_future_kline 旧路径 _fetch_parallel 使用] 单次并行抓取的总超时（秒）。
   # 取值: 正浮点数
   # 影响: 超时后会回收未完成 future，并按策略触发强制回收与串行补拉。
   parallel_total_timeout_seconds: 300
-  # 单个 future.result 的超时（秒）。
+  # [仅供 get_future_kline 旧路径 _fetch_parallel 使用] 单个 future.result 的超时（秒）。
   # 取值: 正浮点数
   # 影响: 防止 worker 返回阶段异常阻塞。
   parallel_result_timeout_seconds: 600
-  # 总超时后是否触发并行进程强制回收。
+  # [仅供 get_future_kline 旧路径 _fetch_parallel 使用] 总超时后是否触发并行进程强制回收。
   # 取值: true/false
   force_recycle_on_timeout: true
-  # 总超时后是否对未完成任务回退串行补拉。
+  # [仅供 get_future_kline 旧路径 _fetch_parallel 使用] 总超时后是否对未完成任务回退串行补拉。
   # 取值: true/false
   timeout_fallback_to_serial: true
   # chunk 级缓存启用阈值（以 get_stock_kline(task) 任务链路计）。
@@ -599,14 +599,18 @@ parallel:
   # 取值: 正整数
   # 影响: 在飞 future 上限 = 进程数 × 该倍率。
   task_chunk_max_inflight_multiplier: 2
-  # chunk 命中“连接不可用”错误时，是否在 worker 当前线程重建标准连接后重试。
+  # chunk 重试循环中，若错误匹配连接不可用关键词，重试前自动尝试重建连接。
   # 取值: true/false
   # 影响: true 时可降低长任务尾部因连接失效导致的批量失败。
   chunk_reconnect_on_unavailable: true
-  # chunk 命中“连接不可用”后，线程级重建连接的最大重试次数。
-  # 取值: 正整数
-  # 影响: 每个 chunk 最多额外重试 N 次，避免无限重试拖慢整体吞吐。
-  chunk_reconnect_max_attempts: 1
+  # 单个 chunk 执行超时（秒），适用于 get_stock_kline 的 async/sync mode。
+  # 取值: 正浮点数
+  # 影响: 超时后进入重试循环，由 _fetch_one_task_chunk 内部处理。
+  chunk_timeout_seconds: 30
+  # chunk 超时或报错后的最大重试次数，适用于 get_stock_kline 的 async/sync mode。
+  # 取值: 非负整数
+  # 影响: 每个 chunk 最多额外重试 N 次，重试耗尽则标记失败。
+  chunk_retry_max_attempts: 2
   # async 调用时是否自动预热进程池与 worker 常驻连接。
   # 取值: true/false
   # 影响: true 时 async 首次调用会自动触发 prewarm，降低冷启动抖动。
@@ -731,7 +735,8 @@ output:
   - `task_chunk_inproc_future_workers`
   - `task_chunk_max_inflight_multiplier`
   - `chunk_reconnect_on_unavailable`
-  - `chunk_reconnect_max_attempts`
+  - `chunk_timeout_seconds`
+  - `chunk_retry_max_attempts`
   - `auto_prewarm_on_async`
   - `auto_prewarm_require_all_workers`
   - `auto_prewarm_timeout_seconds`

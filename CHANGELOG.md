@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.2.0 - 2026-03-16
+
+### Summary
+1. 并行任务链路重构：`get_stock_kline` async/sync chunk 路径移除整体超时与 bundle 超时，统一为 chunk 级超时 + 通用重试机制。
+2. 修复 chunk 超时实现阻塞问题：超时后使用非阻塞 executor 回收，确保单个 chunk 卡死不会拖住整个链路。
+3. 修复异常吞错导致全量 `no_data` 问题：`allow_none=True` 不再吞掉真实调用失败，断网/连接异常可正确进入重试与失败分支。
+4. 配置与文档更新：新增 `chunk_timeout_seconds`、`chunk_retry_max_attempts`，并将旧版整体超时参数标注为仅供 `get_future_kline` 旧路径使用。
+
 ## v1.1.4 - 2026-03-13
 
 ### Summary

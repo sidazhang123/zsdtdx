@@ -579,7 +579,7 @@ def get_future_kline(
     
     # 标准化 codes
     if codes is None:
-        with get_client():
+        with get_client() as client:
             codes = list(client.get_all_future_list(return_df=True)["code"].tolist())
     elif isinstance(codes, str):
         codes = [codes]

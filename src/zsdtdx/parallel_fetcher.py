@@ -1584,7 +1584,8 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
     chunk_hit_tasks = 0
     chunk_network_page_calls = 0
     reconnect_on_unavailable = bool(chunk_payload.get("reconnect_on_unavailable", True))
-    reconnect_max_attempts = max(0, int(chunk_payload.get("reconnect_max_attempts", 1) or 0))
+    chunk_timeout = max(1.0, float(chunk_payload.get("chunk_timeout_seconds", 30.0) or 30.0))
+    chunk_retry_max = max(0, int(chunk_payload.get("chunk_retry_max_attempts", 2) or 0))
 
     def _run_chunk_fetch_once() -> Dict[str, Any]:
         """
@@ -1595,7 +1596,7 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
         输出：
         1. `get_stock_kline_rows_for_chunk_tasks` 返回字典。
         用途：
-        1. 为失败后“重建连接并重试”复用同一段调用逻辑。
+        1. 为失败后重试复用同一段调用逻辑。
         边界条件：
         1. 调用异常向上抛出，由上层统一处理。
         """
@@ -1604,33 +1605,55 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
             enable_cache=enable_cache,
         )
 
-    try:
-        chunk_result = _run_chunk_fetch_once()
-        result_items = list(chunk_result.get("results") or [])
-        chunk_hit_tasks = int(chunk_result.get("chunk_hit_tasks", 0) or 0)
-        chunk_network_page_calls = int(chunk_result.get("chunk_network_page_calls", 0) or 0)
-    except Exception as exc:
-        error_text = str(exc)[:200]
-        retry_count = 0
-        recover_logs: List[Dict[str, Any]] = []
+    def _run_chunk_fetch_with_timeout() -> Dict[str, Any]:
+        """
+        带超时包裹执行一次 chunk 抓取。
 
-        while (
-            bool(reconnect_on_unavailable)
-            and int(retry_count) < int(reconnect_max_attempts)
-            and _is_connection_unavailable_error(error_text)
-        ):
-            retry_count += 1
+        输入：
+        1. 使用外层闭包变量 chunk_timeout。
+        输出：
+        1. chunk 抓取结果字典。
+        用途：
+        1. 防止单个 chunk 无限阻塞，超时后抛出 TimeoutError 由重试循环捕获。
+        边界条件：
+        1. 超时时 future 被取消，抛出 TimeoutError。
+        2. 超时后 executor 以 wait=False 关闭，不阻塞当前线程；
+           被放弃的工作线程持有独立的线程本地 socket，会在底层 IO 结束后自行退出。
+        """
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="zsdtdx_chunk_timeout")
+        f = executor.submit(_run_chunk_fetch_once)
+        try:
+            return f.result(timeout=chunk_timeout)
+        except Exception:
+            f.cancel()
+            raise
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    # 首次执行
+    error_text = ""
+    chunk_result = None
+    try:
+        chunk_result = _run_chunk_fetch_with_timeout()
+    except Exception as exc:
+        error_text = str(exc)[:200] or type(exc).__name__
+
+    # 通用重试循环：任何异常（含超时）均触发重试
+    retry_count = 0
+    while error_text and retry_count < chunk_retry_max:
+        retry_count += 1
+        # 若连接不可用，重试前尝试重建连接
+        if bool(reconnect_on_unavailable) and _is_connection_unavailable_error(error_text):
             recover_detail = _recover_worker_standard_connection_current_thread(reason=error_text)
-            recover_logs.append(dict(recover_detail))
             _emit_log(
                 "warning",
-                "[Task Parallel] chunk 命中连接不可用，尝试线程级重建标准连接并重试",
+                "[Task Parallel] chunk 重试前尝试重建标准连接",
                 {
-                    "stage": "chunk_connection_recover",
+                    "stage": "chunk_retry_reconnect",
                     "chunk_id": str(chunk_id),
                     "chunk_task_count": int(len(raw_tasks)),
                     "retry_count": int(retry_count),
-                    "retry_limit": int(reconnect_max_attempts),
+                    "retry_limit": int(chunk_retry_max),
                     "recover_ok": bool(recover_detail.get("ok")),
                     "reason": str(error_text),
                     "active_host_before": str(recover_detail.get("active_host_before", "")),
@@ -1638,55 +1661,37 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
                     "recover_error": str(recover_detail.get("error", "")),
                 },
             )
-            if not bool(recover_detail.get("ok")):
-                break
-            try:
-                chunk_result = _run_chunk_fetch_once()
-                result_items = list(chunk_result.get("results") or [])
-                chunk_hit_tasks = int(chunk_result.get("chunk_hit_tasks", 0) or 0)
-                chunk_network_page_calls = int(chunk_result.get("chunk_network_page_calls", 0) or 0)
-                error_text = ""
-                break
-            except Exception as retry_exc:
-                error_text = str(retry_exc)[:200]
-
-        if error_text == "":
-            for index, task in enumerate(normalized_tasks):
-                item = result_items[index] if index < len(result_items) and isinstance(result_items[index], dict) else {}
-                result_task = item.get("task", task)
-                rows = item.get("rows", [])
-                item_error_text = item.get("error")
-                payloads.append(
-                    _build_task_payload(
-                        task=result_task if isinstance(result_task, dict) else task,
-                        rows=rows if isinstance(rows, list) else [],
-                        error=item_error_text,
-                        worker_pid=worker_pid,
-                    )
-                )
-                if str(item_error_text or "").strip():
-                    failures.append((str(task.get("code", "")), str(task.get("freq", "")), str(item_error_text)[:200]))
-            return {
-                "chunk_id": chunk_id,
-                "chunk_task_count": int(len(raw_tasks)),
-                "chunk_hit_tasks": int(max(0, chunk_hit_tasks)),
-                "chunk_network_page_calls": int(max(0, chunk_network_page_calls)),
-                "task_detail": task_detail,
-                "payloads": payloads,
-                "failures": failures,
-                "worker_pid": worker_pid,
-            }
-
-        if recover_logs:
+        else:
             _emit_log(
-                "error",
-                "[Task Parallel] chunk 连接重建后仍失败",
+                "warning",
+                "[Task Parallel] chunk 执行失败，开始重试",
                 {
-                    "stage": "chunk_connection_recover_failed",
+                    "stage": "chunk_retry",
                     "chunk_id": str(chunk_id),
                     "chunk_task_count": int(len(raw_tasks)),
                     "retry_count": int(retry_count),
-                    "retry_limit": int(reconnect_max_attempts),
+                    "retry_limit": int(chunk_retry_max),
+                    "reason": str(error_text),
+                },
+            )
+        try:
+            chunk_result = _run_chunk_fetch_with_timeout()
+            error_text = ""
+        except Exception as retry_exc:
+            error_text = str(retry_exc)[:200] or type(retry_exc).__name__
+
+    # 重试耗尽仍失败：标记所有 tasks 为 failed
+    if error_text:
+        if retry_count > 0:
+            _emit_log(
+                "error",
+                "[Task Parallel] chunk 重试耗尽仍失败",
+                {
+                    "stage": "chunk_retry_exhausted",
+                    "chunk_id": str(chunk_id),
+                    "chunk_task_count": int(len(raw_tasks)),
+                    "retry_count": int(retry_count),
+                    "retry_limit": int(chunk_retry_max),
                     "last_error": str(error_text),
                 },
             )
@@ -1704,21 +1709,26 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
             "worker_pid": worker_pid,
         }
 
+    # 成功：解析结果
+    result_items = list(chunk_result.get("results") or [])
+    chunk_hit_tasks = int(chunk_result.get("chunk_hit_tasks", 0) or 0)
+    chunk_network_page_calls = int(chunk_result.get("chunk_network_page_calls", 0) or 0)
+
     for index, task in enumerate(normalized_tasks):
         item = result_items[index] if index < len(result_items) and isinstance(result_items[index], dict) else {}
         result_task = item.get("task", task)
         rows = item.get("rows", [])
-        error_text = item.get("error")
+        item_error_text = item.get("error")
         payloads.append(
             _build_task_payload(
                 task=result_task if isinstance(result_task, dict) else task,
                 rows=rows if isinstance(rows, list) else [],
-                error=error_text,
+                error=item_error_text,
                 worker_pid=worker_pid,
             )
         )
-        if str(error_text or "").strip():
-            failures.append((str(task.get("code", "")), str(task.get("freq", "")), str(error_text)[:200]))
+        if str(item_error_text or "").strip():
+            failures.append((str(task.get("code", "")), str(task.get("freq", "")), str(item_error_text)[:200]))
 
     return {
         "chunk_id": chunk_id,
@@ -1750,12 +1760,14 @@ def _fetch_chunk_bundle(bundle_payload: Dict[str, Any]) -> Dict[str, Any]:
     inproc_workers = max(1, int(bundle_payload.get("inproc_workers", 1) or 1))
     bundle_id = int(bundle_payload.get("bundle_id", 0) or 0)
     reconnect_on_unavailable = bool(bundle_payload.get("reconnect_on_unavailable", True))
-    reconnect_max_attempts = max(0, int(bundle_payload.get("reconnect_max_attempts", 1) or 0))
+    chunk_timeout_seconds = float(bundle_payload.get("chunk_timeout_seconds", 30.0) or 30.0)
+    chunk_retry_max_attempts = int(bundle_payload.get("chunk_retry_max_attempts", 2) or 0)
     prepared_chunk_payloads: List[Dict[str, Any]] = []
     for chunk_payload in chunk_payloads:
         normalized_payload = dict(chunk_payload) if isinstance(chunk_payload, dict) else {}
         normalized_payload["reconnect_on_unavailable"] = bool(reconnect_on_unavailable)
-        normalized_payload["reconnect_max_attempts"] = int(reconnect_max_attempts)
+        normalized_payload["chunk_timeout_seconds"] = float(chunk_timeout_seconds)
+        normalized_payload["chunk_retry_max_attempts"] = int(chunk_retry_max_attempts)
         prepared_chunk_payloads.append(normalized_payload)
 
     chunk_reports: List[Dict[str, Any]] = []
@@ -1800,16 +1812,22 @@ def _fetch_chunk_bundle(bundle_payload: Dict[str, Any]) -> Dict[str, Any]:
                 report = future.result()
             except Exception as exc:
                 error_text = str(exc)[:200]
-                report = _fetch_one_task_chunk(
-                    {
-                        **dict(chunk_payload),
-                        "enable_cache": False,
-                    }
-                )
-                for payload in list(report.get("payloads") or []):
-                    if str(payload.get("error") or "").strip():
-                        continue
-                    payload["error"] = error_text
+                raw_tasks = list(chunk_payload.get("tasks") or [])
+                report = {
+                    "chunk_id": str(chunk_payload.get("chunk_id", "")),
+                    "chunk_task_count": int(len(raw_tasks)),
+                    "chunk_hit_tasks": 0,
+                    "chunk_network_page_calls": 0,
+                    "payloads": [
+                        _build_task_payload(task=t, rows=[], error=error_text, worker_pid=worker_pid)
+                        for t in raw_tasks
+                    ],
+                    "failures": [
+                        (str((t or {}).get("code", "")), str((t or {}).get("freq", "")), error_text)
+                        for t in raw_tasks
+                    ],
+                    "worker_pid": worker_pid,
+                }
             chunk_reports.append(report)
             payloads.extend(list(report.get("payloads") or []))
     finally:
@@ -2011,9 +2029,14 @@ class ParallelKlineFetcher:
         self.chunk_reconnect_on_unavailable = bool(
             parallel_cfg.get("chunk_reconnect_on_unavailable", True)
         )
-        self.chunk_reconnect_max_attempts = self._safe_int_config(
-            parallel_cfg.get("chunk_reconnect_max_attempts"),
-            default=1,
+        self.chunk_timeout_seconds = self._safe_float_config(
+            parallel_cfg.get("chunk_timeout_seconds"),
+            default=30.0,
+            minimum=1.0,
+        )
+        self.chunk_retry_max_attempts = self._safe_int_config(
+            parallel_cfg.get("chunk_retry_max_attempts"),
+            default=2,
             minimum=0,
         )
         self.process_count_core_multiplier = self._safe_float_config(
@@ -2427,7 +2450,7 @@ class ParallelKlineFetcher:
         用途：
         1. 为“单进程 + chunk future 并发”场景提供结果流。
         边界条件：
-        1. 总超时会取消未完成 future，并为未完成任务补充 timeout payload。
+        1. chunk 级超时与重试由 _fetch_one_task_chunk 内部处理。
         """
         task_list = [_normalize_task_payload(item) for item in list(tasks or [])]
         if not task_list:
@@ -2439,11 +2462,8 @@ class ParallelKlineFetcher:
 
         total_tasks = int(len(task_list))
         total_chunks = int(len(chunks))
-        total_timeout = max(1.0, float(self.parallel_total_timeout_seconds))
-        per_future_timeout = max(1.0, float(self.parallel_result_timeout_seconds))
         max_workers = max(1, min(int(self.task_chunk_inproc_future_workers), int(len(chunks))))
         done_tasks = 0
-        timeout_started = time.monotonic()
 
         future_map: Dict[Future, TaskChunk] = {}
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="zsdtdx_main_chunk_worker") as executor:
@@ -2473,126 +2493,93 @@ class ParallelKlineFetcher:
                     enable_cache=bool(chunk.task_count >= int(self.task_chunk_cache_min_tasks))
                 )
                 chunk_payload["reconnect_on_unavailable"] = bool(self.chunk_reconnect_on_unavailable)
-                chunk_payload["reconnect_max_attempts"] = int(self.chunk_reconnect_max_attempts)
+                chunk_payload["chunk_timeout_seconds"] = float(self.chunk_timeout_seconds)
+                chunk_payload["chunk_retry_max_attempts"] = int(self.chunk_retry_max_attempts)
                 future = executor.submit(_fetch_one_task_chunk, chunk_payload)
                 future_map[future] = chunk
 
-            try:
-                for future in as_completed(list(future_map.keys()), timeout=total_timeout):
-                    chunk = future_map[future]
-                    chunk_task_count = int(chunk.task_count)
-                    try:
-                        report = future.result(timeout=per_future_timeout)
-                        payloads = list(report.get("payloads") or [])
-                        if len(payloads) < len(chunk.tasks):
-                            for task in chunk.tasks[len(payloads):]:
-                                payloads.append(
-                                    _build_task_payload(
-                                        task=task,
-                                        rows=[],
-                                        error="missing_chunk_payload",
-                                        worker_pid=os.getpid(),
-                                    )
+            for future in as_completed(list(future_map.keys())):
+                chunk = future_map[future]
+                chunk_task_count = int(chunk.task_count)
+                try:
+                    report = future.result()
+                    payloads = list(report.get("payloads") or [])
+                    if len(payloads) < len(chunk.tasks):
+                        for task in chunk.tasks[len(payloads):]:
+                            payloads.append(
+                                _build_task_payload(
+                                    task=task,
+                                    rows=[],
+                                    error="missing_chunk_payload",
+                                    worker_pid=os.getpid(),
                                 )
-
-                        chunk_failure_count = 0
-                        failure_tasks: List[Dict[str, Any]] = []
-                        for payload in payloads:
-                            error_text = str(payload.get("error") or "").strip()
-                            if not error_text:
-                                continue
-                            chunk_failure_count += 1
-                            task_obj = payload.get("task") if isinstance(payload.get("task"), dict) else {}
-                            failure_tasks.append(
-                                {
-                                    "code": str(task_obj.get("code", "")),
-                                    "freq": str(task_obj.get("freq", "")),
-                                    "error": error_text,
-                                    "start_time": task_obj.get("start_time"),
-                                    "end_time": task_obj.get("end_time"),
-                                }
                             )
 
-                        done_tasks += chunk_task_count
-                        chunk_hit_tasks = int(report.get("chunk_hit_tasks", 0) or 0)
-                        chunk_network_page_calls = int(report.get("chunk_network_page_calls", 0) or 0)
-                        _emit_log(
-                            "info",
-                            "[Task Inproc] chunk 任务完成",
+                    chunk_failure_count = 0
+                    failure_tasks: List[Dict[str, Any]] = []
+                    for payload in payloads:
+                        error_text = str(payload.get("error") or "").strip()
+                        if not error_text:
+                            continue
+                        chunk_failure_count += 1
+                        task_obj = payload.get("task") if isinstance(payload.get("task"), dict) else {}
+                        failure_tasks.append(
                             {
-                                "stage": "chunk_completed",
-                                "bundle_index": 1,
-                                "bundle_total": 1,
-                                "chunk_id": str(chunk.chunk_id),
-                                "chunk_key": f"{chunk.code}|{chunk.freq}",
-                                "chunk_task_count": int(chunk_task_count),
-                                "chunk_failure_count": int(chunk_failure_count),
-                                "chunk_hit_tasks": int(chunk_hit_tasks),
-                                "chunk_network_page_calls": int(chunk_network_page_calls),
-                                "fetch_tasks_done": int(done_tasks),
-                                "fetch_tasks_total": int(total_tasks),
-                                "failure_codes": [str(chunk.code)] if chunk_failure_count > 0 else [],
-                                "failure_tasks": failure_tasks,
-                            },
+                                "code": str(task_obj.get("code", "")),
+                                "freq": str(task_obj.get("freq", "")),
+                                "error": error_text,
+                                "start_time": task_obj.get("start_time"),
+                                "end_time": task_obj.get("end_time"),
+                            }
                         )
-                        for payload in payloads:
-                            yield payload
-                    except Exception as exc:
-                        error_text = str(exc)[:200]
-                        done_tasks += chunk_task_count
-                        _emit_log(
-                            "error",
-                            f"[Task Inproc] chunk 执行失败: {error_text}",
-                            {
-                                "stage": "chunk_failed",
-                                "bundle_index": 1,
-                                "bundle_total": 1,
-                                "chunk_id": str(chunk.chunk_id),
-                                "chunk_key": f"{chunk.code}|{chunk.freq}",
-                                "chunk_task_count": int(chunk_task_count),
-                                "chunk_failure_count": int(chunk_task_count),
-                                "fetch_tasks_done": int(done_tasks),
-                                "fetch_tasks_total": int(total_tasks),
-                            },
-                        )
-                        for task in chunk.tasks:
-                            yield _build_task_payload(
-                                task=task,
-                                rows=[],
-                                error=error_text,
-                                worker_pid=os.getpid(),
-                            )
-            except TimeoutError:
-                unfinished = [future for future in list(future_map.keys()) if not future.done()]
-                unfinished_tasks = int(sum(int(future_map[item].task_count) for item in unfinished))
-                elapsed = round(time.monotonic() - timeout_started, 3)
-                _emit_log(
-                    "error",
-                    "[Task Inproc Timeout] 主进程 chunk 并发总超时，开始回收未完成 future",
-                    {
-                        "stage": "chunk_timeout",
-                        "elapsed_seconds": float(elapsed),
-                        "timeout_seconds": float(total_timeout),
-                        "unfinished_futures": int(len(unfinished)),
-                        "unfinished_chunks": int(len(unfinished)),
-                        "unfinished_tasks": int(unfinished_tasks),
-                        "fetch_tasks_done": int(done_tasks),
-                        "fetch_tasks_total": int(total_tasks),
-                    },
-                )
-                for future in unfinished:
-                    try:
-                        future.cancel()
-                    except Exception:
-                        pass
-                    chunk = future_map.get(future)
-                    if chunk is None:
-                        continue
+
+                    done_tasks += chunk_task_count
+                    chunk_hit_tasks = int(report.get("chunk_hit_tasks", 0) or 0)
+                    chunk_network_page_calls = int(report.get("chunk_network_page_calls", 0) or 0)
+                    _emit_log(
+                        "info",
+                        "[Task Inproc] chunk 任务完成",
+                        {
+                            "stage": "chunk_completed",
+                            "bundle_index": 1,
+                            "bundle_total": 1,
+                            "chunk_id": str(chunk.chunk_id),
+                            "chunk_key": f"{chunk.code}|{chunk.freq}",
+                            "chunk_task_count": int(chunk_task_count),
+                            "chunk_failure_count": int(chunk_failure_count),
+                            "chunk_hit_tasks": int(chunk_hit_tasks),
+                            "chunk_network_page_calls": int(chunk_network_page_calls),
+                            "fetch_tasks_done": int(done_tasks),
+                            "fetch_tasks_total": int(total_tasks),
+                            "failure_codes": [str(chunk.code)] if chunk_failure_count > 0 else [],
+                            "failure_tasks": failure_tasks,
+                        },
+                    )
+                    for payload in payloads:
+                        yield payload
+                except Exception as exc:
+                    error_text = str(exc)[:200]
+                    done_tasks += chunk_task_count
+                    _emit_log(
+                        "error",
+                        f"[Task Inproc] chunk 执行失败: {error_text}",
+                        {
+                            "stage": "chunk_failed",
+                            "bundle_index": 1,
+                            "bundle_total": 1,
+                            "chunk_id": str(chunk.chunk_id),
+                            "chunk_key": f"{chunk.code}|{chunk.freq}",
+                            "chunk_task_count": int(chunk_task_count),
+                            "chunk_failure_count": int(chunk_task_count),
+                            "fetch_tasks_done": int(done_tasks),
+                            "fetch_tasks_total": int(total_tasks),
+                        },
+                    )
                     for task in chunk.tasks:
                         yield _build_task_payload(
                             task=task,
                             rows=[],
-                            error="parallel_total_timeout",
+                            error=error_text,
                             worker_pid=os.getpid(),
                         )
 
@@ -2607,7 +2594,7 @@ class ParallelKlineFetcher:
         用途：
         1. 实现“按 code+freq 分片 + 分片内顺序 + 分片缓存 + 两层并发”。
         边界条件：
-        1. 总超时会取消未完成 future，并为未完成任务补充 timeout payload。
+        1. chunk 级超时与重试由 _fetch_one_task_chunk 内部处理。
         """
         task_list = [_normalize_task_payload(item) for item in list(tasks or [])]
         if not task_list:
@@ -2623,8 +2610,6 @@ class ParallelKlineFetcher:
         total_tasks = int(len(task_list))
         total_chunks = int(len(chunks))
         total_bundles = int(len(bundles))
-        total_timeout = max(1.0, float(self.parallel_total_timeout_seconds))
-        per_future_timeout = max(1.0, float(self.parallel_result_timeout_seconds))
         max_inflight = max(1, int(self.num_processes) * int(self.task_chunk_max_inflight_multiplier))
 
         executor = _get_global_process_pool(self.num_processes)
@@ -2632,7 +2617,6 @@ class ParallelKlineFetcher:
         bundle_cursor = 0
         done_tasks = 0
         dispatch_cursor = 0
-        timeout_started = time.monotonic()
 
         def _submit_one_bundle() -> bool:
             """
@@ -2656,7 +2640,8 @@ class ParallelKlineFetcher:
             bundle_payload = bundle.to_payload(cache_min_tasks=self.task_chunk_cache_min_tasks)
             bundle_payload["inproc_workers"] = int(self.task_chunk_inproc_future_workers)
             bundle_payload["reconnect_on_unavailable"] = bool(self.chunk_reconnect_on_unavailable)
-            bundle_payload["reconnect_max_attempts"] = int(self.chunk_reconnect_max_attempts)
+            bundle_payload["chunk_timeout_seconds"] = float(self.chunk_timeout_seconds)
+            bundle_payload["chunk_retry_max_attempts"] = int(self.chunk_retry_max_attempts)
             future = executor.submit(_fetch_chunk_bundle, bundle_payload)
             pending_futures[future] = {"bundle": bundle}
 
@@ -2686,157 +2671,110 @@ class ParallelKlineFetcher:
         while len(pending_futures) < max_inflight and _submit_one_bundle():
             pass
 
-        try:
-            while pending_futures or bundle_cursor < len(bundles):
-                while len(pending_futures) < max_inflight and _submit_one_bundle():
-                    pass
-                if not pending_futures:
-                    break
+        while pending_futures or bundle_cursor < len(bundles):
+            while len(pending_futures) < max_inflight and _submit_one_bundle():
+                pass
+            if not pending_futures:
+                break
 
-                elapsed = time.monotonic() - timeout_started
-                remaining = total_timeout - elapsed
-                if remaining <= 0:
-                    raise TimeoutError("parallel_total_timeout")
+            done_future = next(as_completed(list(pending_futures.keys())))
 
-                try:
-                    done_future = next(as_completed(list(pending_futures.keys()), timeout=remaining))
-                except TimeoutError:
-                    raise TimeoutError("parallel_total_timeout") from None
-
-                meta = pending_futures.pop(done_future)
-                bundle = meta["bundle"]
-                try:
-                    bundle_result = done_future.result(timeout=per_future_timeout)
-                except Exception as exc:
-                    error_text = str(exc)[:200]
-                    for chunk in bundle.chunks:
-                        chunk_task_count = int(chunk.task_count)
-                        done_tasks += chunk_task_count
-                        _emit_log(
-                            "error",
-                            f"[Task Parallel] chunk 批次执行失败: {error_text}",
-                            {
-                                "stage": "chunk_failed",
-                                "bundle_index": int(bundle.bundle_id),
-                                "bundle_total": int(total_bundles),
-                                "chunk_id": str(chunk.chunk_id),
-                                "chunk_key": f"{chunk.code}|{chunk.freq}",
-                                "chunk_task_count": int(chunk_task_count),
-                                "chunk_failure_count": int(chunk_task_count),
-                                "fetch_tasks_done": int(done_tasks),
-                                "fetch_tasks_total": int(total_tasks),
-                            },
-                        )
-                        for task in chunk.tasks:
-                            yield _build_task_payload(
-                                task=task,
-                                rows=[],
-                                error=error_text,
-                                worker_pid=os.getpid(),
-                            )
-                    continue
-
-                report_map: Dict[str, Dict[str, Any]] = {}
-                for report in list(bundle_result.get("chunk_reports") or []):
-                    if isinstance(report, dict):
-                        report_map[str(report.get("chunk_id", ""))] = report
-
+            meta = pending_futures.pop(done_future)
+            bundle = meta["bundle"]
+            try:
+                bundle_result = done_future.result()
+            except Exception as exc:
+                error_text = str(exc)[:200]
                 for chunk in bundle.chunks:
-                    report = report_map.get(str(chunk.chunk_id), {})
-                    payloads = list(report.get("payloads") or [])
-                    if len(payloads) < len(chunk.tasks):
-                        for task in chunk.tasks[len(payloads):]:
-                            payloads.append(
-                                _build_task_payload(
-                                    task=task,
-                                    rows=[],
-                                    error="missing_chunk_payload",
-                                    worker_pid=os.getpid(),
-                                )
-                            )
-
                     chunk_task_count = int(chunk.task_count)
-                    chunk_failure_count = 0
-                    failure_tasks: List[Dict[str, Any]] = []
-                    for payload in payloads:
-                        error_text = str(payload.get("error") or "").strip()
-                        if not error_text:
-                            continue
-                        chunk_failure_count += 1
-                        task_obj = payload.get("task") if isinstance(payload.get("task"), dict) else {}
-                        failure_tasks.append(
-                            {
-                                "code": str(task_obj.get("code", "")),
-                                "freq": str(task_obj.get("freq", "")),
-                                "error": error_text,
-                                "start_time": task_obj.get("start_time"),
-                                "end_time": task_obj.get("end_time"),
-                            }
-                        )
-
                     done_tasks += chunk_task_count
-                    chunk_hit_tasks = int(report.get("chunk_hit_tasks", 0) or 0)
-                    chunk_network_page_calls = int(report.get("chunk_network_page_calls", 0) or 0)
                     _emit_log(
-                        "info",
-                        "[Task Parallel] chunk 任务完成",
+                        "error",
+                        f"[Task Parallel] chunk 批次执行失败: {error_text}",
                         {
-                            "stage": "chunk_completed",
+                            "stage": "chunk_failed",
                             "bundle_index": int(bundle.bundle_id),
                             "bundle_total": int(total_bundles),
                             "chunk_id": str(chunk.chunk_id),
                             "chunk_key": f"{chunk.code}|{chunk.freq}",
                             "chunk_task_count": int(chunk_task_count),
-                            "chunk_failure_count": int(chunk_failure_count),
-                            "chunk_hit_tasks": int(chunk_hit_tasks),
-                            "chunk_network_page_calls": int(chunk_network_page_calls),
+                            "chunk_failure_count": int(chunk_task_count),
                             "fetch_tasks_done": int(done_tasks),
                             "fetch_tasks_total": int(total_tasks),
-                            "failure_codes": [str(chunk.code)] if chunk_failure_count > 0 else [],
-                            "failure_tasks": failure_tasks,
                         },
                     )
-
-                    for payload in payloads:
-                        yield payload
-        except TimeoutError:
-            unfinished = [future for future in list(pending_futures.keys()) if not future.done()]
-            unfinished_meta = [pending_futures[item] for item in unfinished]
-            unfinished_chunks = int(sum(len(meta.get("bundle").chunks) for meta in unfinished_meta))
-            unfinished_tasks = int(sum(item.task_count for meta in unfinished_meta for item in meta.get("bundle").chunks))
-            elapsed = round(time.monotonic() - timeout_started, 3)
-            _emit_log(
-                "error",
-                "[Task Parallel Timeout] chunk 化并行抓取总超时，开始回收未完成 future",
-                {
-                    "stage": "chunk_timeout",
-                    "elapsed_seconds": float(elapsed),
-                    "timeout_seconds": float(total_timeout),
-                    "unfinished_futures": int(len(unfinished)),
-                    "unfinished_chunks": int(unfinished_chunks),
-                    "unfinished_tasks": int(unfinished_tasks),
-                    "fetch_tasks_done": int(done_tasks),
-                    "fetch_tasks_total": int(total_tasks),
-                },
-            )
-            for future in unfinished:
-                try:
-                    future.cancel()
-                except Exception:
-                    pass
-
-            for meta in unfinished_meta:
-                bundle = meta.get("bundle")
-                if bundle is None:
-                    continue
-                for chunk in bundle.chunks:
                     for task in chunk.tasks:
                         yield _build_task_payload(
                             task=task,
                             rows=[],
-                            error="parallel_total_timeout",
+                            error=error_text,
                             worker_pid=os.getpid(),
                         )
+                continue
+
+            report_map: Dict[str, Dict[str, Any]] = {}
+            for report in list(bundle_result.get("chunk_reports") or []):
+                if isinstance(report, dict):
+                    report_map[str(report.get("chunk_id", ""))] = report
+
+            for chunk in bundle.chunks:
+                report = report_map.get(str(chunk.chunk_id), {})
+                payloads = list(report.get("payloads") or [])
+                if len(payloads) < len(chunk.tasks):
+                    for task in chunk.tasks[len(payloads):]:
+                        payloads.append(
+                            _build_task_payload(
+                                task=task,
+                                rows=[],
+                                error="missing_chunk_payload",
+                                worker_pid=os.getpid(),
+                            )
+                        )
+
+                chunk_task_count = int(chunk.task_count)
+                chunk_failure_count = 0
+                failure_tasks: List[Dict[str, Any]] = []
+                for payload in payloads:
+                    error_text = str(payload.get("error") or "").strip()
+                    if not error_text:
+                        continue
+                    chunk_failure_count += 1
+                    task_obj = payload.get("task") if isinstance(payload.get("task"), dict) else {}
+                    failure_tasks.append(
+                        {
+                            "code": str(task_obj.get("code", "")),
+                            "freq": str(task_obj.get("freq", "")),
+                            "error": error_text,
+                            "start_time": task_obj.get("start_time"),
+                            "end_time": task_obj.get("end_time"),
+                        }
+                    )
+
+                done_tasks += chunk_task_count
+                chunk_hit_tasks = int(report.get("chunk_hit_tasks", 0) or 0)
+                chunk_network_page_calls = int(report.get("chunk_network_page_calls", 0) or 0)
+                _emit_log(
+                    "info",
+                    "[Task Parallel] chunk 任务完成",
+                    {
+                        "stage": "chunk_completed",
+                        "bundle_index": int(bundle.bundle_id),
+                        "bundle_total": int(total_bundles),
+                        "chunk_id": str(chunk.chunk_id),
+                        "chunk_key": f"{chunk.code}|{chunk.freq}",
+                        "chunk_task_count": int(chunk_task_count),
+                        "chunk_failure_count": int(chunk_failure_count),
+                        "chunk_hit_tasks": int(chunk_hit_tasks),
+                        "chunk_network_page_calls": int(chunk_network_page_calls),
+                        "fetch_tasks_done": int(done_tasks),
+                        "fetch_tasks_total": int(total_tasks),
+                        "failure_codes": [str(chunk.code)] if chunk_failure_count > 0 else [],
+                        "failure_tasks": failure_tasks,
+                    },
+                )
+
+                for payload in payloads:
+                    yield payload
 
     def fetch_stock_tasks_sync(
         self,

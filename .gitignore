@@ -26,5 +26,7 @@ examples/*_result.json
 examples/benchmark_taskset_1000x5x15.json
 examples/pytdx_standard_hosts_probe_result.json
 examples/async_1000x5x15_connection_check_result.json
+examples/async_1000x5x15_queue_events.jsonl
+examples/async_1000x5x15_queue_summary.json
 examples/diagrams/*.svg
 examples/diagrams/*.png

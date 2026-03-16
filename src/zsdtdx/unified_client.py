@@ -308,7 +308,9 @@ class PersistentFailoverPool:
                     break
                 break
 
-        if allow_none:
+        # allow_none 仅用于“目标接口确实返回 None”场景；
+        # 若本次调用链发生了真实异常（last_exception 非空），不能吞错返回 None。
+        if allow_none and last_exception is None:
             with self._stats_lock:
                 self._global_stats["none_as_end"] += 1
             return None
