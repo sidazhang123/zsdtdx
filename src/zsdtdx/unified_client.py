@@ -7,9 +7,11 @@ import ipaddress
 import json
 import math
 import re
+import socket as _socket_mod
 import threading
 import time
 import weakref
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -18,9 +20,90 @@ import yaml
 
 from zsdtdx.exhq import TdxExHq_API
 from zsdtdx.hq import TdxHq_API
+from zsdtdx.log import log
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
 _DEFAULT_CONFIG_PATH = _PACKAGE_DIR / "config.yaml"
+
+# ---------------------------------------------------------------------------
+# TCP 延迟探测：主进程探测结果缓存（供 worker 子进程复用）
+# ---------------------------------------------------------------------------
+_probe_result_cache: Dict[str, List[Tuple[str, int]]] = {}
+_probe_result_cache_lock = threading.Lock()
+
+
+def get_probe_result_cache() -> Dict[str, List[Tuple[str, int]]]:
+    """返回主进程 TCP 探测排序结果的快照，key 为池名称（standard/extended）。"""
+    with _probe_result_cache_lock:
+        return {k: list(v) for k, v in _probe_result_cache.items()}
+
+
+def _tcp_probe_one(host: str, port: int, timeout: float) -> Tuple[Tuple[str, int], Optional[float]]:
+    """对单个 host 做 TCP Connect 探测，返回 (host_tuple, latency_ms) 或 (host_tuple, None)。"""
+    sock = _socket_mod.socket(_socket_mod.AF_INET, _socket_mod.SOCK_STREAM)
+    sock.settimeout(timeout)
+    t0 = time.monotonic()
+    try:
+        sock.connect((host, port))
+        latency = (time.monotonic() - t0) * 1000.0
+        return ((host, port), latency)
+    except Exception:
+        return ((host, port), None)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _tcp_probe_hosts(hosts: List[Tuple[str, int]], timeout: float) -> List[Tuple[str, int]]:
+    """
+    并发 TCP Connect 探测所有 host，按延迟升序排列返回。
+
+    输入：
+    1. hosts: (ip, port) 列表。
+    2. timeout: 单个探测超时（秒）。
+    输出：
+    1. 按延迟升序排列的 host 列表；不可达 host 排末尾但保留（failover 后备）。
+    """
+    if not hosts:
+        return []
+    if len(hosts) == 1:
+        return list(hosts)
+
+    workers = min(len(hosts), 32)
+    results: List[Tuple[Tuple[str, int], Optional[float]]] = []
+    with _ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_tcp_probe_one, h, p, timeout): (h, p)
+            for h, p in hosts
+        }
+        for future in futures:
+            try:
+                results.append(future.result(timeout=timeout + 1.0))
+            except Exception:
+                host_tuple = futures[future]
+                results.append((host_tuple, None))
+
+    reachable = [(ht, lat) for ht, lat in results if lat is not None]
+    unreachable = [(ht, lat) for ht, lat in results if lat is None]
+    reachable.sort(key=lambda x: x[1])
+
+    # 日志摘要
+    total = len(results)
+    ok_count = len(reachable)
+    if ok_count > 0:
+        top3 = reachable[:3]
+        top3_str = ", ".join(f"{h}:{p} ({lat:.1f}ms)" for (h, p), lat in top3)
+        log.info(f"[TCP Probe] {ok_count}/{total} 可达, 最快: {top3_str}")
+    else:
+        log.warning(f"[TCP Probe] 0/{total} 可达, 全部超时")
+    if unreachable:
+        fail_str = ", ".join(f"{h}:{p}" for (h, p), _ in unreachable)
+        log.info(f"[TCP Probe] 不可达: {fail_str}")
+
+    sorted_hosts = [ht for ht, _ in reachable] + [ht for ht, _ in unreachable]
+    return sorted_hosts
 
 
 class PersistentFailoverPool:
@@ -38,6 +121,9 @@ class PersistentFailoverPool:
         same_host_reconnect_times: int = 1,
         same_host_reconnect_interval_ms: int = 200,
         api_kwargs: Optional[Dict[str, Any]] = None,
+        probe_on_init: bool = False,
+        probe_timeout: float = 0.8,
+        presorted_hosts: Optional[List[Tuple[str, int]]] = None,
     ):
         """输入连接参数，输出连接池实例；用于稳定调用；host 为空会抛错。"""
         if not hosts:
@@ -52,6 +138,16 @@ class PersistentFailoverPool:
         self.same_host_reconnect_times = max(0, int(same_host_reconnect_times))
         self.same_host_reconnect_interval = max(0.0, float(same_host_reconnect_interval_ms) / 1000.0)
         self.api_kwargs = api_kwargs or {}
+
+        # TCP 延迟探测参数
+        self.probe_on_init = bool(probe_on_init)
+        self.probe_timeout = float(probe_timeout)
+        self._hosts_probed = False
+
+        # 若调用方已提供排序结果（worker 子进程场景），直接使用
+        if presorted_hosts is not None:
+            self.hosts = list(presorted_hosts)
+            self._hosts_probed = True
         
         # P0改造：线程本地存储
         self._local = threading.local()
@@ -184,6 +280,13 @@ class PersistentFailoverPool:
         thread_data = self._get_thread_data()
         if thread_data['api'] is not None and thread_data['active_index'] >= 0:
             return True
+        # 首次连接前做 TCP 延迟探测排序（仅一次）
+        if self.probe_on_init and not self._hosts_probed:
+            self._hosts_probed = True
+            sorted_hosts = _tcp_probe_hosts(self.hosts, self.probe_timeout)
+            self.hosts = sorted_hosts
+            with _probe_result_cache_lock:
+                _probe_result_cache[self.name] = list(self.hosts)
         for index in range(len(self.hosts)):
             if self._connect_to_index(index):
                 return True
@@ -406,7 +509,7 @@ class UnifiedTdxClient:
     STOCK_SCOPE_TOKENS = {"szsh", "bj", "hk"}
     _CONTEXT_STACK: List["UnifiedTdxClient"] = []
 
-    def __init__(self, config_path: Optional[str] = None):
+    def __init__(self, config_path: Optional[str] = None, presorted_hosts: Optional[Dict[str, List[Tuple[str, int]]]] = None):
         """输入配置路径，输出客户端实例；用于统一初始化；路径为空时默认包内配置。"""
         resolved_config_path = self._resolve_config_path(config_path)
         self.config_path = str(resolved_config_path)
@@ -427,6 +530,8 @@ class UnifiedTdxClient:
         same_connection_retry_interval_ms = int(pool_cfg.get("same_connection_retry_interval_ms", 800))
         same_host_reconnect_times = int(pool_cfg.get("same_host_reconnect_times", 3))
         same_host_reconnect_interval_ms = int(pool_cfg.get("same_host_reconnect_interval_ms", 50))
+        probe_on_init = bool(pool_cfg.get("probe_on_init", False))
+        probe_timeout = float(pool_cfg.get("probe_timeout", 0.8))
         api_kwargs = {
             "multithread": True,
             "heartbeat": bool(pool_cfg.get("heartbeat", True)),
@@ -435,6 +540,10 @@ class UnifiedTdxClient:
 
         std_hosts = self._normalize_hosts(self.config.get("hosts", {}).get("standard", []))
         ex_hosts = self._normalize_hosts(self.config.get("hosts", {}).get("extended", []))
+
+        presorted_map = presorted_hosts or {}
+        std_presorted = presorted_map.get("standard")
+        ex_presorted = presorted_map.get("extended")
 
         self.std_pool = PersistentFailoverPool(
             "standard",
@@ -447,6 +556,9 @@ class UnifiedTdxClient:
             same_host_reconnect_times=same_host_reconnect_times,
             same_host_reconnect_interval_ms=same_host_reconnect_interval_ms,
             api_kwargs=api_kwargs,
+            probe_on_init=probe_on_init,
+            probe_timeout=probe_timeout,
+            presorted_hosts=std_presorted,
         )
         self.ex_pool = PersistentFailoverPool(
             "extended",
@@ -459,6 +571,9 @@ class UnifiedTdxClient:
             same_host_reconnect_times=same_host_reconnect_times,
             same_host_reconnect_interval_ms=same_host_reconnect_interval_ms,
             api_kwargs=api_kwargs,
+            probe_on_init=probe_on_init,
+            probe_timeout=probe_timeout,
+            presorted_hosts=ex_presorted,
         )
 
         self._markets_df = None

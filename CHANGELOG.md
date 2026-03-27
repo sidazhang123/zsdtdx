@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.3.0 - 2026-03-27
+
+### Summary
+1. 新增 TCP Connect 延迟探测：首次连接前并发对地址池所有 host 做 TCP 握手测速，按延迟升序排列后优先连接最快节点，显著降低首次连接延迟。
+2. 探测结果自动传递给 worker 子进程：主进程探测一次，通过 `initargs` 传递排序结果，避免每个 worker 重复探测。
+3. 新增配置项 `pool.probe_on_init`（开关）和 `pool.probe_timeout`（单 host 超时秒数），可通过配置关闭恢复原行为。
+4. 不可达 host 不丢弃，排至末尾保留作为 failover 后备。
+
 ## v1.2.0 - 2026-03-16
 
 ### Summary

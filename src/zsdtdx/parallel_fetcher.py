@@ -58,6 +58,7 @@ _worker_chunk_executor_workers: int = 0
 _worker_chunk_executor_lock = threading.Lock()
 _worker_chunk_executor_warmed_workers: int = 0
 _active_config_path: Optional[str] = None
+_worker_sorted_hosts: Optional[Dict[str, list]] = None
 
 
 def set_log_callback(callback: Optional[Callable[[str, str, Optional[Dict[str, Any]]], None]]):
@@ -196,11 +197,14 @@ def _get_global_process_pool(max_workers: int) -> ProcessPoolExecutor:
                 except:
                     pass
             
+            from zsdtdx.unified_client import get_probe_result_cache
+            sorted_hosts_snapshot = get_probe_result_cache() or None
+
             _global_pool_max_workers = max_workers
             _global_process_pool = ProcessPoolExecutor(
                 max_workers=max_workers,
                 initializer=_init_worker,
-                initargs=(_active_config_path,)
+                initargs=(_active_config_path, sorted_hosts_snapshot)
             )
             _global_pool_epoch += 1
             _emit_log("info", f"[Parallel] 创建全局进程池 (workers: {max_workers})")
@@ -632,7 +636,7 @@ def _ensure_worker_client_context():
             return _worker_client_context
 
         _close_worker_client_context()
-        holder = UnifiedTdxClient(config_path=_active_config_path)
+        holder = UnifiedTdxClient(config_path=_active_config_path, presorted_hosts=_worker_sorted_hosts)
         context = holder.__enter__()
         _worker_client_holder = holder
         _worker_client_context = context
@@ -1208,12 +1212,13 @@ FUTURE_PATTERNS = {
 }
 
 
-def _init_worker(config_path: Optional[str] = None):
+def _init_worker(config_path: Optional[str] = None, sorted_hosts_map: Optional[Dict[str, list]] = None):
     """
     worker 进程初始化钩子。
 
     输入：
     1. config_path: 主进程传入的活动配置路径；Windows spawn 模式下必须通过此参数传递。
+    2. sorted_hosts_map: 主进程 TCP 探测排序结果，key 为 standard/extended。
     输出：
     1. 无返回值。
     用途：
@@ -1221,9 +1226,11 @@ def _init_worker(config_path: Optional[str] = None):
     边界条件：
     1. atexit 注册失败时会降级忽略，避免阻断 worker 启动。
     """
-    global _active_config_path
+    global _active_config_path, _worker_sorted_hosts
     if config_path is not None:
         _active_config_path = config_path
+    if sorted_hosts_map is not None and isinstance(sorted_hosts_map, dict) and sorted_hosts_map:
+        _worker_sorted_hosts = sorted_hosts_map
     try:
         atexit.register(_close_worker_client_context)
     except Exception:
