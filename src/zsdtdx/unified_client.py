@@ -6,8 +6,10 @@ import datetime as dt
 import ipaddress
 import json
 import math
+import os
 import re
 import socket as _socket_mod
+import tempfile
 import threading
 import time
 import weakref
@@ -110,6 +112,42 @@ def _tcp_probe_hosts(hosts: List[Tuple[str, int]], timeout: float) -> List[Tuple
 
     sorted_hosts = [ht for ht, _ in reachable] + [ht for ht, _ in unreachable]
     return sorted_hosts
+
+
+def _pick_writable_cache_file_path(preferred_path: Path) -> Optional[Path]:
+    """
+    选择可写缓存文件路径；首选目标目录不可写时降级到临时目录。
+
+    输入：
+    1. preferred_path: 首选缓存文件绝对路径。
+    输出：
+    1. 可写缓存文件路径；若均不可写返回 None。
+    用途：
+    1. 规避 Windows 受限目录导致的 Access is denied。
+    边界条件：
+    1. 写探测失败时不会抛错，由调用方决定是否禁用磁盘缓存。
+    """
+    candidates: List[Path] = [Path(preferred_path).resolve()]
+    temp_fallback = (Path(tempfile.gettempdir()) / "zsdtdx" / "cache" / Path(preferred_path).name).resolve()
+    if temp_fallback not in candidates:
+        candidates.append(temp_fallback)
+
+    for candidate in candidates:
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            probe_name = (
+                f".zsdtdx_cache_probe_{os.getpid()}_{threading.get_ident()}_{int(time.time() * 1000)}.tmp"
+            )
+            probe_path = candidate.parent / probe_name
+            with open(probe_path, "wb") as fp:
+                fp.write(b"ok")
+                fp.flush()
+                os.fsync(fp.fileno())
+            probe_path.unlink(missing_ok=True)
+            return candidate
+        except Exception:
+            continue
+    return None
 
 
 class PersistentFailoverPool:
@@ -545,7 +583,21 @@ class UnifiedTdxClient:
                 cache_base = Path(str(raw_cache_dir).strip()).expanduser()
                 if not cache_base.is_absolute():
                     cache_base = Path.cwd() / cache_base
-            self._index_disk_cache_path = (cache_base / cache_filename).resolve()
+            preferred_cache_path = (cache_base / cache_filename).resolve()
+            writable_cache_path = _pick_writable_cache_file_path(preferred_cache_path)
+            if writable_cache_path is None:
+                self._index_disk_cache_enabled = False
+                self._index_disk_cache_path = None
+                log.warning(
+                    f"[IndexRouteDiskCache] 缓存目录不可写，已自动禁用磁盘缓存: {preferred_cache_path}"
+                )
+            else:
+                self._index_disk_cache_path = writable_cache_path
+                if writable_cache_path != preferred_cache_path:
+                    log.warning(
+                        "[IndexRouteDiskCache] 首选缓存目录不可写，已切换到临时目录: "
+                        f"{preferred_cache_path} -> {writable_cache_path}"
+                    )
         # 指数路由缓存：内存 + 可选用户目录 pickle；key 为别名标准化后的指数名称键。
         self._index_name_route_cache: Dict[str, Dict[str, Any]] = {}
         # 动态发现的指数目录快照（全量候选列表），可 refresh 重建并从磁盘预热。
