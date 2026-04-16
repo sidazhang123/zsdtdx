@@ -239,14 +239,6 @@ output:
   suspended_placeholder_eps: 1.0e-20
 
 index_kline:
-  # 指数名称路由落盘缓存（pickle）。pip 安装后默认写入用户缓存目录，无需写 site-packages。
-  disk_cache:
-    # 是否启用落盘缓存。
-    enabled: true
-    # 缓存目录；留空则使用系统用户缓存目录（Windows: %LOCALAPPDATA%\zsdtdx\cache，其它: $XDG_CACHE_HOME/zsdtdx 或 ~/.cache/zsdtdx）。
-    directory: null
-    # 缓存文件名。
-    filename: index_route_cache.pkl
   # 运行时动态发现 ex 指数市场的优先候选列表（用于名称->路由解析）。
   # 默认优先：中证指数(62)、国证指数(102)、全球指数(37)、香港指数(27)。
   prefer_ex_markets:

@@ -6,10 +6,8 @@ import datetime as dt
 import ipaddress
 import json
 import math
-import os
 import re
 import socket as _socket_mod
-import tempfile
 import threading
 import time
 import weakref
@@ -22,12 +20,7 @@ import yaml
 
 from zsdtdx.exhq import TdxExHq_API
 from zsdtdx.hq import TdxHq_API
-from zsdtdx.index_route_disk_cache import (
-    default_zsdtdx_user_cache_dir,
-    fingerprint_index_kline_config,
-    load_index_route_cache,
-    save_index_route_cache,
-)
+from zsdtdx.index_route_disk_cache import fingerprint_index_kline_config
 from zsdtdx.log import log
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
@@ -112,42 +105,6 @@ def _tcp_probe_hosts(hosts: List[Tuple[str, int]], timeout: float) -> List[Tuple
 
     sorted_hosts = [ht for ht, _ in reachable] + [ht for ht, _ in unreachable]
     return sorted_hosts
-
-
-def _pick_writable_cache_file_path(preferred_path: Path) -> Optional[Path]:
-    """
-    选择可写缓存文件路径；首选目标目录不可写时降级到临时目录。
-
-    输入：
-    1. preferred_path: 首选缓存文件绝对路径。
-    输出：
-    1. 可写缓存文件路径；若均不可写返回 None。
-    用途：
-    1. 规避 Windows 受限目录导致的 Access is denied。
-    边界条件：
-    1. 写探测失败时不会抛错，由调用方决定是否禁用磁盘缓存。
-    """
-    candidates: List[Path] = [Path(preferred_path).resolve()]
-    temp_fallback = (Path(tempfile.gettempdir()) / "zsdtdx" / "cache" / Path(preferred_path).name).resolve()
-    if temp_fallback not in candidates:
-        candidates.append(temp_fallback)
-
-    for candidate in candidates:
-        try:
-            candidate.parent.mkdir(parents=True, exist_ok=True)
-            probe_name = (
-                f".zsdtdx_cache_probe_{os.getpid()}_{threading.get_ident()}_{int(time.time() * 1000)}.tmp"
-            )
-            probe_path = candidate.parent / probe_name
-            with open(probe_path, "wb") as fp:
-                fp.write(b"ok")
-                fp.flush()
-                os.fsync(fp.fileno())
-            probe_path.unlink(missing_ok=True)
-            return candidate
-        except Exception:
-            continue
-    return None
 
 
 class PersistentFailoverPool:
@@ -568,39 +525,7 @@ class UnifiedTdxClient:
         self.index_kline_aliases_cfg = self.index_kline_cfg.get("aliases", {}) or {}
         self.index_kline_lookup_cfg = self.index_kline_cfg.get("lookup", {}) or {}
         self._index_kline_fingerprint = fingerprint_index_kline_config(self.index_kline_cfg)
-        disk_cache_cfg = self.index_kline_cfg.get("disk_cache", {}) or {}
-        self._index_disk_cache_enabled = bool(disk_cache_cfg.get("enabled", True))
-        raw_cache_dir = disk_cache_cfg.get("directory")
-        cache_filename = str(disk_cache_cfg.get("filename", "index_route_cache.pkl") or "index_route_cache.pkl").strip()
-        if cache_filename == "":
-            cache_filename = "index_route_cache.pkl"
-        if not self._index_disk_cache_enabled:
-            self._index_disk_cache_path: Optional[Path] = None
-        else:
-            if raw_cache_dir is None or str(raw_cache_dir).strip() == "":
-                cache_base = default_zsdtdx_user_cache_dir()
-            else:
-                cache_base = Path(str(raw_cache_dir).strip()).expanduser()
-                if not cache_base.is_absolute():
-                    cache_base = Path.cwd() / cache_base
-            preferred_cache_path = (cache_base / cache_filename).resolve()
-            writable_cache_path = _pick_writable_cache_file_path(preferred_cache_path)
-            if writable_cache_path is None:
-                self._index_disk_cache_enabled = False
-                self._index_disk_cache_path = None
-                log.warning(
-                    f"[IndexRouteDiskCache] 缓存目录不可写，已自动禁用磁盘缓存: {preferred_cache_path}"
-                )
-            else:
-                self._index_disk_cache_path = writable_cache_path
-                if writable_cache_path != preferred_cache_path:
-                    log.warning(
-                        "[IndexRouteDiskCache] 首选缓存目录不可写，已切换到临时目录: "
-                        f"{preferred_cache_path} -> {writable_cache_path}"
-                    )
-        # 指数路由缓存：内存 + 可选用户目录 pickle；key 为别名标准化后的指数名称键。
-        self._index_name_route_cache: Dict[str, Dict[str, Any]] = {}
-        # 动态发现的指数目录快照（全量候选列表），可 refresh 重建并从磁盘预热。
+        # 动态发现的指数目录快照（全量候选列表），可 refresh 重建。
         self._index_catalog_records: List[Dict[str, Any]] = []
         self.client_cfg = self.config.get("client", {})
         self.preconnect_on_enter = bool(self.client_cfg.get("preconnect_on_enter", True))
@@ -667,58 +592,6 @@ class UnifiedTdxClient:
         self._instrument_cache = None
         self._runtime_failures: List[Dict[str, Any]] = []
         self._entered_client = None
-
-        self._hydrate_index_cache_from_disk()
-
-    def _hydrate_index_cache_from_disk(self) -> None:
-        """
-        从用户目录 pickle 预热指数名称路由缓存与目录快照。
-
-        输入：
-        1. 无显式输入参数。
-        输出：
-        1. 无返回值。
-        用途：
-        1. 减少冷启动全量拉清单次数；指纹不一致时自动忽略旧文件。
-        边界条件：
-        1. 未启用落盘或文件校验失败时静默跳过。
-        """
-        path = self._index_disk_cache_path
-        if path is None:
-            return
-        loaded = load_index_route_cache(path, self._index_kline_fingerprint)
-        if loaded is None:
-            return
-        name_route, catalog = loaded
-        self._index_name_route_cache.update(name_route)
-        if catalog:
-            self._index_catalog_records = list(catalog)
-
-    def _persist_index_disk_cache(self) -> None:
-        """
-        将当前内存中的指数路由缓存原子写入磁盘。
-
-        输入：
-        1. 无显式输入参数。
-        输出：
-        1. 无返回值。
-        用途：
-        1. 目录发现或名称解析更新后持久化。
-        边界条件：
-        1. 写入失败仅记录日志，不中断业务。
-        """
-        path = self._index_disk_cache_path
-        if path is None:
-            return
-        try:
-            save_index_route_cache(
-                path,
-                fingerprint=self._index_kline_fingerprint,
-                name_route=self._index_name_route_cache,
-                catalog=self._index_catalog_records,
-            )
-        except Exception as exc:
-            log.warning(f"[IndexRouteDiskCache] 写入失败: {path} err={exc}")
 
     def _resolve_config_path(self, config_path: Optional[str]) -> Path:
         """输入配置路径，输出可读取绝对路径；支持相对/绝对路径；不存在时抛错。"""
@@ -1675,9 +1548,6 @@ class UnifiedTdxClient:
         边界条件：
         1. 网络异常时返回当前已缓存结果（可能为空）。
         """
-        if self._index_catalog_records and not bool(refresh):
-            return list(self._index_catalog_records)
-
         records: List[Dict[str, Any]] = []
         seen_keys: set[str] = set()
         security_page = int(self.pagination.get("standard_security_list_page_size", 800))
@@ -1755,9 +1625,7 @@ class UnifiedTdxClient:
                 break
 
         self._index_catalog_records = list(records)
-        if records:
-            self._persist_index_disk_cache()
-        return list(self._index_catalog_records)
+        return list(records)
 
     def resolve_index_name(self, index_name: Any, refresh: bool = False) -> Dict[str, Any]:
         """
@@ -1792,9 +1660,6 @@ class UnifiedTdxClient:
 
         canonical_input_name = alias_map.get(normalized_name, raw_name)
         canonical_key = self._normalize_index_name_key(canonical_input_name)
-        if canonical_key in self._index_name_route_cache and not bool(refresh):
-            return dict(self._index_name_route_cache[canonical_key])
-
         exact_matches: List[Dict[str, Any]] = []
         for record in records:
             if self._normalize_index_name_key(record["name"]) == canonical_key:
@@ -1809,10 +1674,7 @@ class UnifiedTdxClient:
                     market_name=str(item.get("market_name", "")),
                 ),
             )
-            chosen = dict(sorted_matches[0])
-            self._index_name_route_cache[canonical_key] = chosen
-            self._persist_index_disk_cache()
-            return chosen
+            return dict(sorted_matches[0])
 
         max_candidates = int(self.index_kline_lookup_cfg.get("max_candidates", 10) or 10)
         max_candidates = max(1, max_candidates)

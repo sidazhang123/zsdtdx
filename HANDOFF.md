@@ -61,10 +61,9 @@
 8. `auto_prewarm_timeout_seconds`
 9. `auto_prewarm_max_rounds`
 10. `auto_prewarm_spread_standard_hosts`
-11. `index_kline.disk_cache`
-12. `index_kline.prefer_ex_markets`
-13. `index_kline.aliases`
-14. `index_kline.lookup`
+11. `index_kline.prefer_ex_markets`
+12. `index_kline.aliases`
+13. `index_kline.lookup`
 
 ## 7. 文档联动约束
 

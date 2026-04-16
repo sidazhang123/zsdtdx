@@ -304,10 +304,8 @@ print(result)
 **名称匹配与报错:**
 - 先做精确匹配（支持别名标准化），例如 `上证综指 -> 上证指数`。
 - 未命中时抛错并返回“名称片段候选”。
-- 路由由后台动态发现（标准 `get_security_list` + 扩展 `get_instrument_info`），并自动缓存。
-- 名称路由与指数目录可落盘为 pickle（默认在用户缓存目录，见 `index_kline.disk_cache`）；写入采用临时文件 + 原子替换，加载失败会删除损坏文件。
-- 修改 `index_kline` 配置段会改变指纹，旧缓存文件会被忽略或删除后重建。
-- 缓存未命中或命中后抓取失败时，会自动刷新路由后重试一次。
+- 路由由后台动态发现（标准 `get_security_list` + 扩展 `get_instrument_info`）。
+- 抓取失败时，会自动刷新路由后重试一次。
 
 #### （一般无需手动调用）prewarm_parallel_fetcher
 
@@ -753,10 +751,6 @@ stock_scope:
       - "szsh"
 
 index_kline:
-  disk_cache:
-    enabled: true
-    directory: null
-    filename: index_route_cache.pkl
   # 动态发现扩展指数时优先考虑的 ex 市场列表。
   prefer_ex_markets:
     - 62

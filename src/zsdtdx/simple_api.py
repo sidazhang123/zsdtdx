@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import queue as std_queue
 from dataclasses import dataclass
 from pathlib import Path
@@ -529,7 +530,7 @@ def get_stock_kline(
 
 
 def get_index_kline(
-    task: List[Any],
+    task: Optional[List[Any]] = None,
     queue: Optional[Any] = None,
     preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
     mode: str = "async",
@@ -543,7 +544,7 @@ def get_index_kline(
 
     输入:
     - task: 指数任务列表，元素支持 dict 或 `IndexKlineTask`，字段:
-      `index_name/freq/start_time/end_time`。
+      `index_name/freq/start_time/end_time`。当传 `None` 或空列表时，会自动构建默认任务清单（全量指数目录，日线，近 7 天窗口）。
     - queue: 可选事件队列，需实现 `put()`。
     - preprocessor_operator: 可选事件预处理函数，返回 None 时丢弃该事件。
     - mode: `"sync"` 或 `"async"`。
@@ -558,7 +559,55 @@ def get_index_kline(
         raise ValueError("preprocessor_operator 必须是可调用对象")
 
     _ensure_active_config_ready(caller_name="get_index_kline")
-    normalized_tasks = _normalize_task_input(task=task, task_cls=IndexKlineTask)
+    raw_tasks: List[Any]
+    if task is None or (isinstance(task, (list, tuple)) and len(task) == 0):
+        end_dt = dt.datetime.now()
+        start_dt = end_dt - dt.timedelta(days=7)
+        start_text = start_dt.strftime("%Y-%m-%d")
+        end_text = end_dt.strftime("%Y-%m-%d")
+
+        def _build_default_index_tasks(client: UnifiedTdxClient) -> List[Dict[str, str]]:
+            """
+            基于运行时指数目录构建默认指数任务列表。
+
+            输入：
+            1. client: 统一客户端实例。
+            输出：
+            1. 默认任务字典列表。
+            用途：
+            1. 支持 get_index_kline 在 task 缺省场景下自动拉取指数数据。
+            边界条件：
+            1. 目录为空时抛 ValueError，提示调用方显式传 task 或检查连接。
+            """
+            records = client._discover_index_route_records(refresh=False)
+            tasks_buffer: List[Dict[str, str]] = []
+            seen_names: set[str] = set()
+            for record in records:
+                index_name = str(record.get("name", "")).strip()
+                if index_name == "" or index_name in seen_names:
+                    continue
+                seen_names.add(index_name)
+                tasks_buffer.append(
+                    {
+                        "index_name": index_name,
+                        "freq": "d",
+                        "start_time": start_text,
+                        "end_time": end_text,
+                    }
+                )
+            if not tasks_buffer:
+                raise ValueError("默认指数任务构建失败：未发现可用指数目录")
+            return tasks_buffer
+
+        raw_tasks = _call_with_client(
+            _build_default_index_tasks,
+            get_active_context_client=UnifiedTdxClient.get_active_context_client,
+            build_client=lambda: get_client(),
+        )
+    else:
+        raw_tasks = list(task)
+
+    normalized_tasks = _normalize_task_input(task=raw_tasks, task_cls=IndexKlineTask)
     mode_key = str(mode or "async").strip().lower()
     fetcher = get_fetcher()
 
