@@ -17,6 +17,7 @@ pip install zsdtdx
 - `get_stock_code_name`
 - `get_all_future_list`
 - `get_stock_kline`
+- `get_index_kline`
 - `prewarm_parallel_fetcher`
 - `restart_parallel_fetcher`
 - `destroy_parallel_fetcher`
@@ -267,6 +268,46 @@ finally:
   > ```
 - 队列最终会额外推送 done 事件:
   `{"event":"done","total_tasks":...,"success_tasks":...,"failed_tasks":...}`。
+
+#### get_index_kline
+
+获取指数 K 线任务结果（按指数名称输入，支持同步/异步与队列实时回传）。
+
+**调用前置约定:**
+- `mode="sync"`：走 `ParallelFetcher` 的主进程 inproc chunk 路径；若当前已进入 `with get_client():`，其它主进程 API 仍可继续复用该上下文连接。
+- `mode="async"`：走 `ParallelFetcher` 的进程池 chunk 路径，worker 会独立创建并复用自己的连接，不依赖 with 上下文。
+
+**输入:**
+- task: 任务列表，元素是 `IndexKlineTask` 或 dict，字段:
+  `{index_name, freq, start_time, end_time}`。
+- queue: 可选队列，需支持 `put()`。
+- preprocessor_operator: 可选预处理函数，签名 `f(payload)->dict|None`。
+- mode: `"sync"` 或 `"async"`，默认 `"async"`。
+
+**调用示例:**
+```python
+import queue as py_queue
+from zsdtdx import IndexKlineTask, get_index_kline
+
+q = py_queue.Queue()
+result = get_index_kline(
+    task=[
+        IndexKlineTask(index_name="中证1000", freq="d", start_time="2026-03-01", end_time="2026-03-31"),
+        {"index_name": "中证2000", "freq": "60", "start_time": "2026-03-01", "end_time": "2026-03-31"},
+    ],
+    queue=q,
+    mode="sync",
+)
+print(result)
+```
+
+**名称匹配与报错:**
+- 先做精确匹配（支持别名标准化），例如 `上证综指 -> 上证指数`。
+- 未命中时抛错并返回“名称片段候选”。
+- 路由由后台动态发现（标准 `get_security_list` + 扩展 `get_instrument_info`），并自动缓存。
+- 名称路由与指数目录可落盘为 pickle（默认在用户缓存目录，见 `index_kline.disk_cache`）；写入采用临时文件 + 原子替换，加载失败会删除损坏文件。
+- 修改 `index_kline` 配置段会改变指纹，旧缓存文件会被忽略或删除后重建。
+- 缓存未命中或命中后抓取失败时，会自动刷新路由后重试一次。
 
 #### （一般无需手动调用）prewarm_parallel_fetcher
 
@@ -603,11 +644,11 @@ parallel:
   # 取值: true/false
   # 影响: true 时可降低长任务尾部因连接失效导致的批量失败。
   chunk_reconnect_on_unavailable: true
-  # 单个 chunk 执行超时（秒），适用于 get_stock_kline 的 async/sync mode。
+  # 单个 chunk 执行超时（秒），适用于 get_stock_kline / get_index_kline 的 async/sync mode。
   # 取值: 正浮点数
   # 影响: 超时后进入重试循环，由 _fetch_one_task_chunk 内部处理。
   chunk_timeout_seconds: 30
-  # chunk 超时或报错后的最大重试次数，适用于 get_stock_kline 的 async/sync mode。
+  # chunk 超时或报错后的最大重试次数，适用于 get_stock_kline / get_index_kline 的 async/sync mode。
   # 取值: 非负整数
   # 影响: 每个 chunk 最多额外重试 N 次，重试耗尽则标记失败。
   chunk_retry_max_attempts: 2
@@ -710,6 +751,23 @@ stock_scope:
       - "szsh"
     get_stock_kline:
       - "szsh"
+
+index_kline:
+  disk_cache:
+    enabled: true
+    directory: null
+    filename: index_route_cache.pkl
+  # 动态发现扩展指数时优先考虑的 ex 市场列表。
+  prefer_ex_markets:
+    - 62
+    - 102
+    - 37
+    - 27
+  aliases:
+    上证综指: 上证指数
+  lookup:
+    max_candidates: 10
+    normalize_whitespace: true
 
 output:
   # 默认返回 DataFrame 还是 list[dict]。

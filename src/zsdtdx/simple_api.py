@@ -3,7 +3,7 @@
 职责：
 1. 对外暴露 get_* 风格 API，隐藏连接池、市场路由、分页与并行调度细节。
 2. 统一 task 输入格式（code/freq/start_time/end_time）并完成时间窗口标准化。
-3. 提供同步/异步两种股票 K 线任务获取模式。
+3. 提供同步/异步两种股票/指数 K 线任务获取模式。
 4. 暴露并行进程池生命周期管理入口（prewarm/restart/destroy）。
 
 调用约定：
@@ -150,6 +150,106 @@ class StockKlineTask:
             raise ValueError("task 元素必须是 dict 或 StockKlineTask")
         task = cls(
             code=raw.get("code"),
+            freq=raw.get("freq"),
+            start_time=raw.get("start_time"),
+            end_time=raw.get("end_time"),
+        )
+        task.validate()
+        return task
+
+
+@dataclass
+class IndexKlineTask:
+    """
+    指数 K 线任务模板。
+
+    输入：
+    1. index_name: 指数中文名称（会走配置映射/别名解析）。
+    2. freq: 周期，与 `_TASK_FREQ_MAP` 一致（含 d/w/m/60/30/15/5 及同义写法）。
+    3. start_time/end_time: 时间窗口。
+    输出：
+    1. 通过 `to_dict()` 输出标准化 task 字典。
+    用途：
+    1. 为 get_index_kline 提供显式、可校验的任务对象。
+    边界条件：
+    1. 四个核心字段任一为空均会校验失败。
+    """
+
+    index_name: Any
+    freq: Any
+    start_time: Any
+    end_time: Any
+
+    def validate(self) -> None:
+        """
+        校验任务字段合法性。
+
+        输入：
+        1. 当前对象的 index_name/freq/start_time/end_time。
+        输出：
+        1. 无返回值；校验失败抛出 ValueError。
+        用途：
+        1. 在指数任务进入执行链路前尽早暴露输入问题。
+        边界条件：
+        1. freq 不在支持集合内时直接抛错。
+        """
+        index_name = str(self.index_name or "").strip()
+        freq = str(self.freq or "").strip().lower()
+        start_time = str(self.start_time or "").strip()
+        end_time = str(self.end_time or "").strip()
+        if index_name == "":
+            raise ValueError("task.index_name 不能为空")
+        if freq == "":
+            raise ValueError("task.freq 不能为空")
+        if start_time == "":
+            raise ValueError("task.start_time 不能为空")
+        if end_time == "":
+            raise ValueError("task.end_time 不能为空")
+        if freq not in _TASK_FREQ_MAP:
+            raise ValueError(f"不支持的频率: {self.freq}")
+        _parse_task_datetime(start_time)
+        _parse_task_datetime(end_time)
+
+    def to_dict(self) -> Dict[str, str]:
+        """
+        输出标准化任务字典。
+
+        输入：
+        1. 当前任务对象。
+        输出：
+        1. `{\"index_name\",\"freq\",\"start_time\",\"end_time\"}` 标准字典。
+        用途：
+        1. 作为指数任务执行器统一输入。
+        边界条件：
+        1. 会先执行 validate；失败时抛错。
+        """
+        self.validate()
+        normalized_start, normalized_end = _normalize_task_time_window(self.start_time, self.end_time)
+        return {
+            "index_name": str(self.index_name).strip(),
+            "freq": _TASK_FREQ_MAP[str(self.freq).strip().lower()],
+            "start_time": normalized_start,
+            "end_time": normalized_end,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Dict[str, Any]) -> "IndexKlineTask":
+        """
+        从字典构造任务对象并执行校验。
+
+        输入：
+        1. raw: 包含 index_name/freq/start_time/end_time 的字典。
+        输出：
+        1. `IndexKlineTask` 实例。
+        用途：
+        1. 兼容 dict 任务输入并统一校验行为。
+        边界条件：
+        1. raw 不是 dict 时抛 ValueError。
+        """
+        if not isinstance(raw, dict):
+            raise ValueError("task 元素必须是 dict 或 IndexKlineTask")
+        task = cls(
+            index_name=raw.get("index_name"),
             freq=raw.get("freq"),
             start_time=raw.get("start_time"),
             end_time=raw.get("end_time"),
@@ -421,6 +521,56 @@ def get_stock_kline(
     if mode_key == "async":
         async_queue = queue if queue is not None else std_queue.Queue()
         return fetcher.fetch_stock_tasks_async(
+            tasks=normalized_tasks,
+            queue=async_queue,
+            preprocessor_operator=preprocessor_operator,
+        )
+    raise ValueError("mode 仅支持 'sync' 或 'async'")
+
+
+def get_index_kline(
+    task: List[Any],
+    queue: Optional[Any] = None,
+    preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+    mode: str = "async",
+) -> Any:
+    """
+    获取指数 K 线任务结果（按指数名称输入，支持 sync/async）。
+
+    调用前置约定:
+    - `mode="sync"`：走 `ParallelFetcher` 的主进程 inproc chunk 路径；若当前已进入 `with get_client():`，其他主进程 API 仍可继续复用该上下文连接。
+    - `mode="async"`：走 `ParallelFetcher` 的进程池 chunk 路径，worker 会独立创建并复用自己的连接，不依赖 with 上下文。
+
+    输入:
+    - task: 指数任务列表，元素支持 dict 或 `IndexKlineTask`，字段:
+      `index_name/freq/start_time/end_time`。
+    - queue: 可选事件队列，需实现 `put()`。
+    - preprocessor_operator: 可选事件预处理函数，返回 None 时丢弃该事件。
+    - mode: `"sync"` 或 `"async"`。
+
+    返回:
+    - mode="sync": `list[task_payload]`。
+    - mode="async": `StockKlineJob`，可从 `job.queue` 消费事件直到 done。
+    """
+    if queue is not None and not hasattr(queue, "put"):
+        raise ValueError("queue 必须提供 put() 方法")
+    if preprocessor_operator is not None and not callable(preprocessor_operator):
+        raise ValueError("preprocessor_operator 必须是可调用对象")
+
+    _ensure_active_config_ready(caller_name="get_index_kline")
+    normalized_tasks = _normalize_task_input(task=task, task_cls=IndexKlineTask)
+    mode_key = str(mode or "async").strip().lower()
+    fetcher = get_fetcher()
+
+    if mode_key == "sync":
+        return fetcher.fetch_index_tasks_sync(
+            tasks=normalized_tasks,
+            queue=queue,
+            preprocessor_operator=preprocessor_operator,
+        )
+    if mode_key == "async":
+        async_queue = queue if queue is not None else std_queue.Queue()
+        return fetcher.fetch_index_tasks_async(
             tasks=normalized_tasks,
             queue=async_queue,
             preprocessor_operator=preprocessor_operator,
@@ -766,6 +916,7 @@ def get_runtime_metadata() -> Dict[str, Any]:
 
 __all__ = [
     "StockKlineTask",
+    "IndexKlineTask",
     "StockKlineJob",
     "set_config_path",
     "get_client",
@@ -773,6 +924,7 @@ __all__ = [
     "get_stock_code_name",
     "get_all_future_list",
     "get_stock_kline",
+    "get_index_kline",
     "prewarm_parallel_fetcher",
     "restart_parallel_fetcher",
     "destroy_parallel_fetcher",

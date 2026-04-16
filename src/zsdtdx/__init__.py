@@ -1,6 +1,7 @@
 """zsdtdx 对外导出入口。"""
 
 from zsdtdx.simple_api import (
+    IndexKlineTask,
     StockKlineTask,
     destroy_parallel_fetcher,
     get_all_future_list,
@@ -8,6 +9,7 @@ from zsdtdx.simple_api import (
     get_company_info,
     get_future_kline,
     get_future_latest_price,
+    get_index_kline,
     prewarm_parallel_fetcher,
     restart_parallel_fetcher,
     get_runtime_failures,
@@ -27,6 +29,7 @@ __all__ = [
     "__version__",
     "UnifiedTdxClient",
     "StockKlineTask",
+    "IndexKlineTask",
     "StockKlineJob",
     "set_config_path",
     "get_client",
@@ -34,6 +37,7 @@ __all__ = [
     "get_stock_code_name",
     "get_all_future_list",
     "get_stock_kline",
+    "get_index_kline",
     "prewarm_parallel_fetcher",
     "restart_parallel_fetcher",
     "destroy_parallel_fetcher",

@@ -20,6 +20,12 @@ import yaml
 
 from zsdtdx.exhq import TdxExHq_API
 from zsdtdx.hq import TdxHq_API
+from zsdtdx.index_route_disk_cache import (
+    default_zsdtdx_user_cache_dir,
+    fingerprint_index_kline_config,
+    load_index_route_cache,
+    save_index_route_cache,
+)
 from zsdtdx.log import log
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
@@ -520,6 +526,30 @@ class UnifiedTdxClient:
         self.market_rules = self.config.get("market_rules", {})
         self.stock_scope_cfg = self.config.get("stock_scope", {}) or {}
         self.stock_scope_defaults = self.stock_scope_cfg.get("defaults_when_codes_none", {}) or {}
+        self.index_kline_cfg = self.config.get("index_kline", {}) or {}
+        self.index_kline_aliases_cfg = self.index_kline_cfg.get("aliases", {}) or {}
+        self.index_kline_lookup_cfg = self.index_kline_cfg.get("lookup", {}) or {}
+        self._index_kline_fingerprint = fingerprint_index_kline_config(self.index_kline_cfg)
+        disk_cache_cfg = self.index_kline_cfg.get("disk_cache", {}) or {}
+        self._index_disk_cache_enabled = bool(disk_cache_cfg.get("enabled", True))
+        raw_cache_dir = disk_cache_cfg.get("directory")
+        cache_filename = str(disk_cache_cfg.get("filename", "index_route_cache.pkl") or "index_route_cache.pkl").strip()
+        if cache_filename == "":
+            cache_filename = "index_route_cache.pkl"
+        if not self._index_disk_cache_enabled:
+            self._index_disk_cache_path: Optional[Path] = None
+        else:
+            if raw_cache_dir is None or str(raw_cache_dir).strip() == "":
+                cache_base = default_zsdtdx_user_cache_dir()
+            else:
+                cache_base = Path(str(raw_cache_dir).strip()).expanduser()
+                if not cache_base.is_absolute():
+                    cache_base = Path.cwd() / cache_base
+            self._index_disk_cache_path = (cache_base / cache_filename).resolve()
+        # 指数路由缓存：内存 + 可选用户目录 pickle；key 为别名标准化后的指数名称键。
+        self._index_name_route_cache: Dict[str, Dict[str, Any]] = {}
+        # 动态发现的指数目录快照（全量候选列表），可 refresh 重建并从磁盘预热。
+        self._index_catalog_records: List[Dict[str, Any]] = []
         self.client_cfg = self.config.get("client", {})
         self.preconnect_on_enter = bool(self.client_cfg.get("preconnect_on_enter", True))
 
@@ -585,6 +615,58 @@ class UnifiedTdxClient:
         self._instrument_cache = None
         self._runtime_failures: List[Dict[str, Any]] = []
         self._entered_client = None
+
+        self._hydrate_index_cache_from_disk()
+
+    def _hydrate_index_cache_from_disk(self) -> None:
+        """
+        从用户目录 pickle 预热指数名称路由缓存与目录快照。
+
+        输入：
+        1. 无显式输入参数。
+        输出：
+        1. 无返回值。
+        用途：
+        1. 减少冷启动全量拉清单次数；指纹不一致时自动忽略旧文件。
+        边界条件：
+        1. 未启用落盘或文件校验失败时静默跳过。
+        """
+        path = self._index_disk_cache_path
+        if path is None:
+            return
+        loaded = load_index_route_cache(path, self._index_kline_fingerprint)
+        if loaded is None:
+            return
+        name_route, catalog = loaded
+        self._index_name_route_cache.update(name_route)
+        if catalog:
+            self._index_catalog_records = list(catalog)
+
+    def _persist_index_disk_cache(self) -> None:
+        """
+        将当前内存中的指数路由缓存原子写入磁盘。
+
+        输入：
+        1. 无显式输入参数。
+        输出：
+        1. 无返回值。
+        用途：
+        1. 目录发现或名称解析更新后持久化。
+        边界条件：
+        1. 写入失败仅记录日志，不中断业务。
+        """
+        path = self._index_disk_cache_path
+        if path is None:
+            return
+        try:
+            save_index_route_cache(
+                path,
+                fingerprint=self._index_kline_fingerprint,
+                name_route=self._index_name_route_cache,
+                catalog=self._index_catalog_records,
+            )
+        except Exception as exc:
+            log.warning(f"[IndexRouteDiskCache] 写入失败: {path} err={exc}")
 
     def _resolve_config_path(self, config_path: Optional[str]) -> Path:
         """输入配置路径，输出可读取绝对路径；支持相对/绝对路径；不存在时抛错。"""
@@ -1477,6 +1559,350 @@ class UnifiedTdxClient:
         if "." in raw_code:
             raw_code = raw_code.split(".", 1)[1]
         return raw_code
+
+    def _normalize_index_name_key(self, name: Any) -> str:
+        """
+        输入指数名称，输出用于匹配的标准化键。
+
+        输入：
+        1. name: 任意名称输入。
+        输出：
+        1. 标准化后的名称字符串。
+        用途：
+        1. 统一指数名称、别名与候选匹配键，支持未来扩展。
+        边界条件：
+        1. 空值会返回空串。
+        """
+        text = str(name or "").strip()
+        if text == "":
+            return ""
+        if bool(self.index_kline_lookup_cfg.get("normalize_whitespace", True)):
+            text = re.sub(r"\s+", "", text)
+        return text
+
+    def _index_route_priority(self, source: str, market: int, code: str, market_name: str) -> int:
+        """
+        计算指数路由优先级（越小越优先）。
+
+        输入：
+        1. source/market/code/market_name: 候选路由信息。
+        输出：
+        1. 整数优先级。
+        用途：
+        1. 在同名候选中优先挑选“更像指数主序列”的路由。
+        边界条件：
+        1. 无法识别时返回较大值，作为低优先级候选。
+        """
+        source_key = str(source or "").strip().lower()
+        code_text = str(code or "").strip()
+        market_title = str(market_name or "").strip()
+        if source_key == "std":
+            if market in {0, 1} and (code_text.startswith("399") or code_text.startswith("000")):
+                return 10
+            if market in {0, 1}:
+                return 80
+            return 30
+        if source_key == "ex":
+            if market_title in {"中证指数", "国证指数", "全球指数(静态)", "香港指数"}:
+                return 40
+            if "指数" in market_title:
+                return 50
+            return 90
+        return 100
+
+    def _discover_index_route_records(self, refresh: bool = False) -> List[Dict[str, Any]]:
+        """
+        动态发现指数名称路由并缓存。
+
+        输入：
+        1. refresh: 是否强制刷新发现缓存。
+        输出：
+        1. `[{name, source, market, code, market_name}, ...]` 路由记录列表。
+        用途：
+        1. 在运行时通过标准/扩展行情清单动态定位指数名称对应路由。
+        边界条件：
+        1. 网络异常时返回当前已缓存结果（可能为空）。
+        """
+        if self._index_catalog_records and not bool(refresh):
+            return list(self._index_catalog_records)
+
+        records: List[Dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        security_page = int(self.pagination.get("standard_security_list_page_size", 800))
+        index_name_markers = ("指数", "中证", "深证", "上证", "创业板", "科创")
+
+        for market in [0, 1]:
+            start = 0
+            while True:
+                page = self.std_pool.call("get_security_list", market, start, allow_none=True)
+                if not page:
+                    break
+                for item in page:
+                    name = str(item.get("name", "")).strip()
+                    code = str(item.get("code", "")).strip()
+                    if name == "" or code == "":
+                        continue
+                    if not any(marker in name for marker in index_name_markers):
+                        continue
+                    key = f"std|{int(market)}|{code}|{name}"
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    records.append(
+                        {
+                            "name": name,
+                            "source": "std",
+                            "market": int(market),
+                            "code": code,
+                            "market_name": "深圳" if int(market) == 0 else "上海",
+                        }
+                    )
+                start += len(page)
+                if len(page) < security_page:
+                    break
+
+        ex_index_markets = set(self.index_kline_cfg.get("prefer_ex_markets", [62, 102, 37, 27]))
+        ex_page_size = int(self.pagination.get("extended_instrument_info_page_size", 800))
+        start = 0
+        while True:
+            page = self.ex_pool.call("get_instrument_info", start, ex_page_size, allow_none=True)
+            if not page:
+                break
+            for item in page:
+                name = str(item.get("name", "")).strip()
+                code = str(item.get("code", "")).strip()
+                try:
+                    market = int(item.get("market", -1))
+                except Exception:
+                    market = -1
+                if name == "" or code == "" or market < 0:
+                    continue
+                market_name = str(self._get_ex_market_name(market) or "").strip()
+                should_keep = (
+                    market in ex_index_markets
+                    or "指数" in market_name
+                    or any(marker in name for marker in index_name_markers)
+                )
+                if not should_keep:
+                    continue
+                key = f"ex|{market}|{code}|{name}"
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                records.append(
+                    {
+                        "name": name,
+                        "source": "ex",
+                        "market": int(market),
+                        "code": code,
+                        "market_name": market_name,
+                    }
+                )
+            start += len(page)
+            if len(page) < ex_page_size:
+                break
+
+        self._index_catalog_records = list(records)
+        if records:
+            self._persist_index_disk_cache()
+        return list(self._index_catalog_records)
+
+    def resolve_index_name(self, index_name: Any, refresh: bool = False) -> Dict[str, Any]:
+        """
+        解析指数名称并返回标准路由。
+
+        输入：
+        1. index_name: 用户输入指数名称。
+        输出：
+        1. `{name, source, market, code}` 路由字典。
+        用途：
+        1. 在指数 K 线查询前完成“精确匹配优先 + 候选提示”校验。
+        边界条件：
+        1. 未命中时抛 ValueError，错误文本中包含片段候选。
+        """
+        raw_name = str(index_name or "").strip()
+        if raw_name == "":
+            raise ValueError("index_name 不能为空")
+        normalized_name = self._normalize_index_name_key(raw_name)
+
+        alias_map: Dict[str, str] = {}
+        if isinstance(self.index_kline_aliases_cfg, dict):
+            for alias_raw, canonical_raw in self.index_kline_aliases_cfg.items():
+                alias_key = self._normalize_index_name_key(alias_raw)
+                canonical_name = str(canonical_raw or "").strip()
+                if alias_key == "" or canonical_name == "":
+                    continue
+                alias_map[alias_key] = canonical_name
+
+        records = self._discover_index_route_records(refresh=refresh)
+        if not records:
+            raise ValueError("指数路由发现失败：未获取到可用指数清单")
+
+        canonical_input_name = alias_map.get(normalized_name, raw_name)
+        canonical_key = self._normalize_index_name_key(canonical_input_name)
+        if canonical_key in self._index_name_route_cache and not bool(refresh):
+            return dict(self._index_name_route_cache[canonical_key])
+
+        exact_matches: List[Dict[str, Any]] = []
+        for record in records:
+            if self._normalize_index_name_key(record["name"]) == canonical_key:
+                exact_matches.append(dict(record))
+        if exact_matches:
+            sorted_matches = sorted(
+                exact_matches,
+                key=lambda item: self._index_route_priority(
+                    source=str(item.get("source", "")),
+                    market=int(item.get("market", -1)),
+                    code=str(item.get("code", "")),
+                    market_name=str(item.get("market_name", "")),
+                ),
+            )
+            chosen = dict(sorted_matches[0])
+            self._index_name_route_cache[canonical_key] = chosen
+            self._persist_index_disk_cache()
+            return chosen
+
+        max_candidates = int(self.index_kline_lookup_cfg.get("max_candidates", 10) or 10)
+        max_candidates = max(1, max_candidates)
+        candidates: List[str] = []
+        for record in records:
+            record_name = str(record["name"])
+            record_key = self._normalize_index_name_key(record_name)
+            if normalized_name in record_key or record_key in normalized_name:
+                candidates.append(record_name)
+        candidates = sorted(list(dict.fromkeys(candidates)))[:max_candidates]
+        candidate_text = "、".join(candidates) if candidates else "无"
+        raise ValueError(
+            f"指数名称未找到: {raw_name}；可选候选: {candidate_text}"
+        )
+
+    def get_index_kline_rows_for_task(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        输入单任务字典，输出指数 K 线字典列表。
+
+        输入：
+        1. task: 必须包含 index_name/freq/start_time/end_time。
+        输出：
+        1. 统一字段列表：index_name,code,freq,open,close,high,low,volume,amount,datetime。
+        用途：
+        1. 提供 simple_api 指数任务 sync/async 的底层执行单元。
+        边界条件：
+        1. 名称未命中、频率非法或时间窗口非法时抛 ValueError。
+        """
+        if not isinstance(task, dict):
+            raise ValueError("task 必须是 dict")
+        index_name = str(task.get("index_name", "")).strip()
+        freq = str(task.get("freq", "")).strip().lower()
+        start_time = str(task.get("start_time", "")).strip()
+        end_time = str(task.get("end_time", "")).strip()
+        if index_name == "":
+            raise ValueError("task.index_name 不能为空")
+        if freq == "":
+            raise ValueError("task.freq 不能为空")
+        if start_time == "":
+            raise ValueError("task.start_time 不能为空")
+        if end_time == "":
+            raise ValueError("task.end_time 不能为空")
+
+        route = self.resolve_index_name(index_name=index_name, refresh=False)
+        category = self._freq_to_category(freq)
+        start_dt = self._to_datetime_no_df(start_time)
+        end_dt = self._to_datetime_no_df(end_time)
+        if start_dt > end_dt:
+            raise ValueError("start_time 不能晚于 end_time")
+
+        def _fetch_route_rows(current_route: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+            source = str(current_route.get("source", "std")).strip().lower()
+            market = int(current_route.get("market", -1))
+            code = str(current_route.get("code", "")).strip()
+            if market < 0 or code == "":
+                raise ValueError(f"指数路由配置非法: {current_route}")
+            page_size = int(
+                self.pagination.get(
+                    "standard_kline_page_size" if source == "std" else "extended_kline_page_size",
+                    800 if source == "std" else 700,
+                )
+            )
+            max_pages = int(self.pagination.get("max_kline_pages", 300))
+            rows: List[Dict[str, Any]] = []
+            start = 0
+            for _ in range(max_pages):
+                if source == "std":
+                    page = self.std_pool.call(
+                        "get_index_bars",
+                        int(category),
+                        int(market),
+                        str(code),
+                        int(start),
+                        int(page_size),
+                        allow_none=True,
+                    )
+                else:
+                    page = self.ex_pool.call(
+                        "get_instrument_bars",
+                        int(category),
+                        int(market),
+                        str(code),
+                        int(start),
+                        int(page_size),
+                        allow_none=True,
+                    )
+                if not page:
+                    break
+                rows.extend(list(page))
+                oldest_raw = page[0].get("datetime") if isinstance(page[0], dict) else None
+                try:
+                    oldest_dt = self._to_datetime_no_df(oldest_raw)
+                except Exception:
+                    oldest_dt = None
+                if oldest_dt is not None and oldest_dt <= start_dt:
+                    break
+                if len(page) < page_size:
+                    break
+                start += len(page)
+            return {"source": source, "market": market, "code": code}, rows
+
+        try:
+            effective_route, raw_rows = _fetch_route_rows(route)
+        except Exception:
+            route = self.resolve_index_name(index_name=index_name, refresh=True)
+            effective_route, raw_rows = _fetch_route_rows(route)
+        if not raw_rows:
+            route = self.resolve_index_name(index_name=index_name, refresh=True)
+            effective_route, raw_rows = _fetch_route_rows(route)
+
+        by_datetime: Dict[str, Dict[str, Any]] = {}
+        normalized_freq = self._normalize_freq(freq)
+        for row in raw_rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                parsed_dt = self._to_datetime_no_df(row.get("datetime"))
+            except Exception:
+                continue
+            if parsed_dt < start_dt or parsed_dt > end_dt:
+                continue
+            dt_key = parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
+            vol_v = self._safe_float_no_df(row.get("vol"))
+            trade_v = self._safe_float_no_df(row.get("trade"))
+            volume_v = vol_v if vol_v is not None else trade_v
+            normalized = {
+                "index_name": str(route.get("name", index_name)),
+                "code": str(effective_route.get("code", "")),
+                "freq": normalized_freq,
+                "open": self._safe_float_no_df(row.get("open")),
+                "close": self._safe_float_no_df(row.get("close")),
+                "high": self._safe_float_no_df(row.get("high")),
+                "low": self._safe_float_no_df(row.get("low")),
+                "volume": volume_v,
+                "amount": self._safe_float_no_df(row.get("amount")),
+                "datetime": dt_key,
+            }
+            by_datetime[dt_key] = normalized
+
+        if not by_datetime:
+            return []
+        return [by_datetime[key] for key in sorted(by_datetime.keys())]
 
     def _normalize_code_list(self, codes: Optional[Any]) -> Optional[List[str]]:
         """输入代码列表参数，输出去重后的字符串列表；用于统一处理；空输入返回 None。"""

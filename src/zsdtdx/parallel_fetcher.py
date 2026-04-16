@@ -1460,6 +1460,41 @@ def _normalize_task_payload(task: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
+def _normalize_index_task_payload(task: Dict[str, Any]) -> Dict[str, str]:
+    """
+    标准化指数 task 字段，确保进程间传输结构稳定。
+
+    输入：
+    1. task: 任务字典，需包含 index_name/freq/start_time/end_time。
+    输出：
+    1. 标准化后的指数任务字典（全部字符串字段）。
+    用途：
+    1. 统一指数 sync/async、串行/并行路径的任务结构。
+    边界条件：
+    1. 缺失必填字段时抛 ValueError。
+    """
+    if not isinstance(task, dict):
+        raise ValueError("task 必须是 dict")
+    index_name = str(task.get("index_name", "")).strip()
+    freq = str(task.get("freq", "")).strip().lower()
+    start_time = str(task.get("start_time", "")).strip()
+    end_time = str(task.get("end_time", "")).strip()
+    if index_name == "":
+        raise ValueError("task.index_name 不能为空")
+    if freq == "":
+        raise ValueError("task.freq 不能为空")
+    if start_time == "":
+        raise ValueError("task.start_time 不能为空")
+    if end_time == "":
+        raise ValueError("task.end_time 不能为空")
+    return {
+        "index_name": index_name,
+        "freq": freq,
+        "start_time": start_time,
+        "end_time": end_time,
+    }
+
+
 def _to_sortable_task_ts(raw_value: Any) -> pd.Timestamp:
     """
     输入：
@@ -1519,6 +1554,42 @@ def _build_task_payload(
     }
 
 
+def _build_index_task_payload(
+    *,
+    task: Dict[str, Any],
+    rows: Optional[List[Dict[str, Any]]] = None,
+    error: Optional[str] = None,
+    worker_pid: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    构建标准指数 task payload。
+
+    输入：
+    1. task: 标准化指数任务字典。
+    2. rows: 任务 K 线结果列表。
+    3. error: 失败原因，成功时为 None。
+    4. worker_pid: 处理该任务的进程 ID。
+    输出：
+    1. 标准化指数事件 payload，结构固定。
+    用途：
+    1. 统一指数队列输出与函数返回的数据契约。
+    边界条件：
+    1. rows 为空时输出空列表，不返回 None。
+    """
+    return {
+        "event": "data",
+        "task": {
+            "index_name": str(task.get("index_name", "")),
+            "freq": str(task.get("freq", "")),
+            "start_time": str(task.get("start_time", "")),
+            "end_time": str(task.get("end_time", "")),
+        },
+        "rows": list(rows or []),
+        "error": None if error is None else str(error),
+        "worker_pid": int(worker_pid or 0),
+    }
+
+
 def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     进程 worker：执行单个 chunk（同 code+freq）并返回任务 payload 列表。
@@ -1532,6 +1603,9 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
     边界条件：
     1. 客户端建连失败或分片执行失败时，会为所有任务返回 error payload。
     """
+    if str(chunk_payload.get("task_kind", "stock")).strip().lower() == "index":
+        return _fetch_one_index_task_chunk(chunk_payload)
+
     worker_pid = int(os.getpid())
     chunk_id = str(chunk_payload.get("chunk_id", ""))
     raw_tasks = list(chunk_payload.get("tasks") or [])
@@ -1742,6 +1816,233 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
         "chunk_task_count": int(len(raw_tasks)),
         "chunk_hit_tasks": int(max(0, chunk_hit_tasks)),
         "chunk_network_page_calls": int(max(0, chunk_network_page_calls)),
+        "task_detail": task_detail,
+        "payloads": payloads,
+        "failures": failures,
+        "worker_pid": worker_pid,
+    }
+
+
+def _fetch_one_index_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    进程 worker：执行单个指数 chunk（同 index_name+freq）并返回任务 payload 列表。
+
+    输入：
+    1. chunk_payload: 分片字典，包含 chunk_id/code/freq/tasks 等字段。
+    输出：
+    1. 指数分片执行结果字典，包含 payloads/failures/命中统计等字段。
+    用途：
+    1. 作为指数 worker 内 chunk 级并发的最小执行单元。
+    边界条件：
+    1. 客户端建连失败或分片执行失败时，会为所有任务返回 error payload。
+    """
+    worker_pid = int(os.getpid())
+    chunk_id = str(chunk_payload.get("chunk_id", ""))
+    raw_tasks = list(chunk_payload.get("tasks") or [])
+
+    task_detail: List[Dict[str, Any]] = []
+    normalized_tasks: List[Dict[str, str]] = []
+    payloads: List[Dict[str, Any]] = []
+    failures: List[Tuple[str, str, str]] = []
+
+    for item in raw_tasks:
+        try:
+            normalized = _normalize_index_task_payload(item)
+            normalized_tasks.append(normalized)
+            task_detail.append(dict(normalized))
+        except Exception as exc:
+            fallback_task = {
+                "index_name": str((item or {}).get("index_name", "")),
+                "freq": str((item or {}).get("freq", "")),
+                "start_time": str((item or {}).get("start_time", "")),
+                "end_time": str((item or {}).get("end_time", "")),
+            }
+            error_text = str(exc)[:200]
+            payloads.append(
+                _build_index_task_payload(task=fallback_task, rows=[], error=error_text, worker_pid=worker_pid)
+            )
+            failures.append((fallback_task["index_name"], fallback_task["freq"], error_text))
+
+    if not normalized_tasks:
+        return {
+            "chunk_id": chunk_id,
+            "chunk_task_count": int(len(raw_tasks)),
+            "chunk_hit_tasks": 0,
+            "chunk_network_page_calls": 0,
+            "task_detail": task_detail,
+            "payloads": payloads,
+            "failures": failures,
+            "worker_pid": worker_pid,
+        }
+
+    try:
+        client_context = _ensure_worker_client_context()
+    except Exception as exc:
+        error_text = str(exc)[:200]
+        for task in normalized_tasks:
+            payloads.append(_build_index_task_payload(task=task, rows=[], error=error_text, worker_pid=worker_pid))
+            failures.append((str(task.get("index_name", "")), str(task.get("freq", "")), error_text))
+        return {
+            "chunk_id": chunk_id,
+            "chunk_task_count": int(len(raw_tasks)),
+            "chunk_hit_tasks": 0,
+            "chunk_network_page_calls": 0,
+            "task_detail": task_detail,
+            "payloads": payloads,
+            "failures": failures,
+            "worker_pid": worker_pid,
+        }
+
+    reconnect_on_unavailable = bool(chunk_payload.get("reconnect_on_unavailable", True))
+    chunk_timeout = max(1.0, float(chunk_payload.get("chunk_timeout_seconds", 30.0) or 30.0))
+    chunk_retry_max = max(0, int(chunk_payload.get("chunk_retry_max_attempts", 2) or 0))
+
+    def _run_chunk_fetch_once() -> List[Dict[str, Any]]:
+        """
+        执行一次指数 chunk 抓取调用。
+
+        输入：
+        1. 使用外层闭包变量 client_context/normalized_tasks。
+        输出：
+        1. 指数 task 结果列表。
+        用途：
+        1. 为失败后重试复用同一段调用逻辑。
+        边界条件：
+        1. 调用异常向上抛出，由上层统一处理。
+        """
+        result_items: List[Dict[str, Any]] = []
+        for task in normalized_tasks:
+            rows = client_context.get_index_kline_rows_for_task(task)
+            result_items.append(
+                {
+                    "task": dict(task),
+                    "rows": rows if isinstance(rows, list) else [],
+                    "error": None if rows else "no_data",
+                }
+            )
+        return result_items
+
+    def _run_chunk_fetch_with_timeout() -> List[Dict[str, Any]]:
+        """
+        带超时包裹执行一次指数 chunk 抓取。
+
+        输入：
+        1. 使用外层闭包变量 chunk_timeout。
+        输出：
+        1. 指数 chunk 抓取结果列表。
+        用途：
+        1. 防止单个 chunk 无限阻塞，超时后抛出 TimeoutError 由重试循环捕获。
+        边界条件：
+        1. 超时时 future 被取消，抛出 TimeoutError。
+        2. 超时后 executor 以 wait=False 关闭，不阻塞当前线程。
+        """
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="zsdtdx_index_chunk_timeout")
+        f = executor.submit(_run_chunk_fetch_once)
+        try:
+            return f.result(timeout=chunk_timeout)
+        except Exception:
+            f.cancel()
+            raise
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    error_text = ""
+    chunk_result: Optional[List[Dict[str, Any]]] = None
+    try:
+        chunk_result = _run_chunk_fetch_with_timeout()
+    except Exception as exc:
+        error_text = str(exc)[:200] or type(exc).__name__
+
+    retry_count = 0
+    while error_text and retry_count < chunk_retry_max:
+        retry_count += 1
+        if bool(reconnect_on_unavailable) and _is_connection_unavailable_error(error_text):
+            recover_detail = _recover_worker_standard_connection_current_thread(reason=error_text)
+            _emit_log(
+                "warning",
+                "[Task Parallel] index chunk 重试前尝试重建标准连接",
+                {
+                    "stage": "chunk_retry_reconnect",
+                    "chunk_id": str(chunk_id),
+                    "chunk_task_count": int(len(raw_tasks)),
+                    "retry_count": int(retry_count),
+                    "retry_limit": int(chunk_retry_max),
+                    "recover_ok": bool(recover_detail.get("ok")),
+                    "reason": str(error_text),
+                    "active_host_before": str(recover_detail.get("active_host_before", "")),
+                    "active_host_after": str(recover_detail.get("active_host_after", "")),
+                    "recover_error": str(recover_detail.get("error", "")),
+                },
+            )
+        else:
+            _emit_log(
+                "warning",
+                "[Task Parallel] index chunk 执行失败，开始重试",
+                {
+                    "stage": "chunk_retry",
+                    "chunk_id": str(chunk_id),
+                    "chunk_task_count": int(len(raw_tasks)),
+                    "retry_count": int(retry_count),
+                    "retry_limit": int(chunk_retry_max),
+                    "reason": str(error_text),
+                },
+            )
+        try:
+            chunk_result = _run_chunk_fetch_with_timeout()
+            error_text = ""
+        except Exception as retry_exc:
+            error_text = str(retry_exc)[:200] or type(retry_exc).__name__
+
+    if error_text:
+        if retry_count > 0:
+            _emit_log(
+                "error",
+                "[Task Parallel] index chunk 重试耗尽仍失败",
+                {
+                    "stage": "chunk_retry_exhausted",
+                    "chunk_id": str(chunk_id),
+                    "chunk_task_count": int(len(raw_tasks)),
+                    "retry_count": int(retry_count),
+                    "retry_limit": int(chunk_retry_max),
+                    "last_error": str(error_text),
+                },
+            )
+        for task in normalized_tasks:
+            payloads.append(_build_index_task_payload(task=task, rows=[], error=error_text, worker_pid=worker_pid))
+            failures.append((str(task.get("index_name", "")), str(task.get("freq", "")), error_text))
+        return {
+            "chunk_id": chunk_id,
+            "chunk_task_count": int(len(raw_tasks)),
+            "chunk_hit_tasks": 0,
+            "chunk_network_page_calls": 0,
+            "task_detail": task_detail,
+            "payloads": payloads,
+            "failures": failures,
+            "worker_pid": worker_pid,
+        }
+
+    result_items = list(chunk_result or [])
+    for index, task in enumerate(normalized_tasks):
+        item = result_items[index] if index < len(result_items) and isinstance(result_items[index], dict) else {}
+        result_task = item.get("task", task)
+        rows = item.get("rows", [])
+        item_error_text = item.get("error")
+        payloads.append(
+            _build_index_task_payload(
+                task=result_task if isinstance(result_task, dict) else task,
+                rows=rows if isinstance(rows, list) else [],
+                error=item_error_text,
+                worker_pid=worker_pid,
+            )
+        )
+        if str(item_error_text or "").strip():
+            failures.append((str(task.get("index_name", "")), str(task.get("freq", "")), str(item_error_text)[:200]))
+
+    return {
+        "chunk_id": chunk_id,
+        "chunk_task_count": int(len(raw_tasks)),
+        "chunk_hit_tasks": 0,
+        "chunk_network_page_calls": 0,
         "task_detail": task_detail,
         "payloads": payloads,
         "failures": failures,
@@ -2380,6 +2681,59 @@ class ParallelKlineFetcher:
         )
         return chunks
 
+    def _build_index_task_chunks(self, tasks: List[Dict[str, Any]]) -> List[TaskChunk]:
+        """
+        构建指数任务 chunk：按 index_name+freq 分组，并在组内按时间升序排序。
+
+        输入：
+        1. tasks: 标准化指数任务列表。
+        输出：
+        1. chunk 列表（同 index_name+freq 聚合后的有序任务分片）。
+        用途：
+        1. 为指数并行路径提供“局部顺序执行”的分片基础。
+        边界条件：
+        1. tasks 为空时返回空列表。
+        """
+        grouped: Dict[Tuple[str, str], List[Tuple[int, Dict[str, str], pd.Timestamp, pd.Timestamp]]] = defaultdict(list)
+        normalize_task = _normalize_index_task_payload
+        to_sortable_ts = _to_sortable_task_ts
+        for index, raw_task in enumerate(tasks or []):
+            normalized_task = normalize_task(raw_task)
+            index_name = str(normalized_task.get("index_name", "")).strip()
+            freq = str(normalized_task.get("freq", "")).strip()
+            grouped[(index_name, freq)].append(
+                (
+                    int(index),
+                    normalized_task,
+                    to_sortable_ts(normalized_task.get("start_time")),
+                    to_sortable_ts(normalized_task.get("end_time")),
+                )
+            )
+
+        chunks: List[TaskChunk] = []
+        for chunk_idx, ((index_name, freq), items) in enumerate(grouped.items(), start=1):
+            items.sort(key=lambda item: (item[2], item[3], item[0]))
+            chunk_tasks = [dict(item[1]) for item in items]
+            chunks.append(
+                TaskChunk(
+                    chunk_id=f"{index_name}:{freq}:{chunk_idx}",
+                    code=str(index_name),
+                    freq=str(freq),
+                    tasks=chunk_tasks,
+                )
+            )
+
+        chunks.sort(
+            key=lambda item: (
+                -int(item.task_count),
+                str(item.code),
+                str(item.freq),
+                str(item.tasks[0].get("start_time", "")) if item.tasks else "",
+                str(item.chunk_id),
+            )
+        )
+        return chunks
+
     def _build_chunk_bundles(self, chunks: List[TaskChunk], inproc_workers: int) -> List[ChunkBundle]:
         """
         构建 chunk 批次：先按进程负载均衡，再按进程内并发切批。
@@ -2446,7 +2800,7 @@ class ParallelKlineFetcher:
             for index, item in enumerate(raw_bundles, start=1)
         ]
 
-    def _iter_task_payloads_inproc_chunked(self, tasks: List[Dict[str, Any]]):
+    def _iter_task_payloads_inproc_chunked(self, tasks: List[Dict[str, Any]], task_kind: str = "stock"):
         """
         主进程内 chunk 并发迭代任务结果（不启用多进程）。
 
@@ -2459,11 +2813,14 @@ class ParallelKlineFetcher:
         边界条件：
         1. chunk 级超时与重试由 _fetch_one_task_chunk 内部处理。
         """
-        task_list = [_normalize_task_payload(item) for item in list(tasks or [])]
+        kind = str(task_kind or "stock").strip().lower()
+        normalize_task = _normalize_index_task_payload if kind == "index" else _normalize_task_payload
+        build_chunks = self._build_index_task_chunks if kind == "index" else self._build_task_chunks
+        task_list = [normalize_task(item) for item in list(tasks or [])]
         if not task_list:
             return
 
-        chunks = self._build_task_chunks(task_list)
+        chunks = build_chunks(task_list)
         if not chunks:
             return
 
@@ -2499,6 +2856,7 @@ class ParallelKlineFetcher:
                 chunk_payload = chunk.to_payload(
                     enable_cache=bool(chunk.task_count >= int(self.task_chunk_cache_min_tasks))
                 )
+                chunk_payload["task_kind"] = str(kind)
                 chunk_payload["reconnect_on_unavailable"] = bool(self.chunk_reconnect_on_unavailable)
                 chunk_payload["chunk_timeout_seconds"] = float(self.chunk_timeout_seconds)
                 chunk_payload["chunk_retry_max_attempts"] = int(self.chunk_retry_max_attempts)
@@ -2530,9 +2888,10 @@ class ParallelKlineFetcher:
                             continue
                         chunk_failure_count += 1
                         task_obj = payload.get("task") if isinstance(payload.get("task"), dict) else {}
+                        task_symbol = str(task_obj.get("code") or task_obj.get("index_name") or "")
                         failure_tasks.append(
                             {
-                                "code": str(task_obj.get("code", "")),
+                                "code": task_symbol,
                                 "freq": str(task_obj.get("freq", "")),
                                 "error": error_text,
                                 "start_time": task_obj.get("start_time"),
@@ -2590,7 +2949,7 @@ class ParallelKlineFetcher:
                             worker_pid=os.getpid(),
                         )
 
-    def _iter_task_payloads_parallel_chunked(self, tasks: List[Dict[str, Any]]):
+    def _iter_task_payloads_parallel_chunked(self, tasks: List[Dict[str, Any]], task_kind: str = "stock"):
         """
         chunk 化并行迭代任务结果（完成顺序回收）。
 
@@ -2603,11 +2962,14 @@ class ParallelKlineFetcher:
         边界条件：
         1. chunk 级超时与重试由 _fetch_one_task_chunk 内部处理。
         """
-        task_list = [_normalize_task_payload(item) for item in list(tasks or [])]
+        kind = str(task_kind or "stock").strip().lower()
+        normalize_task = _normalize_index_task_payload if kind == "index" else _normalize_task_payload
+        build_chunks = self._build_index_task_chunks if kind == "index" else self._build_task_chunks
+        task_list = [normalize_task(item) for item in list(tasks or [])]
         if not task_list:
             return
 
-        chunks = self._build_task_chunks(task_list)
+        chunks = build_chunks(task_list)
         if not chunks:
             return
         bundles = self._build_chunk_bundles(chunks, self.task_chunk_inproc_future_workers)
@@ -2645,6 +3007,9 @@ class ParallelKlineFetcher:
             bundle_cursor += 1
 
             bundle_payload = bundle.to_payload(cache_min_tasks=self.task_chunk_cache_min_tasks)
+            for chunk_payload in list(bundle_payload.get("chunks") or []):
+                if isinstance(chunk_payload, dict):
+                    chunk_payload["task_kind"] = str(kind)
             bundle_payload["inproc_workers"] = int(self.task_chunk_inproc_future_workers)
             bundle_payload["reconnect_on_unavailable"] = bool(self.chunk_reconnect_on_unavailable)
             bundle_payload["chunk_timeout_seconds"] = float(self.chunk_timeout_seconds)
@@ -2747,9 +3112,10 @@ class ParallelKlineFetcher:
                         continue
                     chunk_failure_count += 1
                     task_obj = payload.get("task") if isinstance(payload.get("task"), dict) else {}
+                    task_symbol = str(task_obj.get("code") or task_obj.get("index_name") or "")
                     failure_tasks.append(
                         {
-                            "code": str(task_obj.get("code", "")),
+                            "code": task_symbol,
                             "freq": str(task_obj.get("freq", "")),
                             "error": error_text,
                             "start_time": task_obj.get("start_time"),
@@ -2833,6 +3199,80 @@ class ParallelKlineFetcher:
             ),
         )
         iterator = self._iter_task_payloads_inproc_chunked(normalized_tasks)
+
+        for raw_payload in iterator:
+            error_text = str(raw_payload.get("error") or "").strip()
+            if error_text:
+                failed_tasks += 1
+            else:
+                success_tasks += 1
+            processed_payload = self._apply_preprocessor_operator(raw_payload, preprocessor_operator)
+            if processed_payload is None:
+                continue
+            outputs.append(processed_payload)
+            if queue is not None:
+                queue.put(processed_payload)
+
+        done_payload = {
+            "event": "done",
+            "total_tasks": int(total_tasks),
+            "success_tasks": int(success_tasks),
+            "failed_tasks": int(failed_tasks),
+        }
+        if queue is not None:
+            queue.put(done_payload)
+        return outputs
+
+    def fetch_index_tasks_sync(
+        self,
+        *,
+        tasks: List[Dict[str, Any]],
+        queue: Optional[Any] = None,
+        preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        同步执行指数 task 列表，并实时写入队列。
+
+        输入：
+        1. tasks: 指数任务列表。
+        2. queue: 可选结果队列（需支持 put）。
+        3. preprocessor_operator: 可选预处理函数。
+        输出：
+        1. 处理后的指数 task payload 列表。
+        用途：
+        1. 支持“阻塞调用 + 实时队列”模式。
+        边界条件：
+        1. tasks 为空时返回空列表并发送 done 事件。
+        2. 同步模式固定在主进程内执行 chunk 调度，不使用多进程池。
+        """
+        self._validate_queue(queue)
+        normalized_tasks = [_normalize_index_task_payload(item) for item in list(tasks or [])]
+        total_tasks = int(len(normalized_tasks))
+        outputs: List[Dict[str, Any]] = []
+        success_tasks = 0
+        failed_tasks = 0
+
+        if total_tasks <= 0:
+            done_payload = {
+                "event": "done",
+                "total_tasks": 0,
+                "success_tasks": 0,
+                "failed_tasks": 0,
+            }
+            if queue is not None:
+                queue.put(done_payload)
+            return outputs
+
+        _emit_log(
+            "info",
+            (
+                "[Task Sync] 主进程指数 chunk 执行模式（不启用多进程池） "
+                f"(num_processes_config={self.num_processes}, "
+                f"inproc_workers={self.task_chunk_inproc_future_workers}, "
+                f"任务数={total_tasks})"
+            ),
+        )
+        iterator = self._iter_task_payloads_inproc_chunked(normalized_tasks, task_kind="index")
 
         for raw_payload in iterator:
             error_text = str(raw_payload.get("error") or "").strip()
@@ -2946,6 +3386,118 @@ class ParallelKlineFetcher:
             return outputs
 
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="zsdtdx_stock_kline_async")
+        future = executor.submit(_run_async_worker)
+
+        def _cleanup(_future: Future) -> None:
+            """
+            异步任务结束后的线程池清理回调。
+
+            输入：
+            1. _future: 已完成的 future（仅用于回调签名占位）。
+            输出：
+            1. 无返回值。
+            用途：
+            1. 在后台任务结束后关闭承载 async 包装任务的单线程执行器。
+            边界条件：
+            1. 关闭异常会被吞掉，避免影响 future 完成态传播。
+            """
+            try:
+                executor.shutdown(wait=False, cancel_futures=False)
+            except Exception:
+                pass
+
+        future.add_done_callback(_cleanup)
+        return StockKlineJob(future=future, queue_obj=queue)
+
+    def fetch_index_tasks_async(
+        self,
+        *,
+        tasks: List[Dict[str, Any]],
+        queue: Optional[Any] = None,
+        preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+    ) -> StockKlineJob:
+        """
+        异步启动指数 task 执行并立即返回句柄。
+
+        输入：
+        1. tasks: 指数任务列表。
+        2. queue: 可选结果队列。
+        3. preprocessor_operator: 可选预处理函数。
+        输出：
+        1. StockKlineJob 异步句柄。
+        用途：
+        1. 支持“非阻塞调用 + 队列持续消费”模式。
+        边界条件：
+        1. 任务执行异常由 job.exception()/job.result() 暴露。
+        """
+        self._validate_queue(queue)
+        self._ensure_async_prewarm()
+        normalized_tasks = [_normalize_index_task_payload(item) for item in list(tasks or [])]
+        total_tasks = int(len(normalized_tasks))
+
+        def _run_async_worker() -> List[Dict[str, Any]]:
+            """
+            async 后台执行体：固定走进程池指数 chunk 并行路径。
+
+            输入：
+            1. 使用外层闭包变量 normalized_tasks/queue/preprocessor_operator。
+            输出：
+            1. 处理后的指数 task payload 列表。
+            用途：
+            1. 与 sync 主进程路径分离，确保 async 真正落到进程池并行执行。
+            边界条件：
+            1. tasks 为空时返回空列表并发送 done 事件。
+            """
+            outputs: List[Dict[str, Any]] = []
+            success_tasks = 0
+            failed_tasks = 0
+
+            if total_tasks <= 0:
+                done_payload = {
+                    "event": "done",
+                    "total_tasks": 0,
+                    "success_tasks": 0,
+                    "failed_tasks": 0,
+                }
+                if queue is not None:
+                    queue.put(done_payload)
+                return outputs
+
+            _emit_log(
+                "info",
+                (
+                    "[Task Async] 进程池指数 chunk 执行模式 "
+                    f"(num_processes={self.num_processes}, "
+                    f"inproc_workers={self.task_chunk_inproc_future_workers}, "
+                    f"任务数={total_tasks})"
+                ),
+            )
+            iterator = self._iter_task_payloads_parallel_chunked(normalized_tasks, task_kind="index")
+
+            for raw_payload in iterator:
+                error_text = str(raw_payload.get("error") or "").strip()
+                if error_text:
+                    failed_tasks += 1
+                else:
+                    success_tasks += 1
+                processed_payload = self._apply_preprocessor_operator(raw_payload, preprocessor_operator)
+                if processed_payload is None:
+                    continue
+                outputs.append(processed_payload)
+                if queue is not None:
+                    queue.put(processed_payload)
+
+            done_payload = {
+                "event": "done",
+                "total_tasks": int(total_tasks),
+                "success_tasks": int(success_tasks),
+                "failed_tasks": int(failed_tasks),
+            }
+            if queue is not None:
+                queue.put(done_payload)
+            return outputs
+
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="zsdtdx_index_kline_async")
         future = executor.submit(_run_async_worker)
 
         def _cleanup(_future: Future) -> None:

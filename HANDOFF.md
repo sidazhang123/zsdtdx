@@ -20,7 +20,7 @@
 
 ## 3. 术语定义
 
-1. `task`：单个 K 线请求，字段 `{code,freq,start_time,end_time}`。
+1. `task`：单个 K 线请求，股票任务字段 `{code,freq,start_time,end_time}`，指数任务字段 `{index_name,freq,start_time,end_time}`。
 2. `chunk`：同 `code+freq` 的 task 集合，按 `start_time` 升序执行。
 3. `bundle`：提交给单个进程池 future 的 chunk 批次。
 4. `inproc future`：worker 进程内的 chunk 线程 future（上限由 `task_chunk_inproc_future_workers` 控制）。
@@ -33,6 +33,7 @@
 4. worker 进程内通过 `ThreadPoolExecutor` 并发执行 chunk。
 5. chunk 内通过 `unified_client.get_stock_kline_rows_for_chunk_tasks(...)` 拉取并复用缓存。
 6. 主进程按 bundle 完成顺序归集结果并写入队列，最终追加 `event=done`。
+7. 指数入口 `simple_api.get_index_kline(task, mode=...)` 现已接入 `ParallelFetcher`：sync 走主进程 inproc chunk，async 走进程池 bundle + worker chunk；chunk 内按 `(index_name, freq)` 分组后顺序调用 `unified_client.get_index_kline_rows_for_task(...)`。
 
 ## 5. sync/async 当前语义
 
@@ -41,6 +42,7 @@
 3. async：后台任务立即返回 `StockKlineJob`。
 4. async：队列产出粒度为“bundle 回收后逐 payload 写入”，不是 worker 内 chunk 完成即跨进程直推。
 5. async：建议消费端按 `queue.get(timeout=20)` 持续读取，直到 `event=done`。
+6. 指数 sync/async：与 stock_kline 共用 `ParallelFetcher` 的日志、配置传递、预热、worker 常驻连接与进程池生命周期；事件结构保持一致。
 
 ## 6. 关键配置项（`config.yaml.parallel`）
 
@@ -59,6 +61,10 @@
 8. `auto_prewarm_timeout_seconds`
 9. `auto_prewarm_max_rounds`
 10. `auto_prewarm_spread_standard_hosts`
+11. `index_kline.disk_cache`
+12. `index_kline.prefer_ex_markets`
+13. `index_kline.aliases`
+14. `index_kline.lookup`
 
 ## 7. 文档联动约束
 

@@ -96,9 +96,9 @@ parallel:
   # 总超时后是否对未完成任务回退串行补拉。
   # 取值: true/false
   timeout_fallback_to_serial: true
-  # chunk 级缓存启用阈值（以 get_stock_kline(task) 任务链路计）。
+  # chunk 级缓存启用阈值（适用于 get_stock_kline(task) / get_index_kline(task) 并行链路）。
   # 取值: 正整数
-  # 影响: 当 code+freq 的 chunk 任务数达到阈值时启用轻量缓存。
+  # 影响: 当同一 chunk 任务数达到阈值时启用轻量缓存（stock 按 code+freq；index 按 index_name+freq）。
   task_chunk_cache_min_tasks: 2
   # worker 进程内 chunk 级 future 并发数。
   # 取值: 正整数
@@ -120,7 +120,7 @@ parallel:
   # 取值: 非负整数
   # 影响: 每个 chunk 最多重试 N 次（超时、连接不可用、其他异常均触发），避免无限重试拖慢整体吞吐。
   chunk_retry_max_attempts: 2
-  # async 调用时是否自动预热进程池与 worker 常驻连接。
+  # async 调用时是否自动预热进程池与 worker 常驻连接（适用于 stock/index）。
   # 取值: true/false
   # 影响: true 时 async 首次调用会自动触发 prewarm，降低冷启动抖动。
   auto_prewarm_on_async: true
@@ -237,3 +237,28 @@ output:
   # 占位K线成交量/成交额“极小值”阈值。
   # 取值: 非负浮点数（科学计数法可用）
   suspended_placeholder_eps: 1.0e-20
+
+index_kline:
+  # 指数名称路由落盘缓存（pickle）。pip 安装后默认写入用户缓存目录，无需写 site-packages。
+  disk_cache:
+    # 是否启用落盘缓存。
+    enabled: true
+    # 缓存目录；留空则使用系统用户缓存目录（Windows: %LOCALAPPDATA%\zsdtdx\cache，其它: $XDG_CACHE_HOME/zsdtdx 或 ~/.cache/zsdtdx）。
+    directory: null
+    # 缓存文件名。
+    filename: index_route_cache.pkl
+  # 运行时动态发现 ex 指数市场的优先候选列表（用于名称->路由解析）。
+  # 默认优先：中证指数(62)、国证指数(102)、全球指数(37)、香港指数(27)。
+  prefer_ex_markets:
+    - 62
+    - 102
+    - 37
+    - 27
+  # 指数别名：先将用户输入转换为标准名称，再执行精确匹配。
+  aliases:
+    上证综指: 上证指数
+  lookup:
+    # 名称未命中时，错误中最多返回多少个候选名称。
+    max_candidates: 10
+    # 名称匹配前是否移除空白字符（半角/全角空格等）。
+    normalize_whitespace: true
