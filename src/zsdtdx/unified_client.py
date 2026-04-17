@@ -1767,7 +1767,7 @@ class UnifiedTdxClient:
         records: List[Dict[str, Any]] = []
         seen_keys: set[str] = set()
         security_page = int(self.pagination.get("standard_security_list_page_size", 800))
-        index_name_markers = ("指数", "中证", "深证", "上证", "创业板", "科创")
+        index_name_markers = ("指数", "中证", "深证", "上证", "沪深", "创业板", "科创")
 
         for market in [0, 1]:
             start = 0
@@ -1780,7 +1780,11 @@ class UnifiedTdxClient:
                     code = str(item.get("code", "")).strip()
                     if name == "" or code == "":
                         continue
-                    if not any(marker in name for marker in index_name_markers):
+                    looks_like_std_index_code = (
+                        (int(market) == 1 and code.startswith("000"))
+                        or (int(market) == 0 and code.startswith("399"))
+                    )
+                    if (not any(marker in name for marker in index_name_markers)) and (not looks_like_std_index_code):
                         continue
                     key = f"std|{int(market)}|{code}|{name}"
                     if key in seen_keys:
