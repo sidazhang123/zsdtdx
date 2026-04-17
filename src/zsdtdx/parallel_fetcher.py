@@ -1853,6 +1853,7 @@ def _fetch_one_index_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]
     worker_pid = int(os.getpid())
     chunk_id = str(chunk_payload.get("chunk_id", ""))
     raw_tasks = list(chunk_payload.get("tasks") or [])
+    enable_cache = bool(chunk_payload.get("enable_cache", False))
 
     task_detail: List[Dict[str, Any]] = []
     normalized_tasks: List[Dict[str, str]] = []
@@ -1911,7 +1912,7 @@ def _fetch_one_index_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]
     chunk_timeout = max(1.0, float(chunk_payload.get("chunk_timeout_seconds", 30.0) or 30.0))
     chunk_retry_max = max(0, int(chunk_payload.get("chunk_retry_max_attempts", 2) or 0))
 
-    def _run_chunk_fetch_once() -> List[Dict[str, Any]]:
+    def _run_chunk_fetch_once() -> Dict[str, Any]:
         """
         执行一次指数 chunk 抓取调用。
 
@@ -1924,19 +1925,12 @@ def _fetch_one_index_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]
         边界条件：
         1. 调用异常向上抛出，由上层统一处理。
         """
-        result_items: List[Dict[str, Any]] = []
-        for task in normalized_tasks:
-            rows = client_context.get_index_kline_rows_for_task(task)
-            result_items.append(
-                {
-                    "task": dict(task),
-                    "rows": rows if isinstance(rows, list) else [],
-                    "error": None if rows else "no_data",
-                }
-            )
-        return result_items
+        return client_context.get_index_kline_rows_for_chunk_tasks(
+            tasks=normalized_tasks,
+            enable_cache=enable_cache,
+        )
 
-    def _run_chunk_fetch_with_timeout() -> List[Dict[str, Any]]:
+    def _run_chunk_fetch_with_timeout() -> Dict[str, Any]:
         """
         带超时包裹执行一次指数 chunk 抓取。
 
@@ -1961,7 +1955,7 @@ def _fetch_one_index_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]
             executor.shutdown(wait=False, cancel_futures=True)
 
     error_text = ""
-    chunk_result: Optional[List[Dict[str, Any]]] = None
+    chunk_result: Optional[Dict[str, Any]] = None
     try:
         chunk_result = _run_chunk_fetch_with_timeout()
     except Exception as exc:
@@ -2035,7 +2029,9 @@ def _fetch_one_index_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]
             "worker_pid": worker_pid,
         }
 
-    result_items = list(chunk_result or [])
+    chunk_hit_tasks = int((chunk_result or {}).get("chunk_hit_tasks", 0) or 0)
+    chunk_network_page_calls = int((chunk_result or {}).get("chunk_network_page_calls", 0) or 0)
+    result_items = list((chunk_result or {}).get("results") or [])
     for index, task in enumerate(normalized_tasks):
         item = result_items[index] if index < len(result_items) and isinstance(result_items[index], dict) else {}
         result_task = item.get("task", task)
@@ -2055,8 +2051,8 @@ def _fetch_one_index_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]
     return {
         "chunk_id": chunk_id,
         "chunk_task_count": int(len(raw_tasks)),
-        "chunk_hit_tasks": 0,
-        "chunk_network_page_calls": 0,
+        "chunk_hit_tasks": int(max(0, chunk_hit_tasks)),
+        "chunk_network_page_calls": int(max(0, chunk_network_page_calls)),
         "task_detail": task_detail,
         "payloads": payloads,
         "failures": failures,

@@ -1357,6 +1357,218 @@ class UnifiedTdxClient:
             route=route,
         )
 
+    def get_index_kline_rows_for_chunk_tasks(
+        self,
+        tasks: List[Dict[str, Any]],
+        enable_cache: bool,
+    ) -> Dict[str, Any]:
+        """
+        执行同 `index_name+freq` 的指数 chunk 任务并返回逐任务结果。
+
+        输入：
+        1. tasks: 任务列表，元素至少包含 index_name/freq/start_time/end_time。
+        2. enable_cache: 是否启用 chunk 级轻量缓存。
+        输出：
+        1. 结果字典：{"results":[{"task","rows","error"}...], "chunk_hit_tasks", "chunk_network_page_calls"}。
+        用途：
+        1. 在 chunk 内按 `start_time` 升序执行任务，尽量复用前序任务已拉取的指数原始 bar 缓存。
+        边界条件：
+        1. 若任务不属于同一 index_name+freq，直接抛 ValueError。
+        2. `chunk_network_page_calls` 统计的是分页请求次数；发生分页时会累计多次。
+        """
+        raw_tasks = list(tasks or [])
+        if not raw_tasks:
+            return {"results": [], "chunk_hit_tasks": 0, "chunk_network_page_calls": 0}
+
+        normalized_tasks: List[Dict[str, Any]] = []
+        for item in raw_tasks:
+            normalized_tasks.append(self._normalize_index_task_payload_no_df(item))
+
+        base_index_name = str(normalized_tasks[0]["index_name"]).strip()
+        base_freq = str(normalized_tasks[0]["freq"]).strip()
+        for task in normalized_tasks[1:]:
+            if str(task["index_name"]).strip() != base_index_name or str(task["freq"]).strip() != base_freq:
+                raise ValueError("chunk 任务必须属于同一 index_name+freq")
+
+        ordered_tasks = sorted(
+            list(enumerate(normalized_tasks)),
+            key=lambda item: (
+                self._to_datetime_no_df(item[1]["start_time"]),
+                self._to_datetime_no_df(item[1]["end_time"]),
+                int(item[0]),
+            ),
+        )
+        task_items = [dict(item[1]) for item in ordered_tasks]
+
+        if not bool(enable_cache):
+            results: List[Dict[str, Any]] = []
+            for task in task_items:
+                try:
+                    rows = self.get_index_kline_rows_for_task(task)
+                except Exception as exc:
+                    results.append({"task": task, "rows": [], "error": str(exc)[:200]})
+                    continue
+                if not rows:
+                    results.append({"task": task, "rows": [], "error": "no_data"})
+                else:
+                    results.append({"task": task, "rows": rows, "error": None})
+            return {"results": results, "chunk_hit_tasks": 0, "chunk_network_page_calls": 0}
+
+        first_task = dict(task_items[0])
+        pre_route_source = str(first_task.get("_index_route_source", "")).strip().lower()
+        pre_route_code = str(first_task.get("_index_route_code", "")).strip()
+        pre_route_name = str(first_task.get("_index_route_name", "")).strip()
+        try:
+            pre_route_market = int(first_task.get("_index_route_market", -1))
+        except Exception:
+            pre_route_market = -1
+        if pre_route_source in {"std", "ex"} and pre_route_code != "" and pre_route_market >= 0:
+            route = {
+                "name": pre_route_name if pre_route_name != "" else base_index_name,
+                "source": pre_route_source,
+                "market": pre_route_market,
+                "code": pre_route_code,
+            }
+        else:
+            route = self.resolve_index_name(index_name=base_index_name, refresh=False)
+
+        category = self._freq_to_category(base_freq)
+        normalized_freq = self._normalize_freq(base_freq)
+        page_size = int(
+            self.pagination.get(
+                "standard_kline_page_size" if str(route.get("source", "std")).strip().lower() == "std" else "extended_kline_page_size",
+                800 if str(route.get("source", "std")).strip().lower() == "std" else 700,
+            )
+        )
+        max_pages = int(self.pagination.get("max_kline_pages", 300))
+
+        cache_rows: Dict[str, Dict[str, Any]] = {}
+        oldest_cached_dt: Optional[dt.datetime] = None
+        page_start = 0
+        fetched_pages = 0
+        chunk_hit_tasks = 0
+        chunk_network_page_calls = 0
+        results: List[Dict[str, Any]] = []
+
+        def _fetch_one_page(current_route: Dict[str, Any], start: int) -> List[Dict[str, Any]]:
+            source = str(current_route.get("source", "std")).strip().lower()
+            market = int(current_route.get("market", -1))
+            code = str(current_route.get("code", "")).strip()
+            if market < 0 or code == "":
+                raise ValueError(f"指数路由配置非法: {current_route}")
+            if source == "std":
+                return list(
+                    self.std_pool.call(
+                        "get_index_bars",
+                        int(category),
+                        int(market),
+                        str(code),
+                        int(start),
+                        int(page_size),
+                        allow_none=True,
+                    )
+                    or []
+                )
+            return list(
+                self.ex_pool.call(
+                    "get_instrument_bars",
+                    int(category),
+                    int(market),
+                    str(code),
+                    int(start),
+                    int(page_size),
+                    allow_none=True,
+                )
+                or []
+            )
+
+        def _merge_index_cache_page_rows(page_rows: List[Dict[str, Any]]) -> Optional[dt.datetime]:
+            nonlocal cache_rows
+            page_oldest_dt: Optional[dt.datetime] = None
+            route_name = str(route.get("name", base_index_name))
+            route_code = str(route.get("code", ""))
+            for row in page_rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    parsed_dt = self._to_datetime_no_df(row.get("datetime"))
+                except Exception:
+                    continue
+                dt_key = parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
+                vol_v = self._safe_float_no_df(row.get("vol"))
+                trade_v = self._safe_float_no_df(row.get("trade"))
+                volume_v = vol_v if vol_v is not None else trade_v
+                cache_rows[dt_key] = {
+                    "index_name": route_name,
+                    "code": route_code,
+                    "freq": normalized_freq,
+                    "open": self._safe_float_no_df(row.get("open")),
+                    "close": self._safe_float_no_df(row.get("close")),
+                    "high": self._safe_float_no_df(row.get("high")),
+                    "low": self._safe_float_no_df(row.get("low")),
+                    "volume": volume_v,
+                    "amount": self._safe_float_no_df(row.get("amount")),
+                    "datetime": dt_key,
+                }
+                if page_oldest_dt is None or parsed_dt < page_oldest_dt:
+                    page_oldest_dt = parsed_dt
+            return page_oldest_dt
+
+        for task in task_items:
+            try:
+                start_dt = self._to_datetime_no_df(task["start_time"])
+                end_dt = self._to_datetime_no_df(task["end_time"])
+            except Exception as exc:
+                results.append({"task": task, "rows": [], "error": str(exc)[:200]})
+                continue
+            if start_dt > end_dt:
+                results.append({"task": task, "rows": [], "error": "start_time 不能晚于 end_time"})
+                continue
+
+            before_calls = int(chunk_network_page_calls)
+            while True:
+                covered = oldest_cached_dt is not None and oldest_cached_dt <= start_dt
+                if covered:
+                    break
+                if fetched_pages >= max_pages:
+                    break
+                try:
+                    page_rows = _fetch_one_page(route, page_start)
+                except Exception:
+                    route = self.resolve_index_name(index_name=base_index_name, refresh=True)
+                    page_rows = _fetch_one_page(route, page_start)
+                fetched_pages += 1
+                chunk_network_page_calls += 1
+                if not page_rows:
+                    break
+                page_oldest = _merge_index_cache_page_rows(page_rows)
+                if page_oldest is not None and (oldest_cached_dt is None or page_oldest < oldest_cached_dt):
+                    oldest_cached_dt = page_oldest
+                if len(page_rows) < page_size:
+                    break
+                page_start += len(page_rows)
+
+            task_rows: List[Dict[str, Any]] = []
+            for dt_key in sorted(cache_rows.keys()):
+                try:
+                    bar_dt = self._to_datetime_no_df(dt_key)
+                except Exception:
+                    continue
+                if start_dt <= bar_dt <= end_dt:
+                    task_rows.append(dict(cache_rows[dt_key]))
+            if int(chunk_network_page_calls) == int(before_calls):
+                chunk_hit_tasks += 1
+            if not task_rows:
+                results.append({"task": task, "rows": [], "error": "no_data"})
+            else:
+                results.append({"task": task, "rows": task_rows, "error": None})
+
+        return {
+            "results": results,
+            "chunk_hit_tasks": int(chunk_hit_tasks),
+            "chunk_network_page_calls": int(chunk_network_page_calls),
+        }
+
     def _record_failure(self, task: str, code: str, reason: str, detail: str, freq: str = ""):
         """输入失败信息，输出无；用于失败报告；detail 为空会转空串。"""
         self._runtime_failures.append(

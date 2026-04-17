@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.4.4 - 2026-04-17
+
+### Summary
+1. 指数 chunk 执行新增批量任务入口：在 worker 侧按 `index_name+freq` 聚合后，通过 `get_index_kline_rows_for_chunk_tasks()` 统一执行，减少重复调用开销。
+2. 指数 chunk 级缓存能力补齐：支持在同一 chunk 内复用已拉取的原始 bar，按任务时间窗口切片返回，降低分页请求次数。
+3. 指数并行链路补充命中统计：`chunk_hit_tasks` 与 `chunk_network_page_calls` 在 index 任务路径中按真实执行结果回填，便于性能观测与调优。
+
 ## v1.4.3 - 2026-04-17
 
 ### Summary
