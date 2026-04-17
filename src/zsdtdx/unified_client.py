@@ -767,6 +767,160 @@ class UnifiedTdxClient:
             "end_time": end_time,
         }
 
+    def _normalize_index_task_payload_no_df(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """输入指数任务字典，输出标准化任务；用于无 DataFrame 指数 chunk 校验；缺字段或时间非法抛错。"""
+        if not isinstance(task, dict):
+            raise ValueError("task 必须是 dict")
+        index_name = str(task.get("index_name", "")).strip()
+        freq = str(task.get("freq", "")).strip().lower()
+        start_time = str(task.get("start_time", "")).strip()
+        end_time = str(task.get("end_time", "")).strip()
+        if index_name == "":
+            raise ValueError("task.index_name 不能为空")
+        if freq == "":
+            raise ValueError("task.freq 不能为空")
+        if start_time == "":
+            raise ValueError("task.start_time 不能为空")
+        if end_time == "":
+            raise ValueError("task.end_time 不能为空")
+
+        self._freq_to_category(freq)
+        start_dt = self._to_datetime_no_df(start_time)
+        end_dt = self._to_datetime_no_df(end_time)
+        if start_dt > end_dt:
+            raise ValueError("start_time 不能晚于 end_time")
+
+        normalized: Dict[str, Any] = {
+            "index_name": index_name,
+            "freq": self._normalize_freq(freq),
+            "start_time": start_time,
+            "end_time": end_time,
+        }
+
+        pre_route_source = str(task.get("_index_route_source", "")).strip().lower()
+        pre_route_code = str(task.get("_index_route_code", "")).strip()
+        pre_route_name = str(task.get("_index_route_name", "")).strip()
+        try:
+            pre_route_market = int(task.get("_index_route_market", -1))
+        except Exception:
+            pre_route_market = -1
+        if pre_route_source in {"std", "ex"} and pre_route_code != "" and pre_route_market >= 0:
+            normalized["_index_route_source"] = pre_route_source
+            normalized["_index_route_code"] = pre_route_code
+            normalized["_index_route_market"] = pre_route_market
+            if pre_route_name != "":
+                normalized["_index_route_name"] = pre_route_name
+
+        return normalized
+
+    def _fetch_index_rows_for_task_with_route_no_df(
+        self,
+        normalized_task: Dict[str, Any],
+        route: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """输入标准化任务和路由，输出指数K线；用于无 DataFrame 任务执行；路由失效时自动刷新一次。"""
+        index_name = str(normalized_task.get("index_name", "")).strip()
+        freq = str(normalized_task.get("freq", "")).strip().lower()
+        start_dt = self._to_datetime_no_df(normalized_task.get("start_time"))
+        end_dt = self._to_datetime_no_df(normalized_task.get("end_time"))
+        if start_dt > end_dt:
+            raise ValueError("start_time 不能晚于 end_time")
+        category = self._freq_to_category(freq)
+
+        def _fetch_route_rows(current_route: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+            source = str(current_route.get("source", "std")).strip().lower()
+            market = int(current_route.get("market", -1))
+            code = str(current_route.get("code", "")).strip()
+            if market < 0 or code == "":
+                raise ValueError(f"指数路由配置非法: {current_route}")
+            page_size = int(
+                self.pagination.get(
+                    "standard_kline_page_size" if source == "std" else "extended_kline_page_size",
+                    800 if source == "std" else 700,
+                )
+            )
+            max_pages = int(self.pagination.get("max_kline_pages", 300))
+            rows: List[Dict[str, Any]] = []
+            start = 0
+            for _ in range(max_pages):
+                if source == "std":
+                    page = self.std_pool.call(
+                        "get_index_bars",
+                        int(category),
+                        int(market),
+                        str(code),
+                        int(start),
+                        int(page_size),
+                        allow_none=True,
+                    )
+                else:
+                    page = self.ex_pool.call(
+                        "get_instrument_bars",
+                        int(category),
+                        int(market),
+                        str(code),
+                        int(start),
+                        int(page_size),
+                        allow_none=True,
+                    )
+                if not page:
+                    break
+                rows.extend(list(page))
+                oldest_raw = page[0].get("datetime") if isinstance(page[0], dict) else None
+                try:
+                    oldest_dt = self._to_datetime_no_df(oldest_raw)
+                except Exception:
+                    oldest_dt = None
+                if oldest_dt is not None and oldest_dt <= start_dt:
+                    break
+                if len(page) < page_size:
+                    break
+                start += len(page)
+            return {"source": source, "market": market, "code": code}, rows
+
+        resolved_route = dict(route)
+        try:
+            effective_route, raw_rows = _fetch_route_rows(resolved_route)
+        except Exception:
+            resolved_route = self.resolve_index_name(index_name=index_name, refresh=True)
+            effective_route, raw_rows = _fetch_route_rows(resolved_route)
+        if not raw_rows:
+            resolved_route = self.resolve_index_name(index_name=index_name, refresh=True)
+            effective_route, raw_rows = _fetch_route_rows(resolved_route)
+
+        by_datetime: Dict[str, Dict[str, Any]] = {}
+        normalized_freq = self._normalize_freq(freq)
+        for row in raw_rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                parsed_dt = self._to_datetime_no_df(row.get("datetime"))
+            except Exception:
+                continue
+            if parsed_dt < start_dt or parsed_dt > end_dt:
+                continue
+            dt_key = parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
+            vol_v = self._safe_float_no_df(row.get("vol"))
+            trade_v = self._safe_float_no_df(row.get("trade"))
+            volume_v = vol_v if vol_v is not None else trade_v
+            normalized = {
+                "index_name": str(resolved_route.get("name", index_name)),
+                "code": str(effective_route.get("code", "")),
+                "freq": normalized_freq,
+                "open": self._safe_float_no_df(row.get("open")),
+                "close": self._safe_float_no_df(row.get("close")),
+                "high": self._safe_float_no_df(row.get("high")),
+                "low": self._safe_float_no_df(row.get("low")),
+                "volume": volume_v,
+                "amount": self._safe_float_no_df(row.get("amount")),
+                "datetime": dt_key,
+            }
+            by_datetime[dt_key] = normalized
+
+        if not by_datetime:
+            return []
+        return [by_datetime[key] for key in sorted(by_datetime.keys())]
+
     def _ensure_ex_market_name_map_no_df(self):
         """输入无，输出无；用于无 DataFrame 路径补充扩展市场映射；失败时保持现状。"""
         if self._ex_market_name_map:
@@ -1400,20 +1554,6 @@ class UnifiedTdxClient:
         )
         task_items = [dict(item[1]) for item in ordered_tasks]
 
-        if not bool(enable_cache):
-            results: List[Dict[str, Any]] = []
-            for task in task_items:
-                try:
-                    rows = self.get_index_kline_rows_for_task(task)
-                except Exception as exc:
-                    results.append({"task": task, "rows": [], "error": str(exc)[:200]})
-                    continue
-                if not rows:
-                    results.append({"task": task, "rows": [], "error": "no_data"})
-                else:
-                    results.append({"task": task, "rows": rows, "error": None})
-            return {"results": results, "chunk_hit_tasks": 0, "chunk_network_page_calls": 0}
-
         first_task = dict(task_items[0])
         pre_route_source = str(first_task.get("_index_route_source", "")).strip().lower()
         pre_route_code = str(first_task.get("_index_route_code", "")).strip()
@@ -1431,6 +1571,23 @@ class UnifiedTdxClient:
             }
         else:
             route = self.resolve_index_name(index_name=base_index_name, refresh=False)
+
+        if not bool(enable_cache):
+            results: List[Dict[str, Any]] = []
+            for task in task_items:
+                try:
+                    rows = self._fetch_index_rows_for_task_with_route_no_df(
+                        normalized_task=task,
+                        route=route,
+                    )
+                except Exception as exc:
+                    results.append({"task": task, "rows": [], "error": str(exc)[:200]})
+                    continue
+                if not rows:
+                    results.append({"task": task, "rows": [], "error": "no_data"})
+                else:
+                    results.append({"task": task, "rows": rows, "error": None})
+            return {"results": results, "chunk_hit_tasks": 0, "chunk_network_page_calls": 0}
 
         category = self._freq_to_category(base_freq)
         normalized_freq = self._normalize_freq(base_freq)
@@ -1923,135 +2080,27 @@ class UnifiedTdxClient:
         边界条件：
         1. 名称未命中、频率非法或时间窗口非法时抛 ValueError。
         """
-        if not isinstance(task, dict):
-            raise ValueError("task 必须是 dict")
-        index_name = str(task.get("index_name", "")).strip()
-        freq = str(task.get("freq", "")).strip().lower()
-        start_time = str(task.get("start_time", "")).strip()
-        end_time = str(task.get("end_time", "")).strip()
-        if index_name == "":
-            raise ValueError("task.index_name 不能为空")
-        if freq == "":
-            raise ValueError("task.freq 不能为空")
-        if start_time == "":
-            raise ValueError("task.start_time 不能为空")
-        if end_time == "":
-            raise ValueError("task.end_time 不能为空")
-
-        pre_route_source = str(task.get("_index_route_source", "")).strip().lower()
-        pre_route_code = str(task.get("_index_route_code", "")).strip()
-        pre_route_name = str(task.get("_index_route_name", "")).strip()
+        normalized_task = self._normalize_index_task_payload_no_df(task)
+        pre_route_source = str(normalized_task.get("_index_route_source", "")).strip().lower()
+        pre_route_code = str(normalized_task.get("_index_route_code", "")).strip()
+        pre_route_name = str(normalized_task.get("_index_route_name", "")).strip()
         try:
-            pre_route_market = int(task.get("_index_route_market", -1))
+            pre_route_market = int(normalized_task.get("_index_route_market", -1))
         except Exception:
             pre_route_market = -1
         if pre_route_source in {"std", "ex"} and pre_route_code != "" and pre_route_market >= 0:
             route = {
-                "name": pre_route_name if pre_route_name != "" else index_name,
+                "name": pre_route_name if pre_route_name != "" else str(normalized_task["index_name"]),
                 "source": pre_route_source,
                 "market": pre_route_market,
                 "code": pre_route_code,
             }
         else:
-            route = self.resolve_index_name(index_name=index_name, refresh=False)
-        category = self._freq_to_category(freq)
-        start_dt = self._to_datetime_no_df(start_time)
-        end_dt = self._to_datetime_no_df(end_time)
-        if start_dt > end_dt:
-            raise ValueError("start_time 不能晚于 end_time")
-
-        def _fetch_route_rows(current_route: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-            source = str(current_route.get("source", "std")).strip().lower()
-            market = int(current_route.get("market", -1))
-            code = str(current_route.get("code", "")).strip()
-            if market < 0 or code == "":
-                raise ValueError(f"指数路由配置非法: {current_route}")
-            page_size = int(
-                self.pagination.get(
-                    "standard_kline_page_size" if source == "std" else "extended_kline_page_size",
-                    800 if source == "std" else 700,
-                )
-            )
-            max_pages = int(self.pagination.get("max_kline_pages", 300))
-            rows: List[Dict[str, Any]] = []
-            start = 0
-            for _ in range(max_pages):
-                if source == "std":
-                    page = self.std_pool.call(
-                        "get_index_bars",
-                        int(category),
-                        int(market),
-                        str(code),
-                        int(start),
-                        int(page_size),
-                        allow_none=True,
-                    )
-                else:
-                    page = self.ex_pool.call(
-                        "get_instrument_bars",
-                        int(category),
-                        int(market),
-                        str(code),
-                        int(start),
-                        int(page_size),
-                        allow_none=True,
-                    )
-                if not page:
-                    break
-                rows.extend(list(page))
-                oldest_raw = page[0].get("datetime") if isinstance(page[0], dict) else None
-                try:
-                    oldest_dt = self._to_datetime_no_df(oldest_raw)
-                except Exception:
-                    oldest_dt = None
-                if oldest_dt is not None and oldest_dt <= start_dt:
-                    break
-                if len(page) < page_size:
-                    break
-                start += len(page)
-            return {"source": source, "market": market, "code": code}, rows
-
-        try:
-            effective_route, raw_rows = _fetch_route_rows(route)
-        except Exception:
-            route = self.resolve_index_name(index_name=index_name, refresh=True)
-            effective_route, raw_rows = _fetch_route_rows(route)
-        if not raw_rows:
-            route = self.resolve_index_name(index_name=index_name, refresh=True)
-            effective_route, raw_rows = _fetch_route_rows(route)
-
-        by_datetime: Dict[str, Dict[str, Any]] = {}
-        normalized_freq = self._normalize_freq(freq)
-        for row in raw_rows:
-            if not isinstance(row, dict):
-                continue
-            try:
-                parsed_dt = self._to_datetime_no_df(row.get("datetime"))
-            except Exception:
-                continue
-            if parsed_dt < start_dt or parsed_dt > end_dt:
-                continue
-            dt_key = parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
-            vol_v = self._safe_float_no_df(row.get("vol"))
-            trade_v = self._safe_float_no_df(row.get("trade"))
-            volume_v = vol_v if vol_v is not None else trade_v
-            normalized = {
-                "index_name": str(route.get("name", index_name)),
-                "code": str(effective_route.get("code", "")),
-                "freq": normalized_freq,
-                "open": self._safe_float_no_df(row.get("open")),
-                "close": self._safe_float_no_df(row.get("close")),
-                "high": self._safe_float_no_df(row.get("high")),
-                "low": self._safe_float_no_df(row.get("low")),
-                "volume": volume_v,
-                "amount": self._safe_float_no_df(row.get("amount")),
-                "datetime": dt_key,
-            }
-            by_datetime[dt_key] = normalized
-
-        if not by_datetime:
-            return []
-        return [by_datetime[key] for key in sorted(by_datetime.keys())]
+            route = self.resolve_index_name(index_name=str(normalized_task["index_name"]), refresh=False)
+        return self._fetch_index_rows_for_task_with_route_no_df(
+            normalized_task=normalized_task,
+            route=route,
+        )
 
     def _normalize_code_list(self, codes: Optional[Any]) -> Optional[List[str]]:
         """输入代码列表参数，输出去重后的字符串列表；用于统一处理；空输入返回 None。"""
