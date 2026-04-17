@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.4.3 - 2026-04-17
+
+### Summary
+1. 指数名称路由增加进程内内存复用：`resolve_index_name(refresh=False)` 命中客户端内缓存时直接返回，避免同一客户端重复全市场目录扫描。
+2. `get_index_kline` 增加主进程预解析：在任务分发前统一解析 `index_name -> {source, market, code}`，并将路由写入任务负载，降低 worker 侧重复目录发现开销。
+3. worker 执行链路支持消费预解析路由：`get_index_kline_rows_for_task` 优先使用任务路由字段，缺失时再回退原有名称解析逻辑，保持兼容性。
+4. 指数路由配置默认收敛：`prefer_ex_markets` 默认由 `[62,102,37,27]` 调整为 `[62]`，减少扩展市场索引候选扫描范围。
+
 ## v1.4.2 - 2026-04-16
 
 ### Summary

@@ -1548,6 +1548,10 @@ class UnifiedTdxClient:
         边界条件：
         1. 网络异常时返回当前已缓存结果（可能为空）。
         """
+        # refresh=False 时优先复用进程内快照，避免重复全市场扫描。
+        if (not bool(refresh)) and self._index_catalog_records:
+            return list(self._index_catalog_records)
+
         records: List[Dict[str, Any]] = []
         seen_keys: set[str] = set()
         security_page = int(self.pagination.get("standard_security_list_page_size", 800))
@@ -1718,7 +1722,22 @@ class UnifiedTdxClient:
         if end_time == "":
             raise ValueError("task.end_time 不能为空")
 
-        route = self.resolve_index_name(index_name=index_name, refresh=False)
+        pre_route_source = str(task.get("_index_route_source", "")).strip().lower()
+        pre_route_code = str(task.get("_index_route_code", "")).strip()
+        pre_route_name = str(task.get("_index_route_name", "")).strip()
+        try:
+            pre_route_market = int(task.get("_index_route_market", -1))
+        except Exception:
+            pre_route_market = -1
+        if pre_route_source in {"std", "ex"} and pre_route_code != "" and pre_route_market >= 0:
+            route = {
+                "name": pre_route_name if pre_route_name != "" else index_name,
+                "source": pre_route_source,
+                "market": pre_route_market,
+                "code": pre_route_code,
+            }
+        else:
+            route = self.resolve_index_name(index_name=index_name, refresh=False)
         category = self._freq_to_category(freq)
         start_dt = self._to_datetime_no_df(start_time)
         end_dt = self._to_datetime_no_df(end_time)

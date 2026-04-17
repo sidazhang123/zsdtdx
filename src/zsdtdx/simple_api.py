@@ -608,6 +608,40 @@ def get_index_kline(
         raw_tasks = list(task)
 
     normalized_tasks = _normalize_task_input(task=raw_tasks, task_cls=IndexKlineTask)
+
+    def _attach_index_routes(
+        client: UnifiedTdxClient,
+        tasks_buffer: List[Dict[str, str]],
+    ) -> List[Dict[str, Any]]:
+        """
+        在主进程预解析指数名称路由并写回任务字典。
+
+        输入：
+        1. client: 统一客户端实例。
+        2. tasks_buffer: 标准化后的指数任务列表。
+        输出：
+        1. 附带 `_index_route_*` 字段的任务列表。
+        用途：
+        1. 将名称解析前置到主进程，降低 worker 侧重复目录扫描次数。
+        边界条件：
+        1. 名称未命中时保持原有行为，直接抛 ValueError。
+        """
+        enriched_tasks: List[Dict[str, Any]] = []
+        for task_item in tasks_buffer:
+            route = client.resolve_index_name(index_name=task_item.get("index_name", ""), refresh=False)
+            task_copy: Dict[str, Any] = dict(task_item)
+            task_copy["_index_route_source"] = str(route.get("source", "")).strip().lower()
+            task_copy["_index_route_market"] = int(route.get("market", -1))
+            task_copy["_index_route_code"] = str(route.get("code", "")).strip()
+            task_copy["_index_route_name"] = str(route.get("name", "")).strip()
+            enriched_tasks.append(task_copy)
+        return enriched_tasks
+
+    normalized_tasks = _call_with_client(
+        lambda client: _attach_index_routes(client=client, tasks_buffer=normalized_tasks),
+        get_active_context_client=UnifiedTdxClient.get_active_context_client,
+        build_client=lambda: get_client(),
+    )
     mode_key = str(mode or "async").strip().lower()
     fetcher = get_fetcher()
 

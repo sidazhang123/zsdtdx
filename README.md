@@ -754,9 +754,6 @@ index_kline:
   # 动态发现扩展指数时优先考虑的 ex 市场列表。
   prefer_ex_markets:
     - 62
-    - 102
-    - 37
-    - 27
   aliases:
     上证综指: 上证指数
   lookup:

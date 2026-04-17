@@ -1460,7 +1460,7 @@ def _normalize_task_payload(task: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
-def _normalize_index_task_payload(task: Dict[str, Any]) -> Dict[str, str]:
+def _normalize_index_task_payload(task: Dict[str, Any]) -> Dict[str, Any]:
     """
     标准化指数 task 字段，确保进程间传输结构稳定。
 
@@ -1487,12 +1487,26 @@ def _normalize_index_task_payload(task: Dict[str, Any]) -> Dict[str, str]:
         raise ValueError("task.start_time 不能为空")
     if end_time == "":
         raise ValueError("task.end_time 不能为空")
-    return {
+    normalized: Dict[str, Any] = {
         "index_name": index_name,
         "freq": freq,
         "start_time": start_time,
         "end_time": end_time,
     }
+    route_source = str(task.get("_index_route_source", "")).strip().lower()
+    route_code = str(task.get("_index_route_code", "")).strip()
+    route_name = str(task.get("_index_route_name", "")).strip()
+    try:
+        route_market = int(task.get("_index_route_market", -1))
+    except Exception:
+        route_market = -1
+    if route_source in {"std", "ex"} and route_code != "" and route_market >= 0:
+        normalized["_index_route_source"] = route_source
+        normalized["_index_route_market"] = int(route_market)
+        normalized["_index_route_code"] = route_code
+        if route_name != "":
+            normalized["_index_route_name"] = route_name
+    return normalized
 
 
 def _to_sortable_task_ts(raw_value: Any) -> pd.Timestamp:
@@ -1612,7 +1626,7 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
     enable_cache = bool(chunk_payload.get("enable_cache", False))
 
     task_detail: List[Dict[str, Any]] = []
-    normalized_tasks: List[Dict[str, str]] = []
+    normalized_tasks: List[Dict[str, Any]] = []
     payloads: List[Dict[str, Any]] = []
     failures: List[Tuple[str, str, str]] = []
 
