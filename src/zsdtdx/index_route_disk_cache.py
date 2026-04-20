@@ -15,12 +15,13 @@ import hashlib
 import json
 import os
 import pickle
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # 与磁盘格式绑定；升级结构时递增并做兼容分支。
-_INDEX_ROUTE_CACHE_FORMAT_VERSION = 1
+_INDEX_ROUTE_CACHE_FORMAT_VERSION = 2
 
 
 def default_zsdtdx_user_cache_dir() -> Path:
@@ -44,6 +45,80 @@ def default_zsdtdx_user_cache_dir() -> Path:
     xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
     base = Path(xdg) if xdg else Path.home() / ".cache"
     return base / "zsdtdx"
+
+
+def _is_valid_cache_date(cache_date: Any) -> bool:
+    """校验缓存日期戳格式是否为 YYYY-MM-DD。"""
+    return isinstance(cache_date, str) and bool(re.match(r"^\d{4}-\d{2}-\d{2}$", cache_date))
+
+
+def _ensure_directory_writable(target_dir: Path) -> bool:
+    """
+    探测目录是否可写。
+
+    输入：
+    1. target_dir: 待探测目录。
+    输出：
+    1. bool，可写返回 True。
+    用途：
+    1. 在 pip 安装后目录可能只读时，提前选择可写缓存目录。
+    边界条件：
+    1. 目录不存在时会尝试创建；任一步骤异常都返回 False。
+    """
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return False
+    fd: Optional[int] = None
+    probe_path: Optional[Path] = None
+    try:
+        fd, probe_name = tempfile.mkstemp(dir=str(target_dir), prefix=".zsdtdx_probe_", suffix=".tmp")
+        probe_path = Path(probe_name)
+        os.close(fd)
+        fd = None
+        probe_path.unlink(missing_ok=True)
+        return True
+    except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if probe_path is not None:
+            try:
+                probe_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return False
+
+
+def resolve_index_route_cache_file_path(config_path: Any = None) -> Optional[Path]:
+    """
+    解析指数路由缓存文件路径并保证目录可写。
+
+    输入：
+    1. config_path: 用户配置路径（可为目录或文件）；为空时使用默认路径。
+    输出：
+    1. 可写缓存文件绝对路径；若无可写目录则返回 None。
+    用途：
+    1. 兼容 Windows/Linux 与 pip 安装只读目录场景。
+    边界条件：
+    1. 用户路径不可写时自动回退系统临时目录；仍不可写则返回 None。
+    """
+    candidates: List[Path] = []
+    raw = str(config_path or "").strip()
+    if raw != "":
+        user_path = Path(raw).expanduser()
+        if user_path.suffix:
+            candidates.append(user_path.resolve())
+        else:
+            candidates.append((user_path / "index_route_cache.pkl").resolve())
+    candidates.append((default_zsdtdx_user_cache_dir() / "index_route_cache.pkl").resolve())
+    candidates.append((Path(tempfile.gettempdir()) / "zsdtdx" / "index_route_cache.pkl").resolve())
+    for path in candidates:
+        if _ensure_directory_writable(path.parent):
+            return path
+    return None
 
 
 def fingerprint_index_kline_config(index_kline_cfg: Any) -> str:
@@ -86,14 +161,14 @@ def _is_valid_route_record(obj: Any) -> bool:
     return True
 
 
-def validate_cache_payload(obj: Any) -> Optional[Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]]:
+def validate_cache_payload(obj: Any) -> Optional[Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]], str]]:
     """
     校验反序列化后的缓存根对象。
 
     输入：
     1. obj: pickle 加载结果。
     输出：
-    1. (name_route, catalog) 或 None（表示不可用）。
+    1. (name_route, catalog, cache_date) 或 None（表示不可用）。
     用途：
     1. 避免损坏或恶意 pickle 污染内存。
     边界条件：
@@ -108,7 +183,10 @@ def validate_cache_payload(obj: Any) -> Optional[Tuple[Dict[str, Dict[str, Any]]
         return None
     name_route = obj.get("name_route")
     catalog = obj.get("catalog")
+    cache_date = str(obj.get("cache_date", "")).strip()
     if not isinstance(name_route, dict) or not isinstance(catalog, list):
+        return None
+    if not _is_valid_cache_date(cache_date):
         return None
     clean_nr: Dict[str, Dict[str, Any]] = {}
     for key, val in name_route.items():
@@ -122,10 +200,14 @@ def validate_cache_payload(obj: Any) -> Optional[Tuple[Dict[str, Dict[str, Any]]
         if not _is_valid_route_record(item):
             return None
         clean_cat.append(dict(item))
-    return clean_nr, clean_cat
+    return clean_nr, clean_cat, cache_date
 
 
-def load_index_route_cache(path: Path, expected_fingerprint: str) -> Optional[Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]]:
+def load_index_route_cache(
+    path: Path,
+    expected_fingerprint: str,
+    expected_cache_date: Optional[str] = None,
+) -> Optional[Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]], str]]:
     """
     从磁盘加载指数路由缓存。
 
@@ -133,7 +215,7 @@ def load_index_route_cache(path: Path, expected_fingerprint: str) -> Optional[Tu
     1. path: 缓存文件路径。
     2. expected_fingerprint: 当前配置指纹；不一致则视为未命中并尝试删除损坏/过期文件。
     输出：
-    1. (name_route, catalog) 或 None。
+    1. (name_route, catalog, cache_date) 或 None。
     用途：
     1. 进程启动时预热内存缓存。
     边界条件：
@@ -176,6 +258,10 @@ def load_index_route_cache(path: Path, expected_fingerprint: str) -> Optional[Tu
         except OSError:
             pass
         return None
+    _, _, cache_date = validated
+    expected_date = str(expected_cache_date or "").strip()
+    if expected_date != "" and cache_date != expected_date:
+        return None
     return validated
 
 
@@ -185,6 +271,7 @@ def save_index_route_cache(
     fingerprint: str,
     name_route: Dict[str, Dict[str, Any]],
     catalog: List[Dict[str, Any]],
+    cache_date: str,
 ) -> None:
     """
     将指数路由缓存原子写入磁盘。
@@ -194,6 +281,7 @@ def save_index_route_cache(
     2. fingerprint: 配置指纹。
     3. name_route: 名称键 -> 路由。
     4. catalog: 指数目录列表。
+    5. cache_date: 缓存日期戳（YYYY-MM-DD）。
     输出：
     1. 无；失败抛 OSError/IOError 等。
     用途：
@@ -203,11 +291,15 @@ def save_index_route_cache(
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    normalized_date = str(cache_date or "").strip()
+    if not _is_valid_cache_date(normalized_date):
+        raise ValueError(f"cache_date 格式非法: {cache_date}")
     payload = {
         "format_version": _INDEX_ROUTE_CACHE_FORMAT_VERSION,
         "fingerprint": str(fingerprint),
         "name_route": dict(name_route),
         "catalog": list(catalog),
+        "cache_date": normalized_date,
     }
     data = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
     fd: Optional[int] = None

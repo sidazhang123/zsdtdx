@@ -20,7 +20,12 @@ import yaml
 
 from zsdtdx.exhq import TdxExHq_API
 from zsdtdx.hq import TdxHq_API
-from zsdtdx.index_route_disk_cache import fingerprint_index_kline_config
+from zsdtdx.index_route_disk_cache import (
+    fingerprint_index_kline_config,
+    load_index_route_cache,
+    resolve_index_route_cache_file_path,
+    save_index_route_cache,
+)
 from zsdtdx.log import log
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
@@ -527,6 +532,20 @@ class UnifiedTdxClient:
         self._index_kline_fingerprint = fingerprint_index_kline_config(self.index_kline_cfg)
         # 动态发现的指数目录快照（全量候选列表），可 refresh 重建。
         self._index_catalog_records: List[Dict[str, Any]] = []
+        self._index_name_route_map: Dict[str, Dict[str, Any]] = {}
+        self.index_kline_route_cache_cfg = self.index_kline_cfg.get("route_cache", {}) or {}
+        self._index_route_cache_enabled = bool(self.index_kline_route_cache_cfg.get("enabled", True))
+        self._index_route_cache_refresh_granularity = str(
+            self.index_kline_route_cache_cfg.get("refresh_granularity", "day")
+        ).strip().lower() or "day"
+        self._index_route_cache_date = dt.datetime.now().date().isoformat()
+        self._index_route_cache_path: Optional[Path] = None
+        if self._index_route_cache_enabled and self._index_route_cache_refresh_granularity == "day":
+            self._index_route_cache_path = self._resolve_index_route_cache_path()
+            if self._index_route_cache_path is None:
+                self._index_route_cache_enabled = False
+            else:
+                self._try_load_index_route_cache_from_disk()
         self.client_cfg = self.config.get("client", {})
         self.preconnect_on_enter = bool(self.client_cfg.get("preconnect_on_enter", True))
 
@@ -1904,6 +1923,118 @@ class UnifiedTdxClient:
             return 90
         return 100
 
+    def _resolve_index_route_cache_path(self) -> Optional[Path]:
+        """
+        解析指数路由磁盘缓存路径并校验可写性。
+
+        输入：
+        1. 无显式输入参数，内部读取 `index_kline.route_cache.path`。
+        输出：
+        1. 可写缓存文件路径；无可写位置时返回 None。
+        用途：
+        1. 兼容 pip install 后站点目录只读场景。
+        边界条件：
+        1. 配置路径不可写时自动回退默认路径和临时目录。
+        """
+        configured_path = self.index_kline_route_cache_cfg.get("path")
+        return resolve_index_route_cache_file_path(config_path=configured_path)
+
+    def _rebuild_index_name_route_map(self, records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """
+        输入目录记录列表，输出名称键到路由的最优映射。
+
+        输入：
+        1. records: 全量指数目录记录。
+        输出：
+        1. `{normalized_name: route}` 字典。
+        用途：
+        1. 加速 `resolve_index_name` 命中路径，避免反复扫描全量记录。
+        边界条件：
+        1. 同名冲突时按 `_index_route_priority` 选择优先级更高的候选。
+        """
+        route_map: Dict[str, Dict[str, Any]] = {}
+        for record in records:
+            route_name = str(record.get("name", "")).strip()
+            if route_name == "":
+                continue
+            key = self._normalize_index_name_key(route_name)
+            if key == "":
+                continue
+            route = dict(record)
+            previous = route_map.get(key)
+            if previous is None:
+                route_map[key] = route
+                continue
+            prev_score = self._index_route_priority(
+                source=str(previous.get("source", "")),
+                market=int(previous.get("market", -1)),
+                code=str(previous.get("code", "")),
+                market_name=str(previous.get("market_name", "")),
+            )
+            cur_score = self._index_route_priority(
+                source=str(route.get("source", "")),
+                market=int(route.get("market", -1)),
+                code=str(route.get("code", "")),
+                market_name=str(route.get("market_name", "")),
+            )
+            if cur_score < prev_score:
+                route_map[key] = route
+        return route_map
+
+    def _try_load_index_route_cache_from_disk(self) -> None:
+        """
+        从磁盘加载日级指数路由缓存并回填内存。
+
+        输入：
+        1. 无显式输入参数。
+        输出：
+        1. 无；命中时更新内存快照。
+        用途：
+        1. 在同日重启场景复用缓存，避免重复全市场目录扫描。
+        边界条件：
+        1. 缓存缺失、损坏、跨日或配置指纹变化时保持当前内存状态不变。
+        """
+        if (not self._index_route_cache_enabled) or self._index_route_cache_path is None:
+            return
+        loaded = load_index_route_cache(
+            self._index_route_cache_path,
+            expected_fingerprint=self._index_kline_fingerprint,
+            expected_cache_date=self._index_route_cache_date,
+        )
+        if loaded is None:
+            return
+        name_route, catalog, _ = loaded
+        self._index_name_route_map = {str(k): dict(v) for k, v in dict(name_route).items()}
+        self._index_catalog_records = [dict(item) for item in list(catalog)]
+
+    def _persist_index_route_cache_to_disk(self) -> None:
+        """
+        将当前索引路由内存快照持久化到磁盘。
+
+        输入：
+        1. 无显式输入参数。
+        输出：
+        1. 无。
+        用途：
+        1. 保存“当天首次重建结果”，供同日后续运行直接复用。
+        边界条件：
+        1. 写失败时自动降级禁用磁盘缓存，不影响主流程继续执行。
+        """
+        if (not self._index_route_cache_enabled) or self._index_route_cache_path is None:
+            return
+        if not self._index_catalog_records or not self._index_name_route_map:
+            return
+        try:
+            save_index_route_cache(
+                self._index_route_cache_path,
+                fingerprint=self._index_kline_fingerprint,
+                name_route=self._index_name_route_map,
+                catalog=self._index_catalog_records,
+                cache_date=self._index_route_cache_date,
+            )
+        except Exception:
+            self._index_route_cache_enabled = False
+
     def _discover_index_route_records(self, refresh: bool = False) -> List[Dict[str, Any]]:
         """
         动态发现指数名称路由并缓存。
@@ -2002,6 +2133,8 @@ class UnifiedTdxClient:
                 break
 
         self._index_catalog_records = list(records)
+        self._index_name_route_map = self._rebuild_index_name_route_map(self._index_catalog_records)
+        self._persist_index_route_cache_to_disk()
         return list(records)
 
     def resolve_index_name(self, index_name: Any, refresh: bool = False) -> Dict[str, Any]:
@@ -2031,12 +2164,19 @@ class UnifiedTdxClient:
                     continue
                 alias_map[alias_key] = canonical_name
 
-        records = self._discover_index_route_records(refresh=refresh)
-        if not records:
-            raise ValueError("指数路由发现失败：未获取到可用指数清单")
-
         canonical_input_name = alias_map.get(normalized_name, raw_name)
         canonical_key = self._normalize_index_name_key(canonical_input_name)
+
+        if bool(refresh):
+            records = self._discover_index_route_records(refresh=True)
+        else:
+            cached_route = self._index_name_route_map.get(canonical_key)
+            if cached_route is not None:
+                return dict(cached_route)
+            records = self._discover_index_route_records(refresh=False)
+
+        if not records:
+            raise ValueError("指数路由发现失败：未获取到可用指数清单")
         exact_matches: List[Dict[str, Any]] = []
         for record in records:
             if self._normalize_index_name_key(record["name"]) == canonical_key:
@@ -2051,7 +2191,11 @@ class UnifiedTdxClient:
                     market_name=str(item.get("market_name", "")),
                 ),
             )
-            return dict(sorted_matches[0])
+            picked = dict(sorted_matches[0])
+            if canonical_key != "":
+                self._index_name_route_map[canonical_key] = dict(picked)
+                self._persist_index_route_cache_to_disk()
+            return picked
 
         max_candidates = int(self.index_kline_lookup_cfg.get("max_candidates", 10) or 10)
         max_candidates = max(1, max_candidates)

@@ -754,6 +754,13 @@ index_kline:
   # 动态发现扩展指数时优先考虑的 ex 市场列表。
   prefer_ex_markets:
     - 62
+  route_cache:
+    # true: 启用磁盘缓存；false: 每次按现有内存/网络流程解析
+    enabled: true
+    # day: 按自然日刷新缓存（当天首次全量更新，日内复用）
+    refresh_granularity: day
+    # 可选缓存路径（文件或目录）；留空自动选择用户可写目录
+    path: ""
   aliases:
     上证综指: 上证指数
   lookup:
@@ -777,6 +784,11 @@ output:
   # 取值: 非负浮点数（科学计数法可用）
   suspended_placeholder_eps: 1.0e-20
 ```
+
+- `index_kline.route_cache` 说明：
+  - 默认按自然日刷新：当天首次运行会全量重建指数映射，日内后续运行直接读取缓存。
+  - 默认缓存位置会自动选择用户可写目录（Windows: `LOCALAPPDATA`，Linux: `XDG_CACHE_HOME` 或 `~/.cache`）。
+  - 若目标目录不可写，会自动回退到系统临时目录；仍不可写时自动禁用磁盘缓存，不影响主流程。
 
 - 常用并行配置位于 `config.yaml.parallel`：
   - `process_count_core_multiplier`
