@@ -17,6 +17,7 @@ from zsdtdx.index_route_disk_cache import (
     resolve_index_route_cache_file_path,
     save_index_route_cache,
 )
+from zsdtdx.unified_client import UnifiedTdxClient
 
 
 class IndexRouteDiskCacheTests(unittest.TestCase):
@@ -138,6 +139,99 @@ class IndexRouteDiskCacheTests(unittest.TestCase):
                     catalog=catalog,
                     cache_date="2026/04/20",
                 )
+
+
+class UnifiedClientRuntimeCacheFlowTests(unittest.TestCase):
+    """运行时缓存读取流程测试。"""
+
+    def _build_client_stub(self) -> UnifiedTdxClient:
+        """
+        构造最小可测客户端桩对象。
+
+        输入：
+        1. 无显式输入参数。
+        输出：
+        1. 仅包含缓存相关字段与方法依赖的客户端对象。
+        用途：
+        1. 避免真实网络连接，专注验证内存/磁盘/重建流程。
+        边界条件：
+        1. 通过 `__new__` 绕过初始化，测试中需手动补齐依赖属性。
+        """
+        client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+        client._index_catalog_records = []
+        client._index_name_route_map = {}
+        client._index_route_cache_enabled = True
+        client._index_route_cache_path = Path(tempfile.gettempdir()) / "dummy_route_cache.pkl"
+        return client
+
+    def test_runtime_prefers_memory_cache(self) -> None:
+        """内存缓存存在时不访问磁盘和重建。"""
+        client = self._build_client_stub()
+        client._index_catalog_records = [{"name": "上证指数", "source": "std", "market": 1, "code": "000001"}]
+        client._index_name_route_map = {"上证指数": dict(client._index_catalog_records[0])}
+        calls = {"load": 0, "rebuild": 0}
+
+        def _fake_load() -> None:
+            calls["load"] += 1
+
+        def _fake_rebuild(refresh: bool = False):
+            calls["rebuild"] += 1
+            return list(client._index_catalog_records)
+
+        client._try_load_index_route_cache_from_disk = _fake_load  # type: ignore[method-assign]
+        client._discover_index_route_records = _fake_rebuild  # type: ignore[method-assign]
+
+        rows = client._ensure_index_route_cache_ready()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(calls["load"], 0)
+        self.assertEqual(calls["rebuild"], 0)
+
+    def test_runtime_loads_disk_when_memory_missing(self) -> None:
+        """内存缺失时先查磁盘，命中后不重建。"""
+        client = self._build_client_stub()
+        calls = {"load": 0, "rebuild": 0}
+        disk_route = {"name": "上证指数", "source": "std", "market": 1, "code": "000001"}
+
+        def _fake_load() -> None:
+            calls["load"] += 1
+            client._index_catalog_records = [dict(disk_route)]
+            client._index_name_route_map = {"上证指数": dict(disk_route)}
+
+        def _fake_rebuild(refresh: bool = False):
+            calls["rebuild"] += 1
+            return []
+
+        client._try_load_index_route_cache_from_disk = _fake_load  # type: ignore[method-assign]
+        client._discover_index_route_records = _fake_rebuild  # type: ignore[method-assign]
+
+        rows = client._ensure_index_route_cache_ready()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(calls["load"], 1)
+        self.assertEqual(calls["rebuild"], 0)
+
+    def test_runtime_rebuilds_when_disk_invalid(self) -> None:
+        """内存缺失且磁盘无效时触发重建。"""
+        client = self._build_client_stub()
+        calls = {"load": 0, "rebuild": 0}
+        rebuild_route = {"name": "深证成指", "source": "std", "market": 0, "code": "399001"}
+
+        def _fake_load() -> None:
+            calls["load"] += 1
+            # 模拟磁盘不存在/损坏/跨日：不回填内存
+
+        def _fake_rebuild(refresh: bool = False):
+            calls["rebuild"] += 1
+            client._index_catalog_records = [dict(rebuild_route)]
+            client._index_name_route_map = {"深证成指": dict(rebuild_route)}
+            return list(client._index_catalog_records)
+
+        client._try_load_index_route_cache_from_disk = _fake_load  # type: ignore[method-assign]
+        client._discover_index_route_records = _fake_rebuild  # type: ignore[method-assign]
+
+        rows = client._ensure_index_route_cache_ready()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(calls["load"], 1)
+        self.assertEqual(calls["rebuild"], 1)
 
 
 if __name__ == "__main__":

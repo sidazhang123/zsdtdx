@@ -544,8 +544,6 @@ class UnifiedTdxClient:
             self._index_route_cache_path = self._resolve_index_route_cache_path()
             if self._index_route_cache_path is None:
                 self._index_route_cache_enabled = False
-            else:
-                self._try_load_index_route_cache_from_disk()
         self.client_cfg = self.config.get("client", {})
         self.preconnect_on_enter = bool(self.client_cfg.get("preconnect_on_enter", True))
 
@@ -2007,6 +2005,26 @@ class UnifiedTdxClient:
         self._index_name_route_map = {str(k): dict(v) for k, v in dict(name_route).items()}
         self._index_catalog_records = [dict(item) for item in list(catalog)]
 
+    def _ensure_index_route_cache_ready(self) -> List[Dict[str, Any]]:
+        """
+        确保指数路由缓存在运行时可用并返回目录快照。
+
+        输入：
+        1. 无显式输入参数。
+        输出：
+        1. 目录快照列表。
+        用途：
+        1. 保证 `resolve_index_name` 先读内存，内存缺失时再查磁盘，磁盘无效时立即重建。
+        边界条件：
+        1. 磁盘缓存不可用或无效时会触发全量重建；重建失败时返回可能为空的快照。
+        """
+        if self._index_catalog_records and self._index_name_route_map:
+            return list(self._index_catalog_records)
+        self._try_load_index_route_cache_from_disk()
+        if self._index_catalog_records and self._index_name_route_map:
+            return list(self._index_catalog_records)
+        return self._discover_index_route_records(refresh=True)
+
     def _persist_index_route_cache_to_disk(self) -> None:
         """
         将当前索引路由内存快照持久化到磁盘。
@@ -2170,10 +2188,11 @@ class UnifiedTdxClient:
         if bool(refresh):
             records = self._discover_index_route_records(refresh=True)
         else:
+            self._ensure_index_route_cache_ready()
             cached_route = self._index_name_route_map.get(canonical_key)
             if cached_route is not None:
                 return dict(cached_route)
-            records = self._discover_index_route_records(refresh=False)
+            records = list(self._index_catalog_records)
 
         if not records:
             raise ValueError("指数路由发现失败：未获取到可用指数清单")
