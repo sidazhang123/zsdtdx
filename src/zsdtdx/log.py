@@ -2,13 +2,11 @@
 模块：`log.py`。
 
 职责：
-1. 提供 zsdtdx 体系中的协议封装、解析或对外接口能力。
-2. 对上层暴露稳定调用契约，屏蔽底层协议数据细节。
-3. 当前统计：类 0 个，函数 0 个。
+1. 配置 zsdtdx 包级日志记录器与默认级别。
+2. 通过环境变量 `TDX_DEBUG` 控制是否输出 DEBUG 日志。
 
 边界：
-1. 本模块仅负责当前文件定义范围，不承担其它分层编排职责。
-2. 错误语义、重试策略与容错逻辑以实现与调用方约定为准。
+1. 仅初始化根 logger `ZSDTDX`，不接管第三方库日志。
 """
 
 # coding=utf-8
@@ -16,12 +14,9 @@
 import logging
 import os
 
-DEBUG = os.getenv("TDX_DEBUG", "")
-
-if DEBUG:
-    LOGLEVEL = logging.DEBUG
-else:
-    LOGLEVEL = logging.INFO
+_DEBUG_FLAG = os.getenv("TDX_DEBUG", "").strip().lower()
+DEBUG = _DEBUG_FLAG in ("1", "true", "yes", "on")
+LOGLEVEL = logging.DEBUG if DEBUG else logging.INFO
 
 log = logging.getLogger("ZSDTDX")
 

@@ -2,20 +2,16 @@
 模块：`parser/raw_parser.py`。
 
 职责：
-1. 提供 zsdtdx 体系中的协议封装、解析或对外接口能力。
-2. 对上层暴露稳定调用契约，屏蔽底层协议数据细节。
-3. 当前统计：类 1 个，函数 2 个。
+1. 透传已组好的原始请求包，并将回包体原样返回。
+2. 供 `base_socket_client` 在调试或自定义协议时使用。
 
 边界：
-1. 本模块仅负责当前文件定义范围，不承担其它分层编排职责。
-2. 错误语义、重试策略与容错逻辑以实现与调用方约定为准。
+1. 不做字段解析；调用方自行处理 `body_buf`。
 """
 
 # coding=utf-8
 
 from zsdtdx.parser.base import BaseParser
-
-# Use this parser for testing
 
 
 class RawParser(BaseParser):

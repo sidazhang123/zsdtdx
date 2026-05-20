@@ -111,10 +111,6 @@ def update_last_ack_time(func):
                 to_raise = TdxFunctionCallError("calling function error")
                 to_raise.original_exception = e
                 raise to_raise
-        """
-        如果raise_exception=True 抛出异常
-        如果raise_exception=False 返回None
-        """
         return ret
     return wrapper
 
@@ -305,6 +301,19 @@ class BaseSocketClient(object):
         获取流量统计的信息
         :return:
         """
+        if self.client is None:
+            return {
+                "send_pkg_num": 0,
+                "recv_pkg_num": 0,
+                "send_pkg_bytes": 0,
+                "recv_pkg_bytes": 0,
+                "first_pkg_send_time": None,
+                "total_seconds": None,
+                "send_bytes_per_second": None,
+                "recv_bytes_per_second": None,
+                "last_api_send_bytes": 0,
+                "last_api_recv_bytes": 0,
+            }
         if self.client.first_pkg_send_time is not None:
             total_seconds = (datetime.datetime.now() -
                              self.client.first_pkg_send_time).total_seconds()

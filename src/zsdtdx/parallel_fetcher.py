@@ -53,6 +53,32 @@ _worker_client_holder: Any = None
 _worker_client_context: Any = None
 _worker_client_pid: Optional[int] = None
 _worker_client_lock = threading.Lock()
+
+# P0: worker 级 chunk 超时执行器复用（避免每个 chunk 创建/销毁 ThreadPoolExecutor）
+_chunk_timeout_executor: Optional[ThreadPoolExecutor] = None
+_chunk_timeout_executor_lock = threading.Lock()
+
+
+def _get_chunk_timeout_executor() -> ThreadPoolExecutor:
+    """P0: 获取 worker 级复用的单线程超时执行器。双重检查锁防多线程同时创建。"""
+    global _chunk_timeout_executor
+    if _chunk_timeout_executor is None:
+        with _chunk_timeout_executor_lock:
+            if _chunk_timeout_executor is None:
+                _chunk_timeout_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='zsdtdx_chunk_tmo')
+    return _chunk_timeout_executor
+
+
+def _shutdown_chunk_timeout_executor() -> None:
+    """P0: 关闭 chunk 超时执行器（worker 退出时调用）。"""
+    global _chunk_timeout_executor
+    e = _chunk_timeout_executor
+    _chunk_timeout_executor = None
+    if e is not None:
+        try: e.shutdown(wait=False, cancel_futures=True)
+        except Exception: pass
+
+
 _worker_chunk_executor: Optional[ThreadPoolExecutor] = None
 _worker_chunk_executor_workers: int = 0
 _worker_chunk_executor_lock = threading.Lock()
@@ -197,8 +223,22 @@ def _get_global_process_pool(max_workers: int) -> ProcessPoolExecutor:
                 except:
                     pass
             
+            try:
+                from zsdtdx.unified_client import refresh_tcp_probe_cache_from_config_path
+
+                refresh_tcp_probe_cache_from_config_path(_active_config_path)
+            except Exception as exc:
+                _emit_log("warning", f"[Parallel] TCP probe cache refresh failed: {exc}")
             from zsdtdx.unified_client import get_probe_result_cache
+
             sorted_hosts_snapshot = get_probe_result_cache() or None
+            if not sorted_hosts_snapshot or (
+                not sorted_hosts_snapshot.get("standard") and not sorted_hosts_snapshot.get("extended")
+            ):
+                _emit_log(
+                    "warning",
+                    "[Parallel] TCP probe 缓存为空，worker 首次建连可能重复探测",
+                )
 
             _global_pool_max_workers = max_workers
             _global_process_pool = ProcessPoolExecutor(
@@ -230,7 +270,7 @@ def _shutdown_global_pool():
         try:
             _emit_log("info", "[Parallel] 关闭全局进程池")
             _global_process_pool.shutdown(wait=True)
-        except:
+        except Exception:
             pass
         _global_process_pool = None
         _global_pool_epoch += 1
@@ -510,16 +550,16 @@ def _get_worker_chunk_executor(max_workers: int) -> ThreadPoolExecutor:
     return executor
 
 
-def _worker_chunk_connection_probe() -> Dict[str, Any]:
+def _probe_worker_std_ex_pool_state() -> Dict[str, Any]:
     """
-    在 chunk 线程池线程内触发连接建立并返回状态。
+    探测 worker 内标准/扩展行情池连接状态。
 
     输入：
     1. 无显式输入参数。
     输出：
     1. 连接状态字典（std/ex 是否可用与当前活跃 host）。
     用途：
-    1. 让 worker 进程内 chunk 线程在预热阶段提前建连，后续 chunk 可直接复用。
+    1. 供 chunk 预热线程与 worker 主线程预热复用。
     边界条件：
     1. 建连失败时异常上抛，由调用方统一统计。
     """
@@ -537,6 +577,22 @@ def _worker_chunk_connection_probe() -> Dict[str, Any]:
         "std_host": std_host,
         "ex_host": ex_host,
     }
+
+
+def _worker_chunk_connection_probe() -> Dict[str, Any]:
+    """
+    在 chunk 线程池线程内触发连接建立并返回状态。
+
+    输入：
+    1. 无显式输入参数。
+    输出：
+    1. 连接状态字典（std/ex 是否可用与当前活跃 host）。
+    用途：
+    1. 让 worker 进程内 chunk 线程在预热阶段提前建连，后续 chunk 可直接复用。
+    边界条件：
+    1. 建连失败时异常上抛，由调用方统一统计。
+    """
+    return _probe_worker_std_ex_pool_state()
 
 
 def _prewarm_worker_chunk_executor_connections(inproc_workers: int) -> Dict[str, Any]:
@@ -636,7 +692,11 @@ def _ensure_worker_client_context():
             return _worker_client_context
 
         _close_worker_client_context()
-        holder = UnifiedTdxClient(config_path=_active_config_path, presorted_hosts=_worker_sorted_hosts)
+        holder = UnifiedTdxClient(
+            config_path=_active_config_path,
+            presorted_hosts=_worker_sorted_hosts,
+            worker_client=True,
+        )
         context = holder.__enter__()
         _worker_client_holder = holder
         _worker_client_context = context
@@ -733,23 +793,6 @@ def _recover_worker_standard_connection_current_thread(reason: str = "") -> Dict
         }
 
 
-def _format_host_port(host: str, port: int) -> str:
-    """
-    组装 host:port 字符串。
-
-    输入：
-    1. host: 主机地址。
-    2. port: 端口号。
-    输出：
-    1. 标准化 host:port 字符串。
-    用途：
-    1. 统一预热阶段 host 标识格式，便于主进程与 worker 共享映射。
-    边界条件：
-    1. host 会 strip；port 非法时由调用方保证不传入。
-    """
-    return f"{str(host).strip()}:{int(port)}"
-
-
 def _summarize_worker_std_host_distribution(worker_std_host_map: Dict[int, str]) -> Dict[str, int]:
     """
     汇总 worker 到标准行情 host 的分布统计。
@@ -772,140 +815,8 @@ def _summarize_worker_std_host_distribution(worker_std_host_map: Dict[int, str])
     return {host: int(counter[host]) for host in sorted(counter.keys())}
 
 
-def _probe_valid_standard_hosts_for_prewarm(config_path: Optional[str]) -> List[str]:
-    """
-    探测标准行情 host 池中的可连接 host 列表（主进程）。
-
-    输入：
-    1. config_path: 配置文件路径；None 时走默认配置。
-    输出：
-    1. 按配置顺序返回可连接的标准行情 host 列表。
-    用途：
-    1. 为 async 预热阶段提供“可用 host 候选池”，用于 worker 分散建连。
-    边界条件：
-    1. 当探测失败或全部不可连时返回空列表，不中断预热主流程。
-    """
-    client = UnifiedTdxClient(config_path=config_path)
-    try:
-        pool = getattr(client, "std_pool", None)
-        if pool is None:
-            return []
-        hosts = list(getattr(pool, "hosts", []) or [])
-        connector = getattr(pool, "_connect_to_index", None)
-        if not callable(connector):
-            ensure_connected = getattr(pool, "ensure_connected", None)
-            get_active_host = getattr(pool, "get_active_host", None)
-            if callable(ensure_connected) and callable(get_active_host) and bool(ensure_connected()):
-                active = str(get_active_host() or "").strip()
-                return [active] if active else []
-            return []
-
-        valid_hosts: List[str] = []
-        seen_hosts: set[str] = set()
-        for index, item in enumerate(hosts):
-            if not isinstance(item, (tuple, list)) or len(item) != 2:
-                continue
-            host = _format_host_port(str(item[0]), int(item[1]))
-            try:
-                ok = bool(connector(int(index)))
-            except Exception:
-                ok = False
-            if ok and host not in seen_hosts:
-                seen_hosts.add(host)
-                valid_hosts.append(host)
-        return valid_hosts
-    finally:
-        try:
-            client.close()
-        except Exception:
-            pass
-
-
-def _build_worker_standard_host_assignment(
-    warmed_pids: set[int],
-    valid_standard_hosts: List[str],
-) -> Dict[int, str]:
-    """
-    生成 worker -> 标准行情 host 分配计划（轮询）。
-
-    输入：
-    1. warmed_pids: 已探测到的 worker pid 集合。
-    2. valid_standard_hosts: 可连接标准行情 host 列表。
-    输出：
-    1. pid -> host 映射字典。
-    用途：
-    1. 在 prewarm 后让各 worker 尽量分散到不同有效 host。
-    边界条件：
-    1. host 数小于 worker 数时会循环复用 host。
-    2. 任一输入为空时返回空映射。
-    """
-    normalized_hosts = [str(item).strip() for item in list(valid_standard_hosts or []) if str(item).strip()]
-    normalized_pids = sorted({int(pid) for pid in set(warmed_pids or set()) if int(pid) > 0})
-    if not normalized_hosts or not normalized_pids:
-        return {}
-
-    assignment: Dict[int, str] = {}
-    host_count = int(len(normalized_hosts))
-    for idx, pid in enumerate(normalized_pids):
-        assignment[int(pid)] = str(normalized_hosts[idx % host_count])
-    return assignment
-
-
-def _switch_worker_standard_host(preferred_standard_host: Optional[str]) -> Dict[str, Any]:
-    """
-    在当前 worker 进程尝试切换标准行情连接到指定 host。
-
-    输入：
-    1. preferred_standard_host: 期望连接的标准行情 host（host:port）。
-    输出：
-    1. host 切换结果字典（当前 host、目标 host、是否命中目标）。
-    用途：
-    1. 支持 prewarm 阶段按计划让不同 worker 尽量连接不同标准行情 IP。
-    边界条件：
-    1. 目标 host 为空或不存在时保持当前连接并返回未命中状态。
-    2. 切换失败不抛错，返回当前 host，由主进程统计分布后再决定是否重试。
-    """
-    context_client = _ensure_worker_client_context()
-    pool = getattr(context_client, "std_pool", None)
-    get_active_host = getattr(pool, "get_active_host", None)
-    active_before = str(get_active_host() or "").strip() if callable(get_active_host) else ""
-
-    target_host = str(preferred_standard_host or "").strip()
-    switched = False
-    active_after = active_before
-    matched = False
-    if target_host != "" and pool is not None:
-        hosts = list(getattr(pool, "hosts", []) or [])
-        host_index_map: Dict[str, int] = {}
-        for index, item in enumerate(hosts):
-            if not isinstance(item, (tuple, list)) or len(item) != 2:
-                continue
-            host_index_map[_format_host_port(str(item[0]), int(item[1]))] = int(index)
-
-        connector = getattr(pool, "_connect_to_index", None)
-        target_index = host_index_map.get(target_host)
-        if target_index is not None and callable(connector):
-            try:
-                switched = bool(connector(int(target_index)))
-            except Exception:
-                switched = False
-
-        if callable(get_active_host):
-            active_after = str(get_active_host() or "").strip()
-        matched = bool(active_after == target_host)
-
-    return {
-        "active_std_host_before": active_before,
-        "active_std_host": active_after,
-        "target_std_host": target_host,
-        "std_host_switched": bool(switched),
-        "std_host_matched": bool(matched),
-    }
-
-
 def _worker_warmup_probe(
     hold_seconds: float = 0.15,
-    preferred_standard_host: Optional[str] = None,
     inproc_workers: int = 1,
 ) -> Dict[str, Any]:
     """
@@ -913,53 +824,31 @@ def _worker_warmup_probe(
 
     输入：
     1. hold_seconds: 探针持有时长（秒），用于提高任务分发到不同 worker 的概率。
-    2. preferred_standard_host: 期望绑定的标准行情 host（host:port，可选）。
-    3. inproc_workers: worker 进程内 chunk 并发线程数（用于同步预热线程池连接）。
+    2. inproc_workers: worker 进程内 chunk 并发线程数（用于同步预热线程池连接）。
     输出：
     1. 预热结果字典，包含 `pid` 与标准行情 host 状态。
     用途：
-    1. 在启动阶段触发每个 worker 的首次建连，并可按需切换到指定标准 host。
+    1. 在启动阶段触发每个 worker 进程主线程的标准/扩展池建连。
     2. 当 inproc_workers>1 时，同时预热 chunk 线程池线程连接，确保后续 chunk 复用。
     边界条件：
     1. 建连失败时异常上抛，由主进程聚合并判定启动是否失败。
     """
-    host_state = _switch_worker_standard_host(preferred_standard_host)
+    pool_state = _probe_worker_std_ex_pool_state()
+    active_std = str(pool_state.get("std_host", "")).strip()
+    host_state = {
+        "active_std_host_before": active_std,
+        "active_std_host": active_std,
+        "target_std_host": "",
+        "std_host_switched": False,
+        "std_host_matched": True,
+        "std_ok": bool(pool_state.get("std_ok")),
+        "ex_ok": bool(pool_state.get("ex_ok")),
+    }
     inproc_summary = _prewarm_worker_chunk_executor_connections(inproc_workers)
     hold = max(0.0, min(float(hold_seconds), 1.0))
     if hold > 0:
         time.sleep(hold)
     return {"pid": int(os.getpid()), **host_state, **inproc_summary}
-
-
-def _worker_apply_standard_host_assignment(
-    pid_to_standard_host: Dict[int, str],
-    hold_seconds: float = 0.05,
-    inproc_workers: int = 1,
-) -> Dict[str, Any]:
-    """
-    worker 执行标准行情 host 定向分配任务。
-
-    输入：
-    1. pid_to_standard_host: pid -> host 的分配计划。
-    2. hold_seconds: 任务持有时长（秒）。
-    3. inproc_workers: worker 进程内 chunk 并发线程数（用于同步预热线程池连接）。
-    输出：
-    1. 包含 pid、目标 host、实际 host 的执行结果字典。
-    用途：
-    1. 在主进程完成 worker 探测后，按 pid 精确推动 host 分散绑定。
-    边界条件：
-    1. 当前 pid 未命中分配计划时，仅返回现状，不做主动切换。
-    """
-    current_pid = int(os.getpid())
-    target_host = str((pid_to_standard_host or {}).get(current_pid, "")).strip()
-    payload = _worker_warmup_probe(
-        hold_seconds=float(hold_seconds),
-        preferred_standard_host=target_host if target_host else None,
-        inproc_workers=max(1, int(inproc_workers)),
-    )
-    payload["planned_std_host"] = target_host
-    payload["assignment_applied"] = bool(target_host)
-    return payload
 
 
 def prewarm_parallel_fetcher(
@@ -968,7 +857,6 @@ def prewarm_parallel_fetcher(
     timeout_seconds: float = 60.0,
     max_rounds: int = 3,
     target_workers: Optional[int] = None,
-    spread_standard_hosts: bool = False,
 ) -> Dict[str, Any]:
     """
     预热并行抓取器：强制拉起进程池并建立 worker 常驻连接。
@@ -978,7 +866,6 @@ def prewarm_parallel_fetcher(
     2. timeout_seconds: 预热总超时时间（秒）。
     3. max_rounds: 预热轮次上限。
     4. target_workers: 可选目标进程数；不传时按当前 fetcher 的 num_processes。
-    5. spread_standard_hosts: 是否在 async 预热中对标准行情有效 host 做分散绑定。
     输出：
     1. 预热统计摘要（目标进程数、已预热进程数、pid 列表、耗时等）。
     用途：
@@ -998,9 +885,7 @@ def prewarm_parallel_fetcher(
     started_at = time.monotonic()
     warmed_pids: set[int] = set()
     worker_std_host_map: Dict[int, str] = {}
-    valid_standard_hosts: List[str] = []
     round_errors: list[str] = []
-    assignment_errors: list[str] = []
     rounds_used = 0
 
     _emit_log(
@@ -1012,31 +897,9 @@ def prewarm_parallel_fetcher(
             "require_all_workers": bool(require_all_workers),
             "timeout_seconds": float(timeout_budget),
             "max_rounds": int(rounds_limit),
-            "spread_standard_hosts": bool(spread_standard_hosts),
         },
     )
     executor = _get_global_process_pool(target_workers)
-    if bool(spread_standard_hosts):
-        try:
-            valid_standard_hosts = _probe_valid_standard_hosts_for_prewarm(config_path=_active_config_path)
-        except Exception as exc:
-            round_errors.append(f"probe valid standard hosts failed: {exc}")
-            valid_standard_hosts = []
-        if valid_standard_hosts:
-            _emit_log(
-                "info",
-                "[Parallel] 标准行情有效IP探测完成",
-                {
-                    "valid_standard_host_count": int(len(valid_standard_hosts)),
-                    "valid_standard_hosts": list(valid_standard_hosts),
-                },
-            )
-        else:
-            _emit_log(
-                "warning",
-                "[Parallel] 标准行情有效IP探测为空，回退默认预热策略",
-                {"spread_standard_hosts": bool(spread_standard_hosts)},
-            )
 
     for round_idx in range(1, rounds_limit + 1):
         rounds_used = round_idx
@@ -1047,21 +910,10 @@ def prewarm_parallel_fetcher(
             break
 
         probe_count = max(target_workers * 2, target_workers)
-        if spread_standard_hosts and valid_standard_hosts:
-            futures = [
-                executor.submit(
-                    _worker_warmup_probe,
-                    0.15,
-                    valid_standard_hosts[(round_idx + dispatch_idx) % len(valid_standard_hosts)],
-                    inproc_workers,
-                )
-                for dispatch_idx in range(probe_count)
-            ]
-        else:
-            futures = [
-                executor.submit(_worker_warmup_probe, 0.15, None, inproc_workers)
-                for _ in range(probe_count)
-            ]
+        futures = [
+            executor.submit(_worker_warmup_probe, 0.15, inproc_workers)
+            for _ in range(probe_count)
+        ]
         try:
             for future in as_completed(futures, timeout=remaining):
                 try:
@@ -1095,75 +947,6 @@ def prewarm_parallel_fetcher(
         if len(warmed_pids) >= target_workers:
             break
 
-    assignment_plan: Dict[int, str] = {}
-    assignment_rounds_used = 0
-    assignment_applied_pids: set[int] = set()
-    if spread_standard_hosts and valid_standard_hosts and warmed_pids:
-        assignment_plan = _build_worker_standard_host_assignment(
-            warmed_pids=set(warmed_pids),
-            valid_standard_hosts=list(valid_standard_hosts),
-        )
-        if assignment_plan:
-            for assignment_round in range(1, rounds_limit + 1):
-                assignment_rounds_used = assignment_round
-                elapsed = time.monotonic() - started_at
-                remaining = timeout_budget - elapsed
-                if remaining <= 0:
-                    assignment_errors.append("worker host assignment timeout before round dispatch")
-                    break
-
-                probe_count = max(target_workers * 2, target_workers)
-                futures = [
-                    executor.submit(
-                        _worker_apply_standard_host_assignment,
-                        assignment_plan,
-                        0.05,
-                        inproc_workers,
-                    )
-                    for _ in range(probe_count)
-                ]
-                try:
-                    for future in as_completed(futures, timeout=remaining):
-                        try:
-                            payload = future.result()
-                            pid = int(payload.get("pid", 0))
-                            if pid <= 0:
-                                continue
-                            if pid in assignment_plan:
-                                assignment_applied_pids.add(pid)
-                            active_std_host = str(payload.get("active_std_host", "")).strip()
-                            if active_std_host:
-                                worker_std_host_map[pid] = active_std_host
-                        except Exception as exc:
-                            assignment_errors.append(str(exc))
-                except TimeoutError:
-                    assignment_errors.append("worker host assignment round timeout")
-                finally:
-                    for future in futures:
-                        if not future.done():
-                            future.cancel()
-
-                distribution = _summarize_worker_std_host_distribution(worker_std_host_map)
-                mismatch_count = 0
-                for pid, host in assignment_plan.items():
-                    current_host = str(worker_std_host_map.get(int(pid), "")).strip()
-                    if current_host != str(host).strip():
-                        mismatch_count += 1
-
-                _emit_log(
-                    "info",
-                    "[Parallel] worker 标准行情IP分散分配轮次完成",
-                    {
-                        "round": int(assignment_round),
-                        "planned_workers": int(len(assignment_plan)),
-                        "applied_workers": int(len(assignment_applied_pids)),
-                        "mismatch_workers": int(mismatch_count),
-                        "std_host_distribution": distribution,
-                    },
-                )
-                if len(assignment_applied_pids) >= len(assignment_plan) and mismatch_count <= 0:
-                    break
-
     elapsed_total = round(time.monotonic() - started_at, 3)
     summary: Dict[str, Any] = {
         "target_workers": int(target_workers),
@@ -1172,20 +955,10 @@ def prewarm_parallel_fetcher(
         "elapsed_seconds": float(elapsed_total),
         "rounds_used": int(rounds_used),
         "require_all_workers": bool(require_all_workers),
-        "spread_standard_hosts": bool(spread_standard_hosts),
+        "std_worker_host_distribution": _summarize_worker_std_host_distribution(worker_std_host_map),
     }
-    if spread_standard_hosts:
-        summary["valid_standard_host_count"] = int(len(valid_standard_hosts))
-        summary["valid_standard_hosts"] = list(valid_standard_hosts)
-        summary["std_worker_host_distribution"] = _summarize_worker_std_host_distribution(worker_std_host_map)
-    if assignment_plan:
-        summary["std_host_assignment_plan"] = {str(pid): host for pid, host in sorted(assignment_plan.items())}
-        summary["std_host_assignment_rounds_used"] = int(assignment_rounds_used)
-        summary["std_host_assignment_applied_workers"] = int(len(assignment_applied_pids))
     if round_errors:
         summary["errors"] = round_errors[:10]
-    if assignment_errors:
-        summary["assignment_errors"] = assignment_errors[:10]
 
     if require_all_workers and len(warmed_pids) < target_workers:
         message = (
@@ -1568,6 +1341,43 @@ def _build_task_payload(
     }
 
 
+def _build_task_payload_for_kind(
+    task_kind: str,
+    *,
+    task: Dict[str, Any],
+    rows: Optional[List[Dict[str, Any]]] = None,
+    error: Optional[str] = None,
+    worker_pid: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    按 task_kind 构建标准或指数 task payload。
+
+    输入：
+    1. task_kind: `"stock"` 或 `"index"`。
+    2. task/rows/error/worker_pid: 与 `_build_task_payload` 相同。
+    输出：
+    1. 对应种类的事件 payload。
+    用途：
+    1. 并行回收层统一出口，避免指数任务误用股票 payload 形状。
+    边界条件：
+    1. 未知 kind 时回退为股票 payload。
+    """
+    kind = str(task_kind or "stock").strip().lower()
+    if kind == "index":
+        return _build_index_task_payload(
+            task=task,
+            rows=rows,
+            error=error,
+            worker_pid=worker_pid,
+        )
+    return _build_task_payload(
+        task=task,
+        rows=rows,
+        error=error,
+        worker_pid=worker_pid,
+    )
+
+
 def _build_index_task_payload(
     *,
     task: Dict[str, Any],
@@ -1604,21 +1414,79 @@ def _build_index_task_payload(
     }
 
 
+def _resolve_chunk_task_kind(chunk_payload: Dict[str, Any]) -> str:
+    """输入 chunk_payload，输出规范化 task_kind（stock/index）。"""
+    return str(chunk_payload.get("task_kind", "stock")).strip().lower()
+
+
+def _chunk_task_kind_profile(task_kind: str) -> Dict[str, Any]:
+    """
+    输入 task_kind，输出该链路差异配置（归一化、payload、主键字段、日志标签）。
+
+    边界：未知 kind 回退 stock。
+    """
+    kind = str(task_kind or "stock").strip().lower()
+    if kind == "index":
+        return {
+            "kind": "index",
+            "symbol_field": "index_name",
+            "normalize_item": _normalize_index_task_payload,
+            "build_payload": _build_index_task_payload,
+            "log_tag": "index chunk",
+        }
+    return {
+        "kind": "stock",
+        "symbol_field": "code",
+        "normalize_item": _normalize_task_payload,
+        "build_payload": _build_task_payload,
+        "log_tag": "chunk",
+    }
+
+
+def _run_chunk_fetch_with_timeout(
+    fetch_once: Callable[[], Dict[str, Any]],
+    chunk_timeout: float,
+) -> Dict[str, Any]:
+    """
+    在 worker 级单线程池中执行 chunk 抓取并施加超时。
+
+    输入：fetch_once 无参可调用对象；chunk_timeout 秒。
+    输出：chunk 抓取结果字典。
+    边界：超时取消 future 并关闭 chunk 超时执行器。
+    """
+    executor = _get_chunk_timeout_executor()
+    future = executor.submit(fetch_once)
+    try:
+        return future.result(timeout=chunk_timeout)
+    except TimeoutError:
+        future.cancel()
+        _shutdown_chunk_timeout_executor()
+        raise
+    except Exception:
+        future.cancel()
+        raise
+
+
 def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    进程 worker：执行单个 chunk（同 code+freq）并返回任务 payload 列表。
+    进程 worker：执行单个 chunk 并返回任务 payload 列表（stock/index 共用）。
 
     输入：
-    1. chunk_payload: 分片字典，包含 chunk_id/code/freq/tasks/enable_cache。
+    1. chunk_payload: 分片字典，含 task_kind、chunk_id、tasks、enable_cache 等。
     输出：
     1. 分片执行结果字典，包含 payloads/failures/命中统计等字段。
     用途：
     1. 作为 worker 内 chunk 级并发的最小执行单元。
     边界条件：
-    1. 客户端建连失败或分片执行失败时，会为所有任务返回 error payload。
+    1. task_kind=index 时走指数归一化与 get_index_kline_rows_for_chunk_tasks。
+    2. 客户端建连失败或分片执行失败时，会为所有任务返回 error payload。
     """
-    if str(chunk_payload.get("task_kind", "stock")).strip().lower() == "index":
-        return _fetch_one_index_task_chunk(chunk_payload)
+    task_kind = _resolve_chunk_task_kind(chunk_payload)
+    profile = _chunk_task_kind_profile(task_kind)
+    symbol_field = str(profile["symbol_field"])
+    normalize_item = profile["normalize_item"]
+    build_payload = profile["build_payload"]
+    log_tag = str(profile["log_tag"])
 
     worker_pid = int(os.getpid())
     chunk_id = str(chunk_payload.get("chunk_id", ""))
@@ -1632,19 +1500,20 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
 
     for item in raw_tasks:
         try:
-            normalized = _normalize_task_payload(item)
+            normalized = dict(item) if isinstance(item, dict) else normalize_item(item)
             normalized_tasks.append(normalized)
             task_detail.append(dict(normalized))
         except Exception as exc:
+            raw = item or {}
             fallback_task = {
-                "code": str((item or {}).get("code", "")),
-                "freq": str((item or {}).get("freq", "")),
-                "start_time": str((item or {}).get("start_time", "")),
-                "end_time": str((item or {}).get("end_time", "")),
+                symbol_field: str(raw.get(symbol_field, "")),
+                "freq": str(raw.get("freq", "")),
+                "start_time": str(raw.get("start_time", "")),
+                "end_time": str(raw.get("end_time", "")),
             }
             error_text = str(exc)[:200]
-            payloads.append(_build_task_payload(task=fallback_task, rows=[], error=error_text, worker_pid=worker_pid))
-            failures.append((fallback_task["code"], fallback_task["freq"], error_text))
+            payloads.append(build_payload(task=fallback_task, rows=[], error=error_text, worker_pid=worker_pid))
+            failures.append((fallback_task[symbol_field], fallback_task["freq"], error_text))
 
     if not normalized_tasks:
         return {
@@ -1663,8 +1532,8 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as exc:
         error_text = str(exc)[:200]
         for task in normalized_tasks:
-            payloads.append(_build_task_payload(task=task, rows=[], error=error_text, worker_pid=worker_pid))
-            failures.append((str(task.get("code", "")), str(task.get("freq", "")), error_text))
+            payloads.append(build_payload(task=task, rows=[], error=error_text, worker_pid=worker_pid))
+            failures.append((str(task.get(symbol_field, "")), str(task.get("freq", "")), error_text))
         return {
             "chunk_id": chunk_id,
             "chunk_task_count": int(len(raw_tasks)),
@@ -1676,60 +1545,26 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
             "worker_pid": worker_pid,
         }
 
-    chunk_hit_tasks = 0
-    chunk_network_page_calls = 0
     reconnect_on_unavailable = bool(chunk_payload.get("reconnect_on_unavailable", True))
     chunk_timeout = max(1.0, float(chunk_payload.get("chunk_timeout_seconds", 30.0) or 30.0))
     chunk_retry_max = max(0, int(chunk_payload.get("chunk_retry_max_attempts", 2) or 0))
 
     def _run_chunk_fetch_once() -> Dict[str, Any]:
-        """
-        执行一次 chunk 抓取调用。
-
-        输入：
-        1. 使用外层闭包变量 client_context/normalized_tasks/enable_cache。
-        输出：
-        1. `get_stock_kline_rows_for_chunk_tasks` 返回字典。
-        用途：
-        1. 为失败后重试复用同一段调用逻辑。
-        边界条件：
-        1. 调用异常向上抛出，由上层统一处理。
-        """
+        """执行一次 chunk 抓取（stock/index 由 task_kind 分支）。"""
+        if task_kind == "index":
+            return client_context.get_index_kline_rows_for_chunk_tasks(
+                tasks=normalized_tasks,
+                enable_cache=enable_cache,
+            )
         return client_context.get_stock_kline_rows_for_chunk_tasks(
             tasks=normalized_tasks,
             enable_cache=enable_cache,
         )
 
-    def _run_chunk_fetch_with_timeout() -> Dict[str, Any]:
-        """
-        带超时包裹执行一次 chunk 抓取。
-
-        输入：
-        1. 使用外层闭包变量 chunk_timeout。
-        输出：
-        1. chunk 抓取结果字典。
-        用途：
-        1. 防止单个 chunk 无限阻塞，超时后抛出 TimeoutError 由重试循环捕获。
-        边界条件：
-        1. 超时时 future 被取消，抛出 TimeoutError。
-        2. 超时后 executor 以 wait=False 关闭，不阻塞当前线程；
-           被放弃的工作线程持有独立的线程本地 socket，会在底层 IO 结束后自行退出。
-        """
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="zsdtdx_chunk_timeout")
-        f = executor.submit(_run_chunk_fetch_once)
-        try:
-            return f.result(timeout=chunk_timeout)
-        except Exception:
-            f.cancel()
-            raise
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-
-    # 首次执行
     error_text = ""
-    chunk_result = None
+    chunk_result: Optional[Dict[str, Any]] = None
     try:
-        chunk_result = _run_chunk_fetch_with_timeout()
+        chunk_result = _run_chunk_fetch_with_timeout(_run_chunk_fetch_once, chunk_timeout)
     except Exception as exc:
         error_text = str(exc)[:200] or type(exc).__name__
 
@@ -1742,7 +1577,7 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
             recover_detail = _recover_worker_standard_connection_current_thread(reason=error_text)
             _emit_log(
                 "warning",
-                "[Task Parallel] chunk 重试前尝试重建标准连接",
+                f"[Task Parallel] {log_tag} 重试前尝试重建标准连接",
                 {
                     "stage": "chunk_retry_reconnect",
                     "chunk_id": str(chunk_id),
@@ -1759,7 +1594,7 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             _emit_log(
                 "warning",
-                "[Task Parallel] chunk 执行失败，开始重试",
+                f"[Task Parallel] {log_tag} 执行失败，开始重试",
                 {
                     "stage": "chunk_retry",
                     "chunk_id": str(chunk_id),
@@ -1770,17 +1605,16 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
                 },
             )
         try:
-            chunk_result = _run_chunk_fetch_with_timeout()
+            chunk_result = _run_chunk_fetch_with_timeout(_run_chunk_fetch_once, chunk_timeout)
             error_text = ""
         except Exception as retry_exc:
             error_text = str(retry_exc)[:200] or type(retry_exc).__name__
 
-    # 重试耗尽仍失败：标记所有 tasks 为 failed
     if error_text:
         if retry_count > 0:
             _emit_log(
                 "error",
-                "[Task Parallel] chunk 重试耗尽仍失败",
+                f"[Task Parallel] {log_tag} 重试耗尽仍失败",
                 {
                     "stage": "chunk_retry_exhausted",
                     "chunk_id": str(chunk_id),
@@ -1791,8 +1625,8 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
                 },
             )
         for task in normalized_tasks:
-            payloads.append(_build_task_payload(task=task, rows=[], error=error_text, worker_pid=worker_pid))
-            failures.append((str(task.get("code", "")), str(task.get("freq", "")), error_text))
+            payloads.append(build_payload(task=task, rows=[], error=error_text, worker_pid=worker_pid))
+            failures.append((str(task.get(symbol_field, "")), str(task.get("freq", "")), error_text))
         return {
             "chunk_id": chunk_id,
             "chunk_task_count": int(len(raw_tasks)),
@@ -1804,10 +1638,9 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
             "worker_pid": worker_pid,
         }
 
-    # 成功：解析结果
-    result_items = list(chunk_result.get("results") or [])
-    chunk_hit_tasks = int(chunk_result.get("chunk_hit_tasks", 0) or 0)
-    chunk_network_page_calls = int(chunk_result.get("chunk_network_page_calls", 0) or 0)
+    result_items = list((chunk_result or {}).get("results") or [])
+    chunk_hit_tasks = int((chunk_result or {}).get("chunk_hit_tasks", 0) or 0)
+    chunk_network_page_calls = int((chunk_result or {}).get("chunk_network_page_calls", 0) or 0)
 
     for index, task in enumerate(normalized_tasks):
         item = result_items[index] if index < len(result_items) and isinstance(result_items[index], dict) else {}
@@ -1815,7 +1648,7 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
         rows = item.get("rows", [])
         item_error_text = item.get("error")
         payloads.append(
-            _build_task_payload(
+            build_payload(
                 task=result_task if isinstance(result_task, dict) else task,
                 rows=rows if isinstance(rows, list) else [],
                 error=item_error_text,
@@ -1823,7 +1656,7 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
             )
         )
         if str(item_error_text or "").strip():
-            failures.append((str(task.get("code", "")), str(task.get("freq", "")), str(item_error_text)[:200]))
+            failures.append((str(task.get(symbol_field, "")), str(task.get("freq", "")), str(item_error_text)[:200]))
 
     return {
         "chunk_id": chunk_id,
@@ -1838,226 +1671,10 @@ def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _fetch_one_index_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    进程 worker：执行单个指数 chunk（同 index_name+freq）并返回任务 payload 列表。
-
-    输入：
-    1. chunk_payload: 分片字典，包含 chunk_id/code/freq/tasks 等字段。
-    输出：
-    1. 指数分片执行结果字典，包含 payloads/failures/命中统计等字段。
-    用途：
-    1. 作为指数 worker 内 chunk 级并发的最小执行单元。
-    边界条件：
-    1. 客户端建连失败或分片执行失败时，会为所有任务返回 error payload。
-    """
-    worker_pid = int(os.getpid())
-    chunk_id = str(chunk_payload.get("chunk_id", ""))
-    raw_tasks = list(chunk_payload.get("tasks") or [])
-    enable_cache = bool(chunk_payload.get("enable_cache", False))
-
-    task_detail: List[Dict[str, Any]] = []
-    normalized_tasks: List[Dict[str, str]] = []
-    payloads: List[Dict[str, Any]] = []
-    failures: List[Tuple[str, str, str]] = []
-
-    for item in raw_tasks:
-        try:
-            normalized = _normalize_index_task_payload(item)
-            normalized_tasks.append(normalized)
-            task_detail.append(dict(normalized))
-        except Exception as exc:
-            fallback_task = {
-                "index_name": str((item or {}).get("index_name", "")),
-                "freq": str((item or {}).get("freq", "")),
-                "start_time": str((item or {}).get("start_time", "")),
-                "end_time": str((item or {}).get("end_time", "")),
-            }
-            error_text = str(exc)[:200]
-            payloads.append(
-                _build_index_task_payload(task=fallback_task, rows=[], error=error_text, worker_pid=worker_pid)
-            )
-            failures.append((fallback_task["index_name"], fallback_task["freq"], error_text))
-
-    if not normalized_tasks:
-        return {
-            "chunk_id": chunk_id,
-            "chunk_task_count": int(len(raw_tasks)),
-            "chunk_hit_tasks": 0,
-            "chunk_network_page_calls": 0,
-            "task_detail": task_detail,
-            "payloads": payloads,
-            "failures": failures,
-            "worker_pid": worker_pid,
-        }
-
-    try:
-        client_context = _ensure_worker_client_context()
-    except Exception as exc:
-        error_text = str(exc)[:200]
-        for task in normalized_tasks:
-            payloads.append(_build_index_task_payload(task=task, rows=[], error=error_text, worker_pid=worker_pid))
-            failures.append((str(task.get("index_name", "")), str(task.get("freq", "")), error_text))
-        return {
-            "chunk_id": chunk_id,
-            "chunk_task_count": int(len(raw_tasks)),
-            "chunk_hit_tasks": 0,
-            "chunk_network_page_calls": 0,
-            "task_detail": task_detail,
-            "payloads": payloads,
-            "failures": failures,
-            "worker_pid": worker_pid,
-        }
-
-    reconnect_on_unavailable = bool(chunk_payload.get("reconnect_on_unavailable", True))
-    chunk_timeout = max(1.0, float(chunk_payload.get("chunk_timeout_seconds", 30.0) or 30.0))
-    chunk_retry_max = max(0, int(chunk_payload.get("chunk_retry_max_attempts", 2) or 0))
-
-    def _run_chunk_fetch_once() -> Dict[str, Any]:
-        """
-        执行一次指数 chunk 抓取调用。
-
-        输入：
-        1. 使用外层闭包变量 client_context/normalized_tasks。
-        输出：
-        1. 指数 task 结果列表。
-        用途：
-        1. 为失败后重试复用同一段调用逻辑。
-        边界条件：
-        1. 调用异常向上抛出，由上层统一处理。
-        """
-        return client_context.get_index_kline_rows_for_chunk_tasks(
-            tasks=normalized_tasks,
-            enable_cache=enable_cache,
-        )
-
-    def _run_chunk_fetch_with_timeout() -> Dict[str, Any]:
-        """
-        带超时包裹执行一次指数 chunk 抓取。
-
-        输入：
-        1. 使用外层闭包变量 chunk_timeout。
-        输出：
-        1. 指数 chunk 抓取结果列表。
-        用途：
-        1. 防止单个 chunk 无限阻塞，超时后抛出 TimeoutError 由重试循环捕获。
-        边界条件：
-        1. 超时时 future 被取消，抛出 TimeoutError。
-        2. 超时后 executor 以 wait=False 关闭，不阻塞当前线程。
-        """
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="zsdtdx_index_chunk_timeout")
-        f = executor.submit(_run_chunk_fetch_once)
-        try:
-            return f.result(timeout=chunk_timeout)
-        except Exception:
-            f.cancel()
-            raise
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-
-    error_text = ""
-    chunk_result: Optional[Dict[str, Any]] = None
-    try:
-        chunk_result = _run_chunk_fetch_with_timeout()
-    except Exception as exc:
-        error_text = str(exc)[:200] or type(exc).__name__
-
-    retry_count = 0
-    while error_text and retry_count < chunk_retry_max:
-        retry_count += 1
-        if bool(reconnect_on_unavailable) and _is_connection_unavailable_error(error_text):
-            recover_detail = _recover_worker_standard_connection_current_thread(reason=error_text)
-            _emit_log(
-                "warning",
-                "[Task Parallel] index chunk 重试前尝试重建标准连接",
-                {
-                    "stage": "chunk_retry_reconnect",
-                    "chunk_id": str(chunk_id),
-                    "chunk_task_count": int(len(raw_tasks)),
-                    "retry_count": int(retry_count),
-                    "retry_limit": int(chunk_retry_max),
-                    "recover_ok": bool(recover_detail.get("ok")),
-                    "reason": str(error_text),
-                    "active_host_before": str(recover_detail.get("active_host_before", "")),
-                    "active_host_after": str(recover_detail.get("active_host_after", "")),
-                    "recover_error": str(recover_detail.get("error", "")),
-                },
-            )
-        else:
-            _emit_log(
-                "warning",
-                "[Task Parallel] index chunk 执行失败，开始重试",
-                {
-                    "stage": "chunk_retry",
-                    "chunk_id": str(chunk_id),
-                    "chunk_task_count": int(len(raw_tasks)),
-                    "retry_count": int(retry_count),
-                    "retry_limit": int(chunk_retry_max),
-                    "reason": str(error_text),
-                },
-            )
-        try:
-            chunk_result = _run_chunk_fetch_with_timeout()
-            error_text = ""
-        except Exception as retry_exc:
-            error_text = str(retry_exc)[:200] or type(retry_exc).__name__
-
-    if error_text:
-        if retry_count > 0:
-            _emit_log(
-                "error",
-                "[Task Parallel] index chunk 重试耗尽仍失败",
-                {
-                    "stage": "chunk_retry_exhausted",
-                    "chunk_id": str(chunk_id),
-                    "chunk_task_count": int(len(raw_tasks)),
-                    "retry_count": int(retry_count),
-                    "retry_limit": int(chunk_retry_max),
-                    "last_error": str(error_text),
-                },
-            )
-        for task in normalized_tasks:
-            payloads.append(_build_index_task_payload(task=task, rows=[], error=error_text, worker_pid=worker_pid))
-            failures.append((str(task.get("index_name", "")), str(task.get("freq", "")), error_text))
-        return {
-            "chunk_id": chunk_id,
-            "chunk_task_count": int(len(raw_tasks)),
-            "chunk_hit_tasks": 0,
-            "chunk_network_page_calls": 0,
-            "task_detail": task_detail,
-            "payloads": payloads,
-            "failures": failures,
-            "worker_pid": worker_pid,
-        }
-
-    chunk_hit_tasks = int((chunk_result or {}).get("chunk_hit_tasks", 0) or 0)
-    chunk_network_page_calls = int((chunk_result or {}).get("chunk_network_page_calls", 0) or 0)
-    result_items = list((chunk_result or {}).get("results") or [])
-    for index, task in enumerate(normalized_tasks):
-        item = result_items[index] if index < len(result_items) and isinstance(result_items[index], dict) else {}
-        result_task = item.get("task", task)
-        rows = item.get("rows", [])
-        item_error_text = item.get("error")
-        payloads.append(
-            _build_index_task_payload(
-                task=result_task if isinstance(result_task, dict) else task,
-                rows=rows if isinstance(rows, list) else [],
-                error=item_error_text,
-                worker_pid=worker_pid,
-            )
-        )
-        if str(item_error_text or "").strip():
-            failures.append((str(task.get("index_name", "")), str(task.get("freq", "")), str(item_error_text)[:200]))
-
-    return {
-        "chunk_id": chunk_id,
-        "chunk_task_count": int(len(raw_tasks)),
-        "chunk_hit_tasks": int(max(0, chunk_hit_tasks)),
-        "chunk_network_page_calls": int(max(0, chunk_network_page_calls)),
-        "task_detail": task_detail,
-        "payloads": payloads,
-        "failures": failures,
-        "worker_pid": worker_pid,
-    }
+    """指数 chunk 入口：强制 task_kind=index 后委托统一实现。"""
+    payload = dict(chunk_payload)
+    payload["task_kind"] = "index"
+    return _fetch_one_task_chunk(payload)
 
 
 def _fetch_chunk_bundle(bundle_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2131,17 +1748,28 @@ def _fetch_chunk_bundle(bundle_payload: Dict[str, Any]) -> Dict[str, Any]:
             except Exception as exc:
                 error_text = str(exc)[:200]
                 raw_tasks = list(chunk_payload.get("tasks") or [])
+                chunk_kind = str(chunk_payload.get("task_kind", "stock")).strip().lower()
                 report = {
                     "chunk_id": str(chunk_payload.get("chunk_id", "")),
                     "chunk_task_count": int(len(raw_tasks)),
                     "chunk_hit_tasks": 0,
                     "chunk_network_page_calls": 0,
                     "payloads": [
-                        _build_task_payload(task=t, rows=[], error=error_text, worker_pid=worker_pid)
+                        _build_task_payload_for_kind(
+                            chunk_kind,
+                            task=t,
+                            rows=[],
+                            error=error_text,
+                            worker_pid=worker_pid,
+                        )
                         for t in raw_tasks
                     ],
                     "failures": [
-                        (str((t or {}).get("code", "")), str((t or {}).get("freq", "")), error_text)
+                        (
+                            str((t or {}).get("index_name") or (t or {}).get("code", "")),
+                            str((t or {}).get("freq", "")),
+                            error_text,
+                        )
                         for t in raw_tasks
                     ],
                     "worker_pid": worker_pid,
@@ -2183,7 +1811,7 @@ class StockKlineJob:
         return bool(self._future.done())
 
     def wait(self, timeout: Optional[float] = None) -> bool:
-        """输入超时秒数，输出是否完成；用于阻塞等待；超时返回 False。"""
+        """输入超时秒数，输出是否完成；用于阻塞等待；超时返回 False，任务失败会抛出原异常。"""
         try:
             self._future.result(timeout=timeout)
             return True
@@ -2340,9 +1968,6 @@ class ParallelKlineFetcher:
             parallel_cfg.get("auto_prewarm_max_rounds"),
             default=3,
             minimum=1,
-        )
-        self.auto_prewarm_spread_standard_hosts = bool(
-            parallel_cfg.get("auto_prewarm_spread_standard_hosts", False)
         )
         self.chunk_reconnect_on_unavailable = bool(
             parallel_cfg.get("chunk_reconnect_on_unavailable", True)
@@ -2550,15 +2175,15 @@ class ParallelKlineFetcher:
         preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]],
     ) -> Optional[Dict[str, Any]]:
         """
-        执行预处理函数并规范返回值。
+        执行可选钩子并规范返回值。
 
         输入：
         1. payload: 原始 task payload。
-        2. preprocessor_operator: 预处理函数，可返回 dict/None。
+        2. preprocessor_operator: 可选钩子，可返回 dict/None。
         输出：
         1. 处理后的 payload；返回 None 表示丢弃该条结果。
         用途：
-        1. 支持字段改名、值变换、字段删除与空值过滤。
+        1. 可选扩展入口（如字段筛选、重命名、丢弃条目）；数值刻度由协议解析层统一处理。
         边界条件：
         1. 回调抛错时向上抛 ValueError。
         """
@@ -2614,7 +2239,6 @@ class ParallelKlineFetcher:
                     "require_all_workers": bool(self.auto_prewarm_require_all_workers),
                     "timeout_seconds": float(self.auto_prewarm_timeout_seconds),
                     "max_rounds": int(self.auto_prewarm_max_rounds),
-                    "spread_standard_hosts": bool(self.auto_prewarm_spread_standard_hosts),
                 },
             )
             try:
@@ -2623,7 +2247,6 @@ class ParallelKlineFetcher:
                     timeout_seconds=float(self.auto_prewarm_timeout_seconds),
                     max_rounds=int(self.auto_prewarm_max_rounds),
                     target_workers=int(target_workers),
-                    spread_standard_hosts=bool(self.auto_prewarm_spread_standard_hosts),
                 )
             except Exception:
                 self._auto_prewarm_last_success = False
@@ -2638,27 +2261,28 @@ class ParallelKlineFetcher:
             self._auto_prewarm_last_summary = dict(summary)
             return dict(summary)
 
-    def _build_task_chunks(self, tasks: List[Dict[str, Any]]) -> List[TaskChunk]:
+    def _build_grouped_task_chunks(
+        self,
+        tasks: List[Dict[str, Any]],
+        *,
+        group_key: str,
+    ) -> List[TaskChunk]:
         """
-        构建任务 chunk：按 code+freq 分组，并在组内按时间升序排序。
+        按 group_key+freq 分组构建 chunk，组内按时间升序排序。
 
-        输入：
-        1. tasks: 标准化任务列表。
-        输出：
-        1. chunk 列表（同 code+freq 聚合后的有序任务分片）。
-        用途：
-        1. 为并行路径提供“局部顺序执行 + 局部缓存复用”的分片基础。
-        边界条件：
-        1. tasks 为空时返回空列表。
+        输入：tasks 标准化任务列表；group_key 为 "code" 或 "index_name"。
+        输出：chunk 列表。
+        边界：tasks 为空时返回 []。
         """
         grouped: Dict[Tuple[str, str], List[Tuple[int, Dict[str, str], pd.Timestamp, pd.Timestamp]]] = defaultdict(list)
-        normalize_task = _normalize_task_payload
         to_sortable_ts = _to_sortable_task_ts
         for index, raw_task in enumerate(tasks or []):
-            normalized_task = normalize_task(raw_task)
-            code = str(normalized_task.get("code", "")).strip()
+            if not isinstance(raw_task, dict):
+                raise ValueError("task 必须是 dict")
+            normalized_task = dict(raw_task)
+            symbol = str(normalized_task.get(group_key, "")).strip()
             freq = str(normalized_task.get("freq", "")).strip()
-            grouped[(code, freq)].append(
+            grouped[(symbol, freq)].append(
                 (
                     int(index),
                     normalized_task,
@@ -2668,13 +2292,13 @@ class ParallelKlineFetcher:
             )
 
         chunks: List[TaskChunk] = []
-        for chunk_idx, ((code, freq), items) in enumerate(grouped.items(), start=1):
+        for chunk_idx, ((symbol, freq), items) in enumerate(grouped.items(), start=1):
             items.sort(key=lambda item: (item[2], item[3], item[0]))
             chunk_tasks = [dict(item[1]) for item in items]
             chunks.append(
                 TaskChunk(
-                    chunk_id=f"{code}:{freq}:{chunk_idx}",
-                    code=str(code),
+                    chunk_id=f"{symbol}:{freq}:{chunk_idx}",
+                    code=str(symbol),
                     freq=str(freq),
                     tasks=chunk_tasks,
                 )
@@ -2690,59 +2314,14 @@ class ParallelKlineFetcher:
             )
         )
         return chunks
+
+    def _build_task_chunks(self, tasks: List[Dict[str, Any]]) -> List[TaskChunk]:
+        """构建股票任务 chunk（按 code+freq 分组）。"""
+        return self._build_grouped_task_chunks(tasks, group_key="code")
 
     def _build_index_task_chunks(self, tasks: List[Dict[str, Any]]) -> List[TaskChunk]:
-        """
-        构建指数任务 chunk：按 index_name+freq 分组，并在组内按时间升序排序。
-
-        输入：
-        1. tasks: 标准化指数任务列表。
-        输出：
-        1. chunk 列表（同 index_name+freq 聚合后的有序任务分片）。
-        用途：
-        1. 为指数并行路径提供“局部顺序执行”的分片基础。
-        边界条件：
-        1. tasks 为空时返回空列表。
-        """
-        grouped: Dict[Tuple[str, str], List[Tuple[int, Dict[str, str], pd.Timestamp, pd.Timestamp]]] = defaultdict(list)
-        normalize_task = _normalize_index_task_payload
-        to_sortable_ts = _to_sortable_task_ts
-        for index, raw_task in enumerate(tasks or []):
-            normalized_task = normalize_task(raw_task)
-            index_name = str(normalized_task.get("index_name", "")).strip()
-            freq = str(normalized_task.get("freq", "")).strip()
-            grouped[(index_name, freq)].append(
-                (
-                    int(index),
-                    normalized_task,
-                    to_sortable_ts(normalized_task.get("start_time")),
-                    to_sortable_ts(normalized_task.get("end_time")),
-                )
-            )
-
-        chunks: List[TaskChunk] = []
-        for chunk_idx, ((index_name, freq), items) in enumerate(grouped.items(), start=1):
-            items.sort(key=lambda item: (item[2], item[3], item[0]))
-            chunk_tasks = [dict(item[1]) for item in items]
-            chunks.append(
-                TaskChunk(
-                    chunk_id=f"{index_name}:{freq}:{chunk_idx}",
-                    code=str(index_name),
-                    freq=str(freq),
-                    tasks=chunk_tasks,
-                )
-            )
-
-        chunks.sort(
-            key=lambda item: (
-                -int(item.task_count),
-                str(item.code),
-                str(item.freq),
-                str(item.tasks[0].get("start_time", "")) if item.tasks else "",
-                str(item.chunk_id),
-            )
-        )
-        return chunks
+        """构建指数任务 chunk（按 index_name+freq 分组）。"""
+        return self._build_grouped_task_chunks(tasks, group_key="index_name")
 
     def _build_chunk_bundles(self, chunks: List[TaskChunk], inproc_workers: int) -> List[ChunkBundle]:
         """
@@ -2824,9 +2403,8 @@ class ParallelKlineFetcher:
         1. chunk 级超时与重试由 _fetch_one_task_chunk 内部处理。
         """
         kind = str(task_kind or "stock").strip().lower()
-        normalize_task = _normalize_index_task_payload if kind == "index" else _normalize_task_payload
         build_chunks = self._build_index_task_chunks if kind == "index" else self._build_task_chunks
-        task_list = [normalize_task(item) for item in list(tasks or [])]
+        task_list = list(tasks or [])
         if not task_list:
             return
 
@@ -2882,7 +2460,8 @@ class ParallelKlineFetcher:
                     if len(payloads) < len(chunk.tasks):
                         for task in chunk.tasks[len(payloads):]:
                             payloads.append(
-                                _build_task_payload(
+                                _build_task_payload_for_kind(
+                                    kind,
                                     task=task,
                                     rows=[],
                                     error="missing_chunk_payload",
@@ -2952,7 +2531,8 @@ class ParallelKlineFetcher:
                         },
                     )
                     for task in chunk.tasks:
-                        yield _build_task_payload(
+                        yield _build_task_payload_for_kind(
+                            kind,
                             task=task,
                             rows=[],
                             error=error_text,
@@ -2973,9 +2553,8 @@ class ParallelKlineFetcher:
         1. chunk 级超时与重试由 _fetch_one_task_chunk 内部处理。
         """
         kind = str(task_kind or "stock").strip().lower()
-        normalize_task = _normalize_index_task_payload if kind == "index" else _normalize_task_payload
         build_chunks = self._build_index_task_chunks if kind == "index" else self._build_task_chunks
-        task_list = [normalize_task(item) for item in list(tasks or [])]
+        task_list = list(tasks or [])
         if not task_list:
             return
 
@@ -3086,7 +2665,8 @@ class ParallelKlineFetcher:
                         },
                     )
                     for task in chunk.tasks:
-                        yield _build_task_payload(
+                        yield _build_task_payload_for_kind(
+                            kind,
                             task=task,
                             rows=[],
                             error=error_text,
@@ -3105,7 +2685,8 @@ class ParallelKlineFetcher:
                 if len(payloads) < len(chunk.tasks):
                     for task in chunk.tasks[len(payloads):]:
                         payloads.append(
-                            _build_task_payload(
+                            _build_task_payload_for_kind(
+                                kind,
                                 task=task,
                                 rows=[],
                                 error="missing_chunk_payload",
@@ -3159,30 +2740,31 @@ class ParallelKlineFetcher:
                 for payload in payloads:
                     yield payload
 
-    def fetch_stock_tasks_sync(
+    def _fetch_tasks_sync(
         self,
         *,
+        task_kind: str,
         tasks: List[Dict[str, Any]],
         queue: Optional[Any] = None,
         preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        同步执行 task 列表，并实时写入队列。
+        同步执行 task 列表（stock/index 共用），并实时写入队列。
 
-        输入：
-        1. tasks: 任务列表。
-        2. queue: 可选结果队列（需支持 put）。
-        3. preprocessor_operator: 可选预处理函数。
-        输出：
-        1. 处理后的 task payload 列表。
-        用途：
-        1. 支持“阻塞调用 + 实时队列”模式。
-        边界条件：
-        1. tasks 为空时返回空列表并发送 done 事件。
-        2. 同步模式固定在主进程内执行 chunk 调度，不使用多进程池。
+        输入：task_kind、tasks、queue、preprocessor_operator。
+        输出：处理后的 task payload 列表。
+        边界：tasks 为空时返回 [] 并发送 done；主进程内 chunk 调度，不用多进程池。
         """
+        kind = str(task_kind or "stock").strip().lower()
+        normalize_item = _chunk_task_kind_profile(kind)["normalize_item"]
+        sync_log_label = (
+            "主进程指数 chunk 执行模式"
+            if kind == "index"
+            else "主进程 chunk 执行模式"
+        )
+
         self._validate_queue(queue)
-        normalized_tasks = [_normalize_task_payload(item) for item in list(tasks or [])]
+        normalized_tasks = [normalize_item(item) for item in list(tasks or [])]
         total_tasks = int(len(normalized_tasks))
         outputs: List[Dict[str, Any]] = []
         success_tasks = 0
@@ -3202,13 +2784,13 @@ class ParallelKlineFetcher:
         _emit_log(
             "info",
             (
-                "[Task Sync] 主进程 chunk 执行模式（不启用多进程池） "
+                f"[Task Sync] {sync_log_label}（不启用多进程池） "
                 f"(num_processes_config={self.num_processes}, "
                 f"inproc_workers={self.task_chunk_inproc_future_workers}, "
                 f"任务数={total_tasks})"
             ),
         )
-        iterator = self._iter_task_payloads_inproc_chunked(normalized_tasks)
+        iterator = self._iter_task_payloads_inproc_chunked(normalized_tasks, task_kind=kind)
 
         for raw_payload in iterator:
             error_text = str(raw_payload.get("error") or "").strip()
@@ -3232,6 +2814,21 @@ class ParallelKlineFetcher:
         if queue is not None:
             queue.put(done_payload)
         return outputs
+
+    def fetch_stock_tasks_sync(
+        self,
+        *,
+        tasks: List[Dict[str, Any]],
+        queue: Optional[Any] = None,
+        preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """同步执行股票 task 列表，并实时写入队列。"""
+        return self._fetch_tasks_sync(
+            task_kind="stock",
+            tasks=tasks,
+            queue=queue,
+            preprocessor_operator=preprocessor_operator,
+        )
 
     def fetch_index_tasks_sync(
         self,
@@ -3240,72 +2837,108 @@ class ParallelKlineFetcher:
         queue: Optional[Any] = None,
         preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        同步执行指数 task 列表，并实时写入队列。
+        """同步执行指数 task 列表，并实时写入队列。"""
+        return self._fetch_tasks_sync(
+            task_kind="index",
+            tasks=tasks,
+            queue=queue,
+            preprocessor_operator=preprocessor_operator,
+        )
 
-        输入：
-        1. tasks: 指数任务列表。
-        2. queue: 可选结果队列（需支持 put）。
-        3. preprocessor_operator: 可选预处理函数。
-        输出：
-        1. 处理后的指数 task payload 列表。
-        用途：
-        1. 支持“阻塞调用 + 实时队列”模式。
-        边界条件：
-        1. tasks 为空时返回空列表并发送 done 事件。
-        2. 同步模式固定在主进程内执行 chunk 调度，不使用多进程池。
+    def _fetch_tasks_async(
+        self,
+        *,
+        task_kind: str,
+        tasks: List[Dict[str, Any]],
+        queue: Optional[Any] = None,
+        preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+    ) -> StockKlineJob:
         """
+        异步启动 task 执行（stock/index 共用）并立即返回句柄。
+
+        输入：task_kind、tasks、queue、preprocessor_operator。
+        输出：StockKlineJob 异步句柄。
+        边界：任务异常由 job.exception()/job.result() 暴露。
+        """
+        kind = str(task_kind or "stock").strip().lower()
+        normalize_item = _chunk_task_kind_profile(kind)["normalize_item"]
+        async_log_label = (
+            "进程池指数 chunk 执行模式"
+            if kind == "index"
+            else "进程池 chunk 执行模式"
+        )
+        thread_prefix = (
+            "zsdtdx_index_kline_async"
+            if kind == "index"
+            else "zsdtdx_stock_kline_async"
+        )
+
         self._validate_queue(queue)
-        normalized_tasks = [_normalize_index_task_payload(item) for item in list(tasks or [])]
+        self._ensure_async_prewarm()
+        normalized_tasks = [normalize_item(item) for item in list(tasks or [])]
         total_tasks = int(len(normalized_tasks))
-        outputs: List[Dict[str, Any]] = []
-        success_tasks = 0
-        failed_tasks = 0
 
-        if total_tasks <= 0:
+        def _run_async_worker() -> List[Dict[str, Any]]:
+            outputs: List[Dict[str, Any]] = []
+            success_tasks = 0
+            failed_tasks = 0
+
+            if total_tasks <= 0:
+                done_payload = {
+                    "event": "done",
+                    "total_tasks": 0,
+                    "success_tasks": 0,
+                    "failed_tasks": 0,
+                }
+                if queue is not None:
+                    queue.put(done_payload)
+                return outputs
+
+            _emit_log(
+                "info",
+                (
+                    f"[Task Async] {async_log_label} "
+                    f"(num_processes={self.num_processes}, "
+                    f"inproc_workers={self.task_chunk_inproc_future_workers}, "
+                    f"任务数={total_tasks})"
+                ),
+            )
+            iterator = self._iter_task_payloads_parallel_chunked(normalized_tasks, task_kind=kind)
+
+            for raw_payload in iterator:
+                error_text = str(raw_payload.get("error") or "").strip()
+                if error_text:
+                    failed_tasks += 1
+                else:
+                    success_tasks += 1
+                processed_payload = self._apply_preprocessor_operator(raw_payload, preprocessor_operator)
+                if processed_payload is None:
+                    continue
+                outputs.append(processed_payload)
+                if queue is not None:
+                    queue.put(processed_payload)
+
             done_payload = {
                 "event": "done",
-                "total_tasks": 0,
-                "success_tasks": 0,
-                "failed_tasks": 0,
+                "total_tasks": int(total_tasks),
+                "success_tasks": int(success_tasks),
+                "failed_tasks": int(failed_tasks),
             }
             if queue is not None:
                 queue.put(done_payload)
             return outputs
 
-        _emit_log(
-            "info",
-            (
-                "[Task Sync] 主进程指数 chunk 执行模式（不启用多进程池） "
-                f"(num_processes_config={self.num_processes}, "
-                f"inproc_workers={self.task_chunk_inproc_future_workers}, "
-                f"任务数={total_tasks})"
-            ),
-        )
-        iterator = self._iter_task_payloads_inproc_chunked(normalized_tasks, task_kind="index")
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=thread_prefix)
+        future = executor.submit(_run_async_worker)
 
-        for raw_payload in iterator:
-            error_text = str(raw_payload.get("error") or "").strip()
-            if error_text:
-                failed_tasks += 1
-            else:
-                success_tasks += 1
-            processed_payload = self._apply_preprocessor_operator(raw_payload, preprocessor_operator)
-            if processed_payload is None:
-                continue
-            outputs.append(processed_payload)
-            if queue is not None:
-                queue.put(processed_payload)
+        def _cleanup(_future: Future) -> None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=False)
+            except Exception:
+                pass
 
-        done_payload = {
-            "event": "done",
-            "total_tasks": int(total_tasks),
-            "success_tasks": int(success_tasks),
-            "failed_tasks": int(failed_tasks),
-        }
-        if queue is not None:
-            queue.put(done_payload)
-        return outputs
+        future.add_done_callback(_cleanup)
+        return StockKlineJob(future=future, queue_obj=queue)
 
     def fetch_stock_tasks_async(
         self,
@@ -3314,110 +2947,13 @@ class ParallelKlineFetcher:
         queue: Optional[Any] = None,
         preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
     ) -> StockKlineJob:
-        """
-        异步启动 task 执行并立即返回句柄。
-
-        输入：
-        1. tasks: 任务列表。
-        2. queue: 可选结果队列。
-        3. preprocessor_operator: 可选预处理函数。
-        输出：
-        1. StockKlineJob 异步句柄。
-        用途：
-        1. 支持“非阻塞调用 + 队列持续消费”模式。
-        边界条件：
-        1. 任务执行异常由 job.exception()/job.result() 暴露。
-        """
-        self._validate_queue(queue)
-        self._ensure_async_prewarm()
-        normalized_tasks = [_normalize_task_payload(item) for item in list(tasks or [])]
-        total_tasks = int(len(normalized_tasks))
-
-        def _run_async_worker() -> List[Dict[str, Any]]:
-            """
-            async 后台执行体：固定走进程池 chunk 并行路径。
-
-            输入：
-            1. 使用外层闭包变量 normalized_tasks/queue/preprocessor_operator。
-            输出：
-            1. 处理后的 task payload 列表。
-            用途：
-            1. 与 sync 主进程路径分离，确保 async 真正落到进程池并行执行。
-            边界条件：
-            1. tasks 为空时返回空列表并发送 done 事件。
-            """
-            outputs: List[Dict[str, Any]] = []
-            success_tasks = 0
-            failed_tasks = 0
-
-            if total_tasks <= 0:
-                done_payload = {
-                    "event": "done",
-                    "total_tasks": 0,
-                    "success_tasks": 0,
-                    "failed_tasks": 0,
-                }
-                if queue is not None:
-                    queue.put(done_payload)
-                return outputs
-
-            _emit_log(
-                "info",
-                (
-                    "[Task Async] 进程池 chunk 执行模式 "
-                    f"(num_processes={self.num_processes}, "
-                    f"inproc_workers={self.task_chunk_inproc_future_workers}, "
-                    f"任务数={total_tasks})"
-                ),
-            )
-            iterator = self._iter_task_payloads_parallel_chunked(normalized_tasks)
-
-            for raw_payload in iterator:
-                error_text = str(raw_payload.get("error") or "").strip()
-                if error_text:
-                    failed_tasks += 1
-                else:
-                    success_tasks += 1
-                processed_payload = self._apply_preprocessor_operator(raw_payload, preprocessor_operator)
-                if processed_payload is None:
-                    continue
-                outputs.append(processed_payload)
-                if queue is not None:
-                    queue.put(processed_payload)
-
-            done_payload = {
-                "event": "done",
-                "total_tasks": int(total_tasks),
-                "success_tasks": int(success_tasks),
-                "failed_tasks": int(failed_tasks),
-            }
-            if queue is not None:
-                queue.put(done_payload)
-            return outputs
-
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="zsdtdx_stock_kline_async")
-        future = executor.submit(_run_async_worker)
-
-        def _cleanup(_future: Future) -> None:
-            """
-            异步任务结束后的线程池清理回调。
-
-            输入：
-            1. _future: 已完成的 future（仅用于回调签名占位）。
-            输出：
-            1. 无返回值。
-            用途：
-            1. 在后台任务结束后关闭承载 async 包装任务的单线程执行器。
-            边界条件：
-            1. 关闭异常会被吞掉，避免影响 future 完成态传播。
-            """
-            try:
-                executor.shutdown(wait=False, cancel_futures=False)
-            except Exception:
-                pass
-
-        future.add_done_callback(_cleanup)
-        return StockKlineJob(future=future, queue_obj=queue)
+        """异步启动股票 task 执行并立即返回句柄。"""
+        return self._fetch_tasks_async(
+            task_kind="stock",
+            tasks=tasks,
+            queue=queue,
+            preprocessor_operator=preprocessor_operator,
+        )
 
     def fetch_index_tasks_async(
         self,
@@ -3426,111 +2962,14 @@ class ParallelKlineFetcher:
         queue: Optional[Any] = None,
         preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
     ) -> StockKlineJob:
-        """
-        异步启动指数 task 执行并立即返回句柄。
+        """异步启动指数 task 执行并立即返回句柄。"""
+        return self._fetch_tasks_async(
+            task_kind="index",
+            tasks=tasks,
+            queue=queue,
+            preprocessor_operator=preprocessor_operator,
+        )
 
-        输入：
-        1. tasks: 指数任务列表。
-        2. queue: 可选结果队列。
-        3. preprocessor_operator: 可选预处理函数。
-        输出：
-        1. StockKlineJob 异步句柄。
-        用途：
-        1. 支持“非阻塞调用 + 队列持续消费”模式。
-        边界条件：
-        1. 任务执行异常由 job.exception()/job.result() 暴露。
-        """
-        self._validate_queue(queue)
-        self._ensure_async_prewarm()
-        normalized_tasks = [_normalize_index_task_payload(item) for item in list(tasks or [])]
-        total_tasks = int(len(normalized_tasks))
-
-        def _run_async_worker() -> List[Dict[str, Any]]:
-            """
-            async 后台执行体：固定走进程池指数 chunk 并行路径。
-
-            输入：
-            1. 使用外层闭包变量 normalized_tasks/queue/preprocessor_operator。
-            输出：
-            1. 处理后的指数 task payload 列表。
-            用途：
-            1. 与 sync 主进程路径分离，确保 async 真正落到进程池并行执行。
-            边界条件：
-            1. tasks 为空时返回空列表并发送 done 事件。
-            """
-            outputs: List[Dict[str, Any]] = []
-            success_tasks = 0
-            failed_tasks = 0
-
-            if total_tasks <= 0:
-                done_payload = {
-                    "event": "done",
-                    "total_tasks": 0,
-                    "success_tasks": 0,
-                    "failed_tasks": 0,
-                }
-                if queue is not None:
-                    queue.put(done_payload)
-                return outputs
-
-            _emit_log(
-                "info",
-                (
-                    "[Task Async] 进程池指数 chunk 执行模式 "
-                    f"(num_processes={self.num_processes}, "
-                    f"inproc_workers={self.task_chunk_inproc_future_workers}, "
-                    f"任务数={total_tasks})"
-                ),
-            )
-            iterator = self._iter_task_payloads_parallel_chunked(normalized_tasks, task_kind="index")
-
-            for raw_payload in iterator:
-                error_text = str(raw_payload.get("error") or "").strip()
-                if error_text:
-                    failed_tasks += 1
-                else:
-                    success_tasks += 1
-                processed_payload = self._apply_preprocessor_operator(raw_payload, preprocessor_operator)
-                if processed_payload is None:
-                    continue
-                outputs.append(processed_payload)
-                if queue is not None:
-                    queue.put(processed_payload)
-
-            done_payload = {
-                "event": "done",
-                "total_tasks": int(total_tasks),
-                "success_tasks": int(success_tasks),
-                "failed_tasks": int(failed_tasks),
-            }
-            if queue is not None:
-                queue.put(done_payload)
-            return outputs
-
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="zsdtdx_index_kline_async")
-        future = executor.submit(_run_async_worker)
-
-        def _cleanup(_future: Future) -> None:
-            """
-            异步任务结束后的线程池清理回调。
-
-            输入：
-            1. _future: 已完成的 future（仅用于回调签名占位）。
-            输出：
-            1. 无返回值。
-            用途：
-            1. 在后台任务结束后关闭承载 async 包装任务的单线程执行器。
-            边界条件：
-            1. 关闭异常会被吞掉，避免影响 future 完成态传播。
-            """
-            try:
-                executor.shutdown(wait=False, cancel_futures=False)
-            except Exception:
-                pass
-
-        future.add_done_callback(_cleanup)
-        return StockKlineJob(future=future, queue_obj=queue)
-    
     def fetch_stock(self, 
                    codes: List[str],
                    freqs: List[str],
@@ -3810,6 +3249,12 @@ def set_active_config_path(config_path: Optional[str]) -> None:
     normalized = str(config_path or "").strip() or None
     old_path = _active_config_path
     _active_config_path = normalized
+    try:
+        from zsdtdx.unified_client import refresh_tcp_probe_cache_from_config_path
+
+        refresh_tcp_probe_cache_from_config_path(normalized)
+    except Exception as exc:
+        _emit_log("warning", f"[Parallel] TCP probe cache refresh failed: {exc}")
     if _fetcher is not None and _fetcher.config_path != normalized:
         _fetcher = ParallelKlineFetcher(config_path=normalized)
     # 配置路径变更时销毁旧进程池，下次使用时按新配置重建

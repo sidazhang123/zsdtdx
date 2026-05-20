@@ -46,6 +46,6 @@ class ExSetupCmd1(BaseParser):
         用途：
         1. 执行 `parseResponse` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 扩展 setup 无结构化字段，原样返回 body_buf。
         """
-        pass
+        return body_buf

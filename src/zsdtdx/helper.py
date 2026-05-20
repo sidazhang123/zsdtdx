@@ -2,9 +2,9 @@
 模块：`helper.py`。
 
 职责：
-1. 提供 zsdtdx 体系中的协议封装、解析或对外接口能力。
-2. 对上层暴露稳定调用契约，屏蔽底层协议数据细节。
-3. 聚合可复用的通用工具函数，供上层 API 与底层协议模块共享。
+1. 提供协议解析层共用的二进制解码与 K 线数值格式化工具。
+2. K 线 OHLC/量能刻度仅在 socket 解析出口通过本模块函数完成（向量化批量为主）。
+3. 聚合可复用的通用工具函数，供 parser 与上层 API 共享。
 
 边界：
 1. 本模块仅负责当前文件定义范围，不承担其它分层编排职责。
@@ -53,9 +53,7 @@ def get_price(data, pos):
             intdata += (bdata & 0x7f) << pos_byte
             pos_byte += 7
 
-            if bdata & 0x80:
-                pass
-            else:
+            if not (bdata & 0x80):
                 break
 
     pos += 1
@@ -66,61 +64,141 @@ def get_price(data, pos):
     return intdata, pos
 
 
+# P1: pow2 预计算查找表，避免每次 get_volume 调用 pow(2.0, x)
+_POW2_CACHE_MIN = -300
+_POW2_CACHE_MAX = 600
+_POW2_CACHE: dict = {}
+for _e in range(_POW2_CACHE_MIN, _POW2_CACHE_MAX + 1):
+    _POW2_CACHE[_e] = pow(2.0, _e)
+
+
 def get_volume(ivol):
-    """
-    输入：
-    1. ivol: 输入参数，约束以协议定义与函数实现为准。
-    输出：
-    1. 返回值语义由函数实现定义；无返回时为 `None`。
-    用途：
-    1. 执行 `get_volume` 对应的协议处理、数据解析或调用适配逻辑。
-    边界条件：
-    1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
-    """
-    logpoint = ivol >> (8 * 3)
-    hleax = (ivol >> (8 * 2)) & 0xff;  # [2]
-    lheax = (ivol >> 8) & 0xff;  # [1]
-    lleax = ivol & 0xff;  # [0]
+    """P1 优化：使用预计算查找表替代 pow(2.0, x) 调用。"""
+    logpoint = ivol >> 24
+    hleax = (ivol >> 16) & 0xff
+    lheax = (ivol >> 8) & 0xff
+    lleax = ivol & 0xff
 
-    dwEcx = logpoint * 2 - 0x7f;
-    dwEdx = logpoint * 2 - 0x86;
-    dwEsi = logpoint * 2 - 0x8e;
-    dwEax = logpoint * 2 - 0x96;
-    if dwEcx < 0:
-        tmpEax = - dwEcx
-    else:
-        tmpEax = dwEcx
+    ecx = (logpoint << 1) - 0x7f
+    edx = (logpoint << 1) - 0x86
+    esi = (logpoint << 1) - 0x8e
+    eax = (logpoint << 1) - 0x96
 
-    dbl_xmm6 = 0.0
-    dbl_xmm6 = pow(2.0, tmpEax)
-    if dwEcx < 0:
+    abs_ecx = -ecx if ecx < 0 else ecx
+    dbl_xmm6 = _POW2_CACHE[abs_ecx]
+    if ecx < 0:
         dbl_xmm6 = 1.0 / dbl_xmm6
 
-    dbl_xmm4 = 0
-    if hleax > 0x80:
-        tmpdbl_xmm3 = 0.0
-        dwtmpeax = dwEdx + 1
-        tmpdbl_xmm3 = pow(2.0, dwtmpeax)
-        dbl_xmm0 = pow(2.0, dwEdx) * 128.0
-        dbl_xmm0 += (hleax & 0x7f) * tmpdbl_xmm3
-        dbl_xmm4 = dbl_xmm0
-
+    hleax_hi = hleax & 0x80
+    if hleax_hi:
+        dbl_xmm0 = _POW2_CACHE[edx] * 128.0 + (hleax & 0x7f) * _POW2_CACHE[edx + 1]
     else:
-        dbl_xmm0 = 0.0
-        if dwEdx >= 0:
-            dbl_xmm0 = pow(2.0, dwEdx) * hleax
+        if edx >= 0:
+            dbl_xmm0 = _POW2_CACHE[edx] * hleax
         else:
-            dbl_xmm0 = (1 / pow(2.0, dwEdx)) * hleax
-        dbl_xmm4 = dbl_xmm0
+            dbl_xmm0 = (1.0 / _POW2_CACHE[-edx]) * hleax
 
-    dbl_xmm3 = pow(2.0, dwEsi) * lheax
-    dbl_xmm1 = pow(2.0, dwEax) * lleax
-    if hleax & 0x80:
+    dbl_xmm3 = _POW2_CACHE[esi] * lheax
+    dbl_xmm1 = _POW2_CACHE[eax] * lleax if eax >= 0 else (1.0 / _POW2_CACHE[-eax]) * lleax
+    if hleax_hi:
         dbl_xmm3 *= 2.0
         dbl_xmm1 *= 2.0
 
-    dbl_ret = dbl_xmm6 + dbl_xmm4 + dbl_xmm3 + dbl_xmm1
-    return dbl_ret
+    return dbl_xmm6 + dbl_xmm0 + dbl_xmm3 + dbl_xmm1
+
+
+def format_socket_kline_page_inplace(
+    opens: Any,
+    closes: Any,
+    highs: Any,
+    lows: Any,
+    volumes: Any,
+    amounts: Any,
+    count: int,
+    *,
+    settlement_prices: Any = None,
+    positions: Any = None,
+) -> None:
+    """
+    单页 K 线数组原地向量化格式化（socket 层唯一批量出口）。
+
+    输入：
+    1. opens/closes/highs/lows/volumes: 长度不少于 count 的 float64 numpy 数组。
+    2. amounts: 可选；为 None 时跳过成交额 rint（期货等无 amount 场景）。
+    3. count: 本页有效 bar 数。
+    3. settlement_prices: 可选，期货结算价/price，与 OHLC 同为 2 位小数。
+    4. positions: 可选，持仓量，与量能同为整数四舍五入。
+    输出：
+    1. 无；原地写入刻度（OHLC/结算价 `np.round(..., 2)`，量能/持仓 `np.rint`）。
+    用途：
+    1. parser 在组 dict 前一次性刻度，避免逐 bar Python round。
+    边界条件：
+    1. count<=0 时 no-op；调用方组 dict 时对量能/持仓字段使用 int(...)。
+    """
+    n = int(count)
+    if n <= 0:
+        return
+    import numpy as np
+
+    sl = slice(0, n)
+    price_like = [opens, closes, highs, lows]
+    if settlement_prices is not None:
+        price_like.append(settlement_prices)
+    for arr in price_like:
+        np.round(arr[sl], 2, out=arr[sl])
+    np.rint(volumes[sl], out=volumes[sl])
+    if amounts is not None:
+        np.rint(amounts[sl], out=amounts[sl])
+    if positions is not None:
+        np.rint(positions[sl], out=positions[sl])
+
+
+def format_socket_bar_ohlc_2dp(value: Any) -> Any:
+    """
+    协议解析层标量格式：开/高/低/收保留两位小数。
+
+    输入：
+    1. value: 解析得到的原始数值或可转 float 的类型。
+    输出：
+    1. float，语义与 `format_socket_kline_page_inplace` 对 OHLC 一致。
+    用途：
+    1. 无法批量数组化的 parser 分支（如逐条 struct 解析）复用同一刻度。
+    边界条件：
+    1. None 返回 None；不可解析时原样返回。
+    """
+    if value is None:
+        return None
+    try:
+        import numpy as np
+
+        x = float(value)
+    except (TypeError, ValueError):
+        return value
+    return float(np.round(np.float64(x), 2))
+
+
+def format_socket_bar_amount_volume_int(value: Any) -> Any:
+    """
+    协议解析层标量格式：成交量、成交额为整数（四舍五入）。
+
+    输入：
+    1. value: 解析得到的原始数值或可转 float 的类型。
+    输出：
+    1. int；None 输入返回 None。
+    用途：
+    1. 与批量 `np.rint` 语义一致的标量出口。
+    边界条件：
+    1. 不可解析时原样返回。
+    """
+    if value is None:
+        return None
+    try:
+        import numpy as np
+
+        x = float(value)
+    except (TypeError, ValueError):
+        return value
+    return int(np.rint(np.float64(x)))
 
 
 def get_datetime(category, buffer, pos):
@@ -332,7 +410,7 @@ def normalize_task_input(task: Sequence[Any], task_cls: Type[Any]) -> List[Dict[
     1. 空列表、非列表或非法元素会抛 ValueError。
     """
     if not isinstance(task, (list, tuple)):
-        raise ValueError("task 必须是列表，元素为 dict 或 StockKlineTask")
+        raise ValueError(f"task 必须是列表，元素为 dict 或 {task_cls.__name__}")
     normalized: List[Dict[str, str]] = []
     for item in list(task):
         if isinstance(item, task_cls):

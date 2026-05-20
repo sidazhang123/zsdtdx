@@ -63,7 +63,7 @@ pool:
   # 是否开启底层心跳线程。
   # 取值: true/false
   # 影响: true 可降低长时间空闲断连概率。
-  heartbeat: true
+  heartbeat: false
   # 首次连接前是否对地址池做 TCP 延迟探测，按延迟排序后优先连最快节点。
   # 取值: true/false
   # 影响: true 启动时多约 0.8s 探测耗时，但后续始终连接最快节点。
@@ -77,7 +77,7 @@ parallel:
   # 并行进程数倍率：推荐进程数 = max(2, int(物理核心数 * 该倍率))。
   # 取值: 正浮点数（建议 0.5~3.0）
   # 影响: 倍率越大并发越高，吞吐可能提升，但 CPU/内存占用也会上升。
-  process_count_core_multiplier: 1.5
+  process_count_core_multiplier: 5
   # （仅供 get_future_kline 旧路径 _fetch_parallel 使用，get_stock_kline 的 async/sync 模式不使用）
   # 单次并行抓取的总超时（秒）。
   # 取值: 正浮点数
@@ -136,10 +136,6 @@ parallel:
   # 取值: 正整数
   # 影响: 每轮会向进程池提交探针任务以拉齐 worker 预热状态。
   auto_prewarm_max_rounds: 3
-  # async 自动预热时是否让各 worker 尽量分散连接到不同标准行情有效 IP。
-  # 取值: true/false
-  # 影响: true 时会先探测标准行情有效 IP，再按 worker 轮询分配，降低单 IP 集中压力。
-  auto_prewarm_spread_standard_hosts: false
 
 pagination:
   # 标准行情 get_security_list 单页数量。

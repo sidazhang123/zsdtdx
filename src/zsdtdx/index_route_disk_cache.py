@@ -261,6 +261,10 @@ def load_index_route_cache(
     _, _, cache_date = validated
     expected_date = str(expected_cache_date or "").strip()
     if expected_date != "" and cache_date != expected_date:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return None
     return validated
 

@@ -43,7 +43,7 @@ from zsdtdx.parallel_fetcher import (
     prewarm_parallel_fetcher as _prewarm_parallel_fetcher,
     set_active_config_path,
 )
-from zsdtdx.unified_client import UnifiedTdxClient
+from zsdtdx.unified_client import UnifiedTdxClient, get_probe_result_cache
 
 _TASK_FREQ_MAP: Dict[str, str] = {
     "d": "d",
@@ -282,6 +282,21 @@ def set_config_path(config_path: str) -> str:
     return _apply_active_config_path(config_path=config_path)
 
 
+def _probe_presorted_hosts_or_none() -> Optional[Dict[str, List[Any]]]:
+    """
+    读取 import 阶段填充的 TCP 探测排序结果。
+
+    输入：无。
+    输出：含 standard/extended 的 presorted 字典；缓存为空时返回 None。
+    用途：主进程建连时显式复用探测缓存，避免重复 probe。
+    边界条件：仅读快照，不触发网络探测。
+    """
+    cache = get_probe_result_cache()
+    if cache.get("standard") or cache.get("extended"):
+        return cache
+    return None
+
+
 def get_client(
     separate_instance: bool = False,
 ) -> UnifiedTdxClient:
@@ -321,7 +336,10 @@ def get_client(
         return active_context_client
 
     new_path = _ensure_active_config_ready(caller_name="get_client")
-    return UnifiedTdxClient(config_path=new_path)
+    return UnifiedTdxClient(
+        config_path=new_path,
+        presorted_hosts=_probe_presorted_hosts_or_none(),
+    )
 
 
 def get_supported_markets(return_df: Optional[bool] = None):
@@ -422,6 +440,7 @@ def get_stock_kline(
     调用前置约定:
     - `mode="sync"`：可进入 `with get_client():` 在主进程复用连接并统一资源释放。
     - `mode="async"`：使用多进程内的独立连接，不依赖get_client()。
+    - `preprocessor_operator`：可选钩子，签名 `f(payload)->dict|None`，返回 None 时丢弃该条 data；OHLC/成交额/成交量默认刻度由协议解析层统一完成。
 
     调用示例（写法一：with 主进程上下文 + sync + 其它接口）:
     ```python
@@ -463,7 +482,8 @@ def get_stock_kline(
         restart_parallel_fetcher,
     )
 
-    prewarm_parallel_fetcher(require_all_workers=True, timeout_seconds=60, max_rounds=3)
+    # 预热参数由 config.yaml 的 parallel.auto_prewarm_* 控制
+    prewarm_parallel_fetcher()
     job = get_stock_kline(
         task=[{"code": "600000", "freq": "d", "start_time": "2026-02-13", "end_time": "2026-02-13"}],
         mode="async",
@@ -544,9 +564,9 @@ def get_index_kline(
 
     输入:
     - task: 指数任务列表，元素支持 dict 或 `IndexKlineTask`，字段:
-      `index_name/freq/start_time/end_time`。当传 `None` 或空列表时，会自动构建默认任务清单（全量指数目录，日线，近 7 天窗口）。
+      `index_name/freq/start_time/end_time`。`mode="async"` 且传 `None` 或空列表时，会自动构建默认任务清单（全量指数目录，日线，近 7 天窗口）；`mode="sync"` 必须显式传非空 task。
     - queue: 可选事件队列，需实现 `put()`。
-    - preprocessor_operator: 可选事件预处理函数，返回 None 时丢弃该事件。
+    - preprocessor_operator: 可选钩子 `f(payload)->dict|None`，返回 None 时丢弃该条；默认数值刻度见协议解析层。
     - mode: `"sync"` 或 `"async"`。
 
     返回:
@@ -559,51 +579,55 @@ def get_index_kline(
         raise ValueError("preprocessor_operator 必须是可调用对象")
 
     _ensure_active_config_ready(caller_name="get_index_kline")
+    mode_key = str(mode or "async").strip().lower()
     raw_tasks: List[Any]
     if task is None or (isinstance(task, (list, tuple)) and len(task) == 0):
-        end_dt = dt.datetime.now()
-        start_dt = end_dt - dt.timedelta(days=7)
-        start_text = start_dt.strftime("%Y-%m-%d")
-        end_text = end_dt.strftime("%Y-%m-%d")
+        if mode_key == "sync":
+            raw_tasks = []
+        else:
+            end_dt = dt.datetime.now()
+            start_dt = end_dt - dt.timedelta(days=7)
+            start_text = start_dt.strftime("%Y-%m-%d")
+            end_text = end_dt.strftime("%Y-%m-%d")
 
-        def _build_default_index_tasks(client: UnifiedTdxClient) -> List[Dict[str, str]]:
-            """
-            基于运行时指数目录构建默认指数任务列表。
+            def _build_default_index_tasks(client: UnifiedTdxClient) -> List[Dict[str, str]]:
+                """
+                基于运行时指数目录构建默认指数任务列表。
 
-            输入：
-            1. client: 统一客户端实例。
-            输出：
-            1. 默认任务字典列表。
-            用途：
-            1. 支持 get_index_kline 在 task 缺省场景下自动拉取指数数据。
-            边界条件：
-            1. 目录为空时抛 ValueError，提示调用方显式传 task 或检查连接。
-            """
-            records = client._discover_index_route_records(refresh=False)
-            tasks_buffer: List[Dict[str, str]] = []
-            seen_names: set[str] = set()
-            for record in records:
-                index_name = str(record.get("name", "")).strip()
-                if index_name == "" or index_name in seen_names:
-                    continue
-                seen_names.add(index_name)
-                tasks_buffer.append(
-                    {
-                        "index_name": index_name,
-                        "freq": "d",
-                        "start_time": start_text,
-                        "end_time": end_text,
-                    }
-                )
-            if not tasks_buffer:
-                raise ValueError("默认指数任务构建失败：未发现可用指数目录")
-            return tasks_buffer
+                输入：
+                1. client: 统一客户端实例。
+                输出：
+                1. 默认任务字典列表。
+                用途：
+                1. 支持 get_index_kline 在 async 且 task 缺省时自动拉取指数数据。
+                边界条件：
+                1. 目录为空时抛 ValueError，提示调用方显式传 task 或检查连接。
+                """
+                records = client._discover_index_route_records(refresh=False)
+                tasks_buffer: List[Dict[str, str]] = []
+                seen_names: set[str] = set()
+                for record in records:
+                    index_name = str(record.get("name", "")).strip()
+                    if index_name == "" or index_name in seen_names:
+                        continue
+                    seen_names.add(index_name)
+                    tasks_buffer.append(
+                        {
+                            "index_name": index_name,
+                            "freq": "d",
+                            "start_time": start_text,
+                            "end_time": end_text,
+                        }
+                    )
+                if not tasks_buffer:
+                    raise ValueError("默认指数任务构建失败：未发现可用指数目录")
+                return tasks_buffer
 
-        raw_tasks = _call_with_client(
-            _build_default_index_tasks,
-            get_active_context_client=UnifiedTdxClient.get_active_context_client,
-            build_client=lambda: get_client(),
-        )
+            raw_tasks = _call_with_client(
+                _build_default_index_tasks,
+                get_active_context_client=UnifiedTdxClient.get_active_context_client,
+                build_client=lambda: get_client(),
+            )
     else:
         raw_tasks = list(task)
 
@@ -628,8 +652,17 @@ def get_index_kline(
         """
         enriched_tasks: List[Dict[str, Any]] = []
         for task_item in tasks_buffer:
-            route = client.resolve_index_name(index_name=task_item.get("index_name", ""), refresh=False)
             task_copy: Dict[str, Any] = dict(task_item)
+            pre_code = str(task_copy.get("_index_route_code", "")).strip()
+            try:
+                pre_market = int(task_copy.get("_index_route_market", -1))
+            except Exception:
+                pre_market = -1
+            pre_source = str(task_copy.get("_index_route_source", "")).strip().lower()
+            if pre_source in {"std", "ex"} and pre_code != "" and pre_market >= 0:
+                enriched_tasks.append(task_copy)
+                continue
+            route = client.resolve_index_name(index_name=task_item.get("index_name", ""), refresh=False)
             task_copy["_index_route_source"] = str(route.get("source", "")).strip().lower()
             task_copy["_index_route_market"] = int(route.get("market", -1))
             task_copy["_index_route_code"] = str(route.get("code", "")).strip()
@@ -642,7 +675,6 @@ def get_index_kline(
         get_active_context_client=UnifiedTdxClient.get_active_context_client,
         build_client=lambda: get_client(),
     )
-    mode_key = str(mode or "async").strip().lower()
     fetcher = get_fetcher()
 
     if mode_key == "sync":
@@ -685,7 +717,6 @@ def prewarm_parallel_fetcher() -> Dict[str, Any]:
     require_all_workers = getattr(fetcher, 'auto_prewarm_require_all_workers', True)
     timeout_seconds = getattr(fetcher, 'auto_prewarm_timeout_seconds', 60.0)
     max_rounds = getattr(fetcher, 'auto_prewarm_max_rounds', 3)
-    spread_standard_hosts = getattr(fetcher, 'auto_prewarm_spread_standard_hosts', False)
     # target_workers 没有对应的 config 参数，使用 None（让内部决定）
     target_workers = None
     return _prewarm_parallel_fetcher(
@@ -693,7 +724,6 @@ def prewarm_parallel_fetcher() -> Dict[str, Any]:
         timeout_seconds=float(timeout_seconds),
         max_rounds=int(max_rounds),
         target_workers=target_workers,
-        spread_standard_hosts=bool(spread_standard_hosts),
     )
 
 

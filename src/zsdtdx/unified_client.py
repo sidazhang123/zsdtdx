@@ -6,6 +6,7 @@ import datetime as dt
 import ipaddress
 import json
 import math
+import random
 import re
 import socket as _socket_mod
 import threading
@@ -30,6 +31,250 @@ from zsdtdx.log import log
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
 _DEFAULT_CONFIG_PATH = _PACKAGE_DIR / "config.yaml"
+
+
+def _resolve_zsdtdx_config_path(config_path: Optional[str]) -> Path:
+    """
+    解析 zsdtdx 配置文件绝对路径。
+
+    输入：
+    1. config_path: 用户配置路径；None 或空串时使用包内默认 config.yaml。
+    输出：
+    1. 存在的配置文件 Path。
+    用途：
+    1. 供 TCP 探测刷新与 UnifiedTdxClient 共用同一套路径规则。
+    边界条件：
+    1. 文件不存在时抛出 FileNotFoundError。
+    """
+    if config_path is None or str(config_path).strip() == "":
+        candidate = _DEFAULT_CONFIG_PATH
+        if candidate.exists():
+            return candidate.resolve()
+        raise FileNotFoundError(f"默认配置文件不存在: {candidate}")
+
+    requested = Path(str(config_path))
+    if requested.is_absolute():
+        if requested.exists():
+            return requested.resolve()
+        raise FileNotFoundError(f"配置文件不存在: {requested}")
+
+    cwd_candidate = requested
+    if cwd_candidate.exists():
+        return cwd_candidate.resolve()
+
+    package_candidate = _PACKAGE_DIR / requested
+    if package_candidate.exists():
+        return package_candidate.resolve()
+
+    raise FileNotFoundError(
+        f"配置文件不存在: {requested}；已尝试 {cwd_candidate.resolve()} 与 {package_candidate.resolve()}"
+    )
+
+
+def normalize_hosts_entries(hosts: List[Any]) -> List[Tuple[str, int]]:
+    """
+    将 YAML 中的 hosts 段规范为 (ip, port) 列表。
+
+    输入：
+    1. hosts: 字符串 "ip:port"、二元组或字典等混合列表。
+    输出：
+    1. 校验通过的 (host, port) 列表。
+    用途：
+    1. UnifiedTdxClient 与 TCP 探测指纹共用同一规范化逻辑。
+    边界条件：
+    1. 全部无效时抛出 ValueError。
+    """
+    normalized: List[Tuple[str, int]] = []
+    for item in hosts or []:
+        ip = None
+        port = None
+        if isinstance(item, str) and ":" in item:
+            ip, p = item.rsplit(":", 1)
+            port = int(p)
+        elif isinstance(item, (tuple, list)) and len(item) == 2:
+            ip, port = str(item[0]), int(item[1])
+        elif isinstance(item, dict):
+            ip = str(item.get("ip", ""))
+            port = int(item.get("port", 0))
+
+        if not ip or not port:
+            continue
+        try:
+            ipaddress.ip_address(ip)
+        except Exception:
+            continue
+        if not (1 <= int(port) <= 65535):
+            continue
+        normalized.append((ip, int(port)))
+
+    if not normalized:
+        raise ValueError("配置中的 host 全部无效")
+    return normalized
+
+
+def compute_hosts_fingerprint(
+    std_hosts: List[Tuple[str, int]],
+    ex_hosts: List[Tuple[str, int]],
+) -> Tuple[Tuple[Tuple[str, int], ...], Tuple[Tuple[str, int], ...]]:
+    """
+    计算 standard / extended 地址集合指纹（与 YAML 列表顺序无关）。
+
+    输入：
+    1. std_hosts / ex_hosts: 已规范化的 (host, port) 列表。
+    输出：
+    1. 二元组 (standard 排序元组, extended 排序元组)，用于判断集合是否变化。
+    用途：
+    1. 仅在地址集合变化时重新执行 TCP 全池探测。
+    边界条件：
+    1. host 均视为 strip 后的字符串再比较。
+    """
+    std_key = tuple(sorted((str(h).strip(), int(p)) for h, p in std_hosts))
+    ex_key = tuple(sorted((str(h).strip(), int(p)) for h, p in ex_hosts))
+    return (std_key, ex_key)
+
+
+def _tcp_probe_and_trim_available_hosts(
+    hosts: List[Tuple[str, int]],
+    timeout: float,
+    fallback_hosts: List[Tuple[str, int]],
+    pool_label: str = "",
+) -> List[Tuple[str, int]]:
+    """
+    对地址池做 TCP 探测后裁剪：剔除不可达；可达按延迟升序；若可达数≥2 再去掉最慢 1 个；若结果为空则回退 fallback 顺序。
+
+    输入：
+    1. hosts: 待探测的 (host, port) 列表。
+    2. timeout: 单地址探测超时（秒）。
+    3. fallback_hosts: 裁剪为空时的回退列表（通常为配置原始顺序）。
+    4. pool_label: 日志用池名前缀。
+    输出：
+    1. 裁剪后的可用地址列表。
+    用途：
+    1. 主进程刷新缓存与 PersistentFailoverPool 首次探测共用。
+    边界条件：
+    1. hosts 为空时返回 fallback 副本。
+    """
+    label = str(pool_label or "").strip()
+    prefix = f"[{label}] " if label else ""
+    if not hosts:
+        return list(fallback_hosts)
+    if len(hosts) == 1:
+        h, p = hosts[0]
+        _ht, lat = _tcp_probe_one(h, p, timeout)
+        if lat is not None:
+            return [hosts[0]]
+        log.warning(f"{prefix}[TCP Probe] 单节点不可达，回退配置顺序")
+        return list(fallback_hosts)
+
+    workers = min(len(hosts), 32)
+    results: List[Tuple[Tuple[str, int], Optional[float]]] = []
+    with _ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_tcp_probe_one, h, p, timeout): (h, p)
+            for h, p in hosts
+        }
+        for future in futures:
+            try:
+                results.append(future.result(timeout=timeout + 1.0))
+            except Exception:
+                host_tuple = futures[future]
+                results.append((host_tuple, None))
+
+    reachable = [(ht, lat) for ht, lat in results if lat is not None]
+    unreachable = [(ht, lat) for ht, lat in results if lat is None]
+    reachable.sort(key=lambda x: x[1])
+
+    total = len(results)
+    ok_count = len(reachable)
+    if ok_count > 0:
+        top3 = reachable[:3]
+        top3_str = ", ".join(f"{h}:{p} ({lat:.1f}ms)" for (h, p), lat in top3)
+        log.info(f"{prefix}[TCP Probe] {ok_count}/{total} 可达, 最快: {top3_str}")
+    else:
+        log.warning(f"{prefix}[TCP Probe] 0/{total} 可达, 全部超时")
+    if unreachable:
+        fail_str = ", ".join(f"{h}:{p}" for (h, p), _ in unreachable)
+        log.info(f"{prefix}[TCP Probe] 不可达已剔除: {fail_str}")
+
+    trimmed = [ht for ht, _ in reachable]
+    if len(trimmed) >= 2:
+        dropped = trimmed[-1]
+        trimmed = trimmed[:-1]
+        log.info(f"{prefix}[TCP Probe] 去掉最慢节点: {dropped[0]}:{dropped[1]}")
+    if not trimmed:
+        log.warning(f"{prefix}[TCP Probe] 裁剪后为空，回退配置原始顺序 ({len(fallback_hosts)} 项)")
+        return list(fallback_hosts)
+    return trimmed
+
+
+_last_tcp_probe_hosts_fingerprint: Optional[
+    Tuple[Tuple[Tuple[str, int], ...], Tuple[Tuple[str, int], ...]]
+] = None
+
+
+def refresh_tcp_probe_cache_from_config_path(
+    config_path: Optional[str] = None,
+    *,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """
+    读取配置并对 standard / extended 执行探测、裁剪后写入 `_probe_result_cache`。
+
+    输入：
+    1. config_path: YAML 路径；None 表示包内默认。
+    2. force: True 时忽略指纹短路，强制重新探测。
+    输出：
+    1. 摘要字典（skipped、路径、各级数量等）。
+    用途：
+    1. 包导入、`set_config_path`、建进程池前保证缓存可用。
+    边界条件：
+    1. YAML 无法读取或 hosts 无效时向上抛出；指纹相同且非 force 时不访问网络。
+    """
+    global _last_tcp_probe_hosts_fingerprint
+
+    resolved = _resolve_zsdtdx_config_path(config_path)
+    with open(resolved, "r", encoding="utf-8") as fp:
+        cfg = yaml.safe_load(fp) or {}
+    pool_cfg = cfg.get("pool", {}) or {}
+    probe_on_init_flag = bool(pool_cfg.get("probe_on_init", False))
+    probe_timeout = float(pool_cfg.get("probe_timeout", 0.8))
+
+    std_hosts = normalize_hosts_entries(cfg.get("hosts", {}).get("standard", []))
+    ex_hosts = normalize_hosts_entries(cfg.get("hosts", {}).get("extended", []))
+    fp_new = compute_hosts_fingerprint(std_hosts, ex_hosts)
+
+    with _probe_result_cache_lock:
+        last_fp = _last_tcp_probe_hosts_fingerprint
+        if not force and last_fp is not None and fp_new == last_fp:
+            return {
+                "skipped": True,
+                "config_path": str(resolved),
+                "reason": "hosts_fingerprint_unchanged",
+            }
+
+    if probe_on_init_flag:
+        std_trimmed = _tcp_probe_and_trim_available_hosts(
+            std_hosts, probe_timeout, std_hosts, "standard"
+        )
+        ex_trimmed = _tcp_probe_and_trim_available_hosts(
+            ex_hosts, probe_timeout, ex_hosts, "extended"
+        )
+    else:
+        std_trimmed = list(std_hosts)
+        ex_trimmed = list(ex_hosts)
+
+    with _probe_result_cache_lock:
+        _probe_result_cache["standard"] = list(std_trimmed)
+        _probe_result_cache["extended"] = list(ex_trimmed)
+        _last_tcp_probe_hosts_fingerprint = fp_new
+
+    return {
+        "skipped": False,
+        "config_path": str(resolved),
+        "standard_count": len(std_trimmed),
+        "extended_count": len(ex_trimmed),
+    }
+
 
 # ---------------------------------------------------------------------------
 # TCP 延迟探测：主进程探测结果缓存（供 worker 子进程复用）
@@ -62,56 +307,6 @@ def _tcp_probe_one(host: str, port: int, timeout: float) -> Tuple[Tuple[str, int
             pass
 
 
-def _tcp_probe_hosts(hosts: List[Tuple[str, int]], timeout: float) -> List[Tuple[str, int]]:
-    """
-    并发 TCP Connect 探测所有 host，按延迟升序排列返回。
-
-    输入：
-    1. hosts: (ip, port) 列表。
-    2. timeout: 单个探测超时（秒）。
-    输出：
-    1. 按延迟升序排列的 host 列表；不可达 host 排末尾但保留（failover 后备）。
-    """
-    if not hosts:
-        return []
-    if len(hosts) == 1:
-        return list(hosts)
-
-    workers = min(len(hosts), 32)
-    results: List[Tuple[Tuple[str, int], Optional[float]]] = []
-    with _ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(_tcp_probe_one, h, p, timeout): (h, p)
-            for h, p in hosts
-        }
-        for future in futures:
-            try:
-                results.append(future.result(timeout=timeout + 1.0))
-            except Exception:
-                host_tuple = futures[future]
-                results.append((host_tuple, None))
-
-    reachable = [(ht, lat) for ht, lat in results if lat is not None]
-    unreachable = [(ht, lat) for ht, lat in results if lat is None]
-    reachable.sort(key=lambda x: x[1])
-
-    # 日志摘要
-    total = len(results)
-    ok_count = len(reachable)
-    if ok_count > 0:
-        top3 = reachable[:3]
-        top3_str = ", ".join(f"{h}:{p} ({lat:.1f}ms)" for (h, p), lat in top3)
-        log.info(f"[TCP Probe] {ok_count}/{total} 可达, 最快: {top3_str}")
-    else:
-        log.warning(f"[TCP Probe] 0/{total} 可达, 全部超时")
-    if unreachable:
-        fail_str = ", ".join(f"{h}:{p}" for (h, p), _ in unreachable)
-        log.info(f"[TCP Probe] 不可达: {fail_str}")
-
-    sorted_hosts = [ht for ht, _ in reachable] + [ht for ht, _ in unreachable]
-    return sorted_hosts
-
-
 class PersistentFailoverPool:
     """连接池：P0改造，线程本地连接，消除锁竞争。"""
 
@@ -130,12 +325,14 @@ class PersistentFailoverPool:
         probe_on_init: bool = False,
         probe_timeout: float = 0.8,
         presorted_hosts: Optional[List[Tuple[str, int]]] = None,
+        shuffle_initial_connect_order: bool = False,
     ):
         """输入连接参数，输出连接池实例；用于稳定调用；host 为空会抛错。"""
         if not hosts:
             raise ValueError(f"{name} host 列表为空")
         self.name = name
         self.api_cls = api_cls
+        self._fallback_hosts_order = list(hosts)
         self.hosts = hosts
         self.connect_timeout = float(connect_timeout)
         self.max_retry = int(max_retry)
@@ -149,12 +346,13 @@ class PersistentFailoverPool:
         self.probe_on_init = bool(probe_on_init)
         self.probe_timeout = float(probe_timeout)
         self._hosts_probed = False
+        self.shuffle_initial_connect_order = bool(shuffle_initial_connect_order)
 
         # 若调用方已提供排序结果（worker 子进程场景），直接使用
         if presorted_hosts is not None:
             self.hosts = list(presorted_hosts)
             self._hosts_probed = True
-        
+
         # P0改造：线程本地存储
         self._local = threading.local()
         self._thread_registry_lock = threading.Lock()
@@ -289,11 +487,19 @@ class PersistentFailoverPool:
         # 首次连接前做 TCP 延迟探测排序（仅一次）
         if self.probe_on_init and not self._hosts_probed:
             self._hosts_probed = True
-            sorted_hosts = _tcp_probe_hosts(self.hosts, self.probe_timeout)
-            self.hosts = sorted_hosts
+            trimmed = _tcp_probe_and_trim_available_hosts(
+                self.hosts,
+                self.probe_timeout,
+                self._fallback_hosts_order,
+                self.name,
+            )
+            self.hosts = trimmed
             with _probe_result_cache_lock:
                 _probe_result_cache[self.name] = list(self.hosts)
-        for index in range(len(self.hosts)):
+        indices = list(range(len(self.hosts)))
+        if self.shuffle_initial_connect_order:
+            random.shuffle(indices)
+        for index in indices:
             if self._connect_to_index(index):
                 return True
         return False
@@ -362,12 +568,57 @@ class PersistentFailoverPool:
             raise RuntimeError(f"{self.name}.{method_name} 返回 None")
         return result
 
-    def call(self, method_name: str, *args, allow_none: bool = False, **kwargs):
+    def _call_with_none_same_connection_confirm(self, method_name: str, *args, **kwargs):
+        """
+        对 socket 失败返回 None 的场景做同连接立刻确认重试（仅 1 次）。
+
+        输入：
+        1. method_name: API 方法名。
+        2. *args/**kwargs: 透传到底层 API。
+        输出：
+        1. 非 None 结果（含空列表 []）；确认后仍为 None 则返回 None。
+        用途：
+        1. 供 K 线/最新价等 allow_none 路径吸收瞬态抖动，不触发 reconnect/rotate。
+        边界条件：
+        1. 须已 ensure_connected；API 抛错向上冒泡，不按 None 失败处理。
+        2. 不使用 interval sleep；至多 2 次直调（初调 + 1 次确认）。
+        """
+        thread_data = self._get_thread_data()
+        api = thread_data["api"]
+        if api is None:
+            raise RuntimeError(f"{self.name} 无可用连接")
+
+        result = getattr(api, method_name)(*args, **kwargs)
+        if result is not None:
+            return result
+
+        with self._stats_lock:
+            self._global_stats["same_conn_retries"] += 1
+
+        result = getattr(api, method_name)(*args, **kwargs)
+        if result is not None:
+            return result
+
+        with self._stats_lock:
+            self._global_stats["none_as_end"] += 1
+        return None
+
+    def call(
+        self,
+        method_name: str,
+        *args,
+        allow_none: bool = False,
+        retry_none_with_same_connection: bool = False,
+        **kwargs,
+    ):
         """输入方法与参数，输出调用结果；用于粘滞重试；优先保当前连接，最后才轮换 IP。"""
         with self._stats_lock:
             self._global_stats["total_calls"] += 1
         if not self._ensure_connected():
             raise RuntimeError(f"{self.name} 无可用连接")
+
+        if bool(retry_none_with_same_connection) and bool(allow_none):
+            return self._call_with_none_same_connection_confirm(method_name, *args, **kwargs)
 
         last_exception = None
         total_budget = max(1, self.max_retry)
@@ -483,6 +734,95 @@ class PersistentFailoverPool:
             data["active_index"] = -1
 
 
+class SharedChunkCache:
+    """二维分区池：_free 软复用 + 线程租约（acquire / soft_delete）。
+
+    - cache_rows：有序 list[(dt_key, row)]；_n 为有效下标（不 list.clear，覆写槽位，靠 _n 防脏读）。
+    - acquire_partition：从 _free 取可复用分区或新建，绑定当前线程租约；跨 (code,freq) 时重置 _n/游标。
+    - chunk 内：首次分页填充为写分区（merge 增 _n）；后续 task 命中缓存为读分区（range(_n) 过滤）。
+    - soft_delete：解除租约并归还 _free，供任意线程下次 acquire；读写期外仅 _free 有锁。
+    """
+
+    def __init__(self):
+        self._free: List[Dict[str, Any]] = []
+        self._pool_lock = threading.Lock()
+        self._local = threading.local()
+
+    @staticmethod
+    def _new_partition() -> Dict[str, Any]:
+        return {
+            "cache_rows": [],
+            "_n": 0,
+            "_partition_key": "",
+            "oldest_dt": None,
+            "newest_dt": None,
+            "page_start": 0,
+            "fetched_pages": 0,
+        }
+
+    @staticmethod
+    def _reset_partition_for_key(partition: Dict[str, Any], partition_key: str) -> None:
+        partition["_n"] = 0
+        partition["oldest_dt"] = None
+        partition["newest_dt"] = None
+        partition["page_start"] = 0
+        partition["fetched_pages"] = 0
+        partition["_partition_key"] = partition_key
+
+    def acquire_partition(self, code: str, freq: str) -> Dict[str, Any]:
+        """输入 code/freq，输出当前线程租约分区；chunk 入口调用一次，chunk 内只读/写该对象。
+
+        每次 acquire 均归零 _n/游标（新 chunk 可见范围）；仅保留 cache_rows 底层槽位供覆写。
+        跨 (code,freq) 时更新 _partition_key；同 key 从 _free 复用也只复用内存，不继承上一 chunk 可见长度。
+        """
+        partition_key = f"{code}|{freq}"
+        leased = getattr(self._local, "lease", None)
+        if leased is not None:
+            if leased.get("_partition_key") != partition_key:
+                raise RuntimeError(
+                    f"线程已有未释放分区租约: {leased.get('_partition_key')}，不能再 acquire {partition_key}"
+                )
+            return leased
+
+        with self._pool_lock:
+            if self._free:
+                partition = self._free.pop()
+            else:
+                partition = self._new_partition()
+
+        partition["_partition_key"] = partition_key
+        partition["_n"] = 0
+        partition["oldest_dt"] = None
+        partition["newest_dt"] = None
+        partition["page_start"] = 0
+        partition["fetched_pages"] = 0
+        self._local.lease = partition
+        return partition
+
+    def get_partition(self, code: str, freq: str) -> Dict[str, Any]:
+        """兼容别名；等价于 acquire_partition。"""
+        return self.acquire_partition(code, freq)
+
+    def soft_delete(self, code: str, freq: str) -> None:
+        """chunk 结束：解除租约，归零 _n/游标后归还 _free（可复用内存，不可复用上一 chunk 可见数据）。"""
+        expected_key = f"{code}|{freq}"
+        leased = getattr(self._local, "lease", None)
+        if leased is None:
+            return
+        if str(leased.get("_partition_key", "") or "") != expected_key:
+            raise RuntimeError(
+                f"soft_delete 与租约 key 不一致: lease={leased.get('_partition_key')} expected={expected_key}"
+            )
+        leased["_n"] = 0
+        leased["oldest_dt"] = None
+        leased["newest_dt"] = None
+        leased["page_start"] = 0
+        leased["fetched_pages"] = 0
+        self._local.lease = None
+        with self._pool_lock:
+            self._free.append(leased)
+
+
 class UnifiedTdxClient:
     """统一行情高层客户端，封装市场路由、分页和连接池。"""
 
@@ -515,7 +855,12 @@ class UnifiedTdxClient:
     STOCK_SCOPE_TOKENS = {"szsh", "bj", "hk"}
     _CONTEXT_STACK: List["UnifiedTdxClient"] = []
 
-    def __init__(self, config_path: Optional[str] = None, presorted_hosts: Optional[Dict[str, List[Tuple[str, int]]]] = None):
+    def __init__(
+        self,
+        config_path: Optional[str] = None,
+        presorted_hosts: Optional[Dict[str, List[Tuple[str, int]]]] = None,
+        worker_client: bool = False,
+    ):
         """输入配置路径，输出客户端实例；用于统一初始化；路径为空时默认包内配置。"""
         resolved_config_path = self._resolve_config_path(config_path)
         self.config_path = str(resolved_config_path)
@@ -554,7 +899,7 @@ class UnifiedTdxClient:
         same_connection_retry_interval_ms = int(pool_cfg.get("same_connection_retry_interval_ms", 800))
         same_host_reconnect_times = int(pool_cfg.get("same_host_reconnect_times", 3))
         same_host_reconnect_interval_ms = int(pool_cfg.get("same_host_reconnect_interval_ms", 50))
-        probe_on_init = bool(pool_cfg.get("probe_on_init", False))
+        probe_on_init_flag = bool(pool_cfg.get("probe_on_init", False))
         probe_timeout = float(pool_cfg.get("probe_timeout", 0.8))
         api_kwargs = {
             "multithread": True,
@@ -564,10 +909,32 @@ class UnifiedTdxClient:
 
         std_hosts = self._normalize_hosts(self.config.get("hosts", {}).get("standard", []))
         ex_hosts = self._normalize_hosts(self.config.get("hosts", {}).get("extended", []))
+        fp_local = compute_hosts_fingerprint(std_hosts, ex_hosts)
 
-        presorted_map = presorted_hosts or {}
+        presorted_map = dict(presorted_hosts or {})
         std_presorted = presorted_map.get("standard")
         ex_presorted = presorted_map.get("extended")
+
+        if not worker_client and presorted_hosts is None:
+            with _probe_result_cache_lock:
+                cache_hit = (
+                    _last_tcp_probe_hosts_fingerprint == fp_local
+                    and bool(_probe_result_cache.get("standard"))
+                    and bool(_probe_result_cache.get("extended"))
+                )
+                if cache_hit:
+                    std_presorted = list(_probe_result_cache["standard"])
+                    ex_presorted = list(_probe_result_cache["extended"])
+
+        if worker_client and not std_presorted and not ex_presorted:
+            log.warning(
+                "[UnifiedTdxClient] worker 未收到 presorted_hosts，首次建连可能重复 TCP 探测"
+            )
+
+        std_probe_on_init = bool(probe_on_init_flag) if not std_presorted else False
+        ex_probe_on_init = bool(probe_on_init_flag) if not ex_presorted else False
+
+        shuffle_conn = bool(worker_client)
 
         self.std_pool = PersistentFailoverPool(
             "standard",
@@ -580,9 +947,10 @@ class UnifiedTdxClient:
             same_host_reconnect_times=same_host_reconnect_times,
             same_host_reconnect_interval_ms=same_host_reconnect_interval_ms,
             api_kwargs=api_kwargs,
-            probe_on_init=probe_on_init,
+            probe_on_init=std_probe_on_init,
             probe_timeout=probe_timeout,
             presorted_hosts=std_presorted,
+            shuffle_initial_connect_order=shuffle_conn,
         )
         self.ex_pool = PersistentFailoverPool(
             "extended",
@@ -595,9 +963,10 @@ class UnifiedTdxClient:
             same_host_reconnect_times=same_host_reconnect_times,
             same_host_reconnect_interval_ms=same_host_reconnect_interval_ms,
             api_kwargs=api_kwargs,
-            probe_on_init=probe_on_init,
+            probe_on_init=ex_probe_on_init,
             probe_timeout=probe_timeout,
             presorted_hosts=ex_presorted,
+            shuffle_initial_connect_order=shuffle_conn,
         )
 
         self._markets_df = None
@@ -609,66 +978,21 @@ class UnifiedTdxClient:
         self._instrument_cache = None
         self._runtime_failures: List[Dict[str, Any]] = []
         self._entered_client = None
+        # chunk 级 2D 分区缓存（(code|index_name, freq) → 分区）；股票/指数共用
+        self._shared_chunk_cache = SharedChunkCache()
 
     def _resolve_config_path(self, config_path: Optional[str]) -> Path:
         """输入配置路径，输出可读取绝对路径；支持相对/绝对路径；不存在时抛错。"""
-        if config_path is None or str(config_path).strip() == "":
-            candidate = _DEFAULT_CONFIG_PATH
-            if candidate.exists():
-                return candidate.resolve()
-            raise FileNotFoundError(f"默认配置文件不存在: {candidate}")
-
-        requested = Path(str(config_path))
-        if requested.is_absolute():
-            if requested.exists():
-                return requested.resolve()
-            raise FileNotFoundError(f"配置文件不存在: {requested}")
-
-        cwd_candidate = requested
-        if cwd_candidate.exists():
-            return cwd_candidate.resolve()
-
-        package_candidate = _PACKAGE_DIR / requested
-        if package_candidate.exists():
-            return package_candidate.resolve()
-
-        raise FileNotFoundError(
-            f"配置文件不存在: {requested}；已尝试 {cwd_candidate.resolve()} 与 {package_candidate.resolve()}"
-        )
+        return _resolve_zsdtdx_config_path(config_path)
 
     def _load_config(self, config_path: Path) -> Dict[str, Any]:
         """输入配置路径，输出配置字典；用于参数集中管理；文件缺失会抛错。"""
         with open(config_path, "r", encoding="utf-8") as fp:
-            return yaml.safe_load(fp)
+            return yaml.safe_load(fp) or {}
 
     def _normalize_hosts(self, hosts: List[Any]) -> List[Tuple[str, int]]:
         """输入 host 配置，输出合法 host 列表；用于剔除脏地址；全无效会抛错。"""
-        normalized = []
-        for item in hosts:
-            ip = None
-            port = None
-            if isinstance(item, str) and ":" in item:
-                ip, p = item.rsplit(":", 1)
-                port = int(p)
-            elif isinstance(item, (tuple, list)) and len(item) == 2:
-                ip, port = str(item[0]), int(item[1])
-            elif isinstance(item, dict):
-                ip = str(item.get("ip", ""))
-                port = int(item.get("port", 0))
-
-            if not ip or not port:
-                continue
-            try:
-                ipaddress.ip_address(ip)
-            except Exception:
-                continue
-            if not (1 <= int(port) <= 65535):
-                continue
-            normalized.append((ip, int(port)))
-
-        if not normalized:
-            raise ValueError("配置中的 host 全部无效")
-        return normalized
+        return normalize_hosts_entries(hosts)
 
     def _default_return_df(self, return_df: Optional[bool]) -> bool:
         """输入返回开关，输出是否 DataFrame；用于统一默认值；None 时走配置。"""
@@ -682,6 +1006,35 @@ class UnifiedTdxClient:
         if p not in self.PERIOD_MAP:
             raise ValueError(f"不支持的频率: {freq}")
         return self.PERIOD_MAP[p]
+
+    def _pool_call_allow_none_with_same_conn_retry(
+        self,
+        pool: PersistentFailoverPool,
+        method_name: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """
+        K 线/最新价专用 pool 调用：allow_none 且对 None 做同连接立刻确认重试。
+
+        输入：
+        1. pool: 标准或扩展连接池。
+        2. method_name: API 方法名。
+        3. *args/**kwargs: 透传参数。
+        输出：
+        1. API 返回值；确认后仍为 None 时返回 None。
+        用途：
+        1. 统一开启 retry_none_with_same_connection，避免漏接。
+        边界条件：
+        1. 固定 allow_none=True；不在此封装内改为 allow_none=False。
+        """
+        return pool.call(
+            method_name,
+            *args,
+            allow_none=True,
+            retry_none_with_same_connection=True,
+            **kwargs,
+        )
 
     def _to_datetime(self, value: Any) -> pd.Timestamp:
         """输入时间值，输出 Timestamp；用于统一过滤；非法时间抛错。"""
@@ -861,38 +1214,39 @@ class UnifiedTdxClient:
             start = 0
             for _ in range(max_pages):
                 if source == "std":
-                    page = self.std_pool.call(
+                    page = self._pool_call_allow_none_with_same_conn_retry(
+                        self.std_pool,
                         "get_index_bars",
                         int(category),
                         int(market),
                         str(code),
                         int(start),
                         int(page_size),
-                        allow_none=True,
                     )
                 else:
-                    page = self.ex_pool.call(
+                    page = self._pool_call_allow_none_with_same_conn_retry(
+                        self.ex_pool,
                         "get_instrument_bars",
                         int(category),
                         int(market),
                         str(code),
                         int(start),
                         int(page_size),
-                        allow_none=True,
                     )
                 if not page:
                     break
-                rows.extend(list(page))
-                oldest_raw = page[0].get("datetime") if isinstance(page[0], dict) else None
+                raw_page = list(page)
+                self._append_raw_kline_page_rows(rows, raw_page)
+                oldest_raw = raw_page[0].get("datetime") if isinstance(raw_page[0], dict) else None
                 try:
                     oldest_dt = self._to_datetime_no_df(oldest_raw)
                 except Exception:
                     oldest_dt = None
                 if oldest_dt is not None and oldest_dt <= start_dt:
                     break
-                if len(page) < page_size:
+                if len(raw_page) < page_size:
                     break
-                start += len(page)
+                start += len(raw_page)
             return {"source": source, "market": market, "code": code}, rows
 
         resolved_route = dict(route)
@@ -905,38 +1259,14 @@ class UnifiedTdxClient:
             resolved_route = self.resolve_index_name(index_name=index_name, refresh=True)
             effective_route, raw_rows = _fetch_route_rows(resolved_route)
 
-        by_datetime: Dict[str, Dict[str, Any]] = {}
-        normalized_freq = self._normalize_freq(freq)
-        for row in raw_rows:
-            if not isinstance(row, dict):
-                continue
-            try:
-                parsed_dt = self._to_datetime_no_df(row.get("datetime"))
-            except Exception:
-                continue
-            if parsed_dt < start_dt or parsed_dt > end_dt:
-                continue
-            dt_key = parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
-            vol_v = self._safe_float_no_df(row.get("vol"))
-            trade_v = self._safe_float_no_df(row.get("trade"))
-            volume_v = vol_v if vol_v is not None else trade_v
-            normalized = {
-                "index_name": str(resolved_route.get("name", index_name)),
-                "code": str(effective_route.get("code", "")),
-                "freq": normalized_freq,
-                "open": self._safe_float_no_df(row.get("open")),
-                "close": self._safe_float_no_df(row.get("close")),
-                "high": self._safe_float_no_df(row.get("high")),
-                "low": self._safe_float_no_df(row.get("low")),
-                "volume": volume_v,
-                "amount": self._safe_float_no_df(row.get("amount")),
-                "datetime": dt_key,
-            }
-            by_datetime[dt_key] = normalized
-
-        if not by_datetime:
-            return []
-        return [by_datetime[key] for key in sorted(by_datetime.keys())]
+        return self._normalize_index_kline_rows(
+            rows=raw_rows,
+            index_name=str(resolved_route.get("name", index_name)),
+            route_code=str(effective_route.get("code", "")),
+            freq=freq,
+            start_dt=start_dt,
+            end_dt=end_dt,
+        )
 
     def _ensure_ex_market_name_map_no_df(self):
         """输入无，输出无；用于无 DataFrame 路径补充扩展市场映射；失败时保持现状。"""
@@ -1059,38 +1389,73 @@ class UnifiedTdxClient:
             raise ValueError(f"股票代码未找到: {code}")
         return normalized_code, route
 
-    def _filter_placeholder_ohlc_equal_rows_list(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """输入K线字典列表，输出过滤结果；用于无 DataFrame 占位条剔除；空列表直接返回。"""
+    def _raw_kline_row_volume(self, row: Dict[str, Any]) -> Optional[float]:
+        """原始 K 线行成交量：优先 vol，其次 trade，再次 volume。"""
+        vol_v = self._safe_float_no_df(row.get("vol"))
+        if vol_v is not None:
+            return vol_v
+        trade_v = self._safe_float_no_df(row.get("trade"))
+        if trade_v is not None:
+            return trade_v
+        return self._safe_float_no_df(row.get("volume"))
+
+    def _is_placeholder_raw_kline_row(self, row: Dict[str, Any]) -> bool:
+        """
+        输入：socket 原始 K 线行。
+        输出：True 表示 o=h=l=c 且成交量/额近零的占位条，取 bar 时应跳过。
+        """
+        if not bool(self.output_cfg.get("filter_suspended_placeholder_bar", True)):
+            return False
+        if not isinstance(row, dict):
+            return False
+        eps = float(self.output_cfg.get("suspended_placeholder_eps", 1e-20))
+        open_v = self._safe_float_no_df(row.get("open"))
+        close_v = self._safe_float_no_df(row.get("close"))
+        high_v = self._safe_float_no_df(row.get("high"))
+        low_v = self._safe_float_no_df(row.get("low"))
+        if None in (open_v, close_v, high_v, low_v):
+            return False
+        if not (open_v == close_v == high_v == low_v):
+            return False
+        volume_v = self._raw_kline_row_volume(row)
+        amount_v = self._safe_float_no_df(row.get("amount"))
+        vol_tiny = volume_v is None or abs(volume_v) <= eps
+        amount_tiny = amount_v is None or abs(amount_v) <= eps
+        return vol_tiny and amount_tiny
+
+    def _filter_placeholder_raw_kline_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """逐条剔除 o=h=l=c 且量额近零的占位 bar；不丢弃同页其它正常 bar。"""
         if not rows:
             return []
-        if not bool(self.output_cfg.get("filter_suspended_placeholder_bar", True)):
-            return list(rows)
-        eps = float(self.output_cfg.get("suspended_placeholder_eps", 1e-20))
-        result: List[Dict[str, Any]] = []
-        for row in rows:
-            open_v = self._safe_float_no_df(row.get("open"))
-            close_v = self._safe_float_no_df(row.get("close"))
-            high_v = self._safe_float_no_df(row.get("high"))
-            low_v = self._safe_float_no_df(row.get("low"))
-            volume_v = self._safe_float_no_df(row.get("volume"))
-            amount_v = self._safe_float_no_df(row.get("amount"))
-            equal_ohlc = (
-                open_v is not None
-                and close_v is not None
-                and high_v is not None
-                and low_v is not None
-                and open_v == close_v == high_v == low_v
-            )
-            tiny_turnover = (
-                volume_v is not None
-                and amount_v is not None
-                and abs(volume_v) <= eps
-                and abs(amount_v) <= eps
-            )
-            if equal_ohlc and tiny_turnover:
-                continue
-            result.append(row)
-        return result
+        return [row for row in rows if not self._is_placeholder_raw_kline_row(row)]
+
+    def _append_raw_kline_page_rows(
+        self,
+        rows: List[Dict[str, Any]],
+        raw_page: List[Dict[str, Any]],
+    ) -> int:
+        """
+        将一页 socket 原始 bar 逐条写入 rows（跳过占位条）。
+
+        输出：原始页长度，供 start+=len(raw_page) 分页偏移；与是否含占位条无关。
+        """
+        raw_page = list(raw_page or [])
+        for row in raw_page:
+            if isinstance(row, dict) and not self._is_placeholder_raw_kline_row(row):
+                rows.append(row)
+        return len(raw_page)
+
+    def _filter_placeholder_ohlc_equal_rows_list(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """输入K线字典列表，输出过滤结果；用于无 DataFrame 占位条剔除；空列表直接返回。"""
+        return self._filter_placeholder_raw_kline_rows(list(rows or []))
+
+    def _dt_key_for_raw_kline_row(self, row: Dict[str, Any]) -> Optional[str]:
+        """输入原始 K 线行，输出与 `_normalize_stock_kline_rows` 一致的 datetime 文本键；非法返回 None。"""
+        try:
+            parsed_dt = self._to_datetime_no_df(row.get("datetime"))
+        except Exception:
+            return None
+        return parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     def _normalize_stock_kline_rows(
         self,
@@ -1102,60 +1467,250 @@ class UnifiedTdxClient:
         start_dt: dt.datetime,
         end_dt: dt.datetime,
     ) -> List[Dict[str, Any]]:
-        """输入原始行，输出标准字段列表；用于无 DataFrame 输出；datetime 非法会被丢弃。"""
+        """P2: numpy 向量化时间过滤/排序；仅使用 socket 层 datetime/_ts，不解析 year/month/day/hour/minute。"""
         if not rows:
             return []
-
-        by_datetime: Dict[str, Dict[str, Any]] = {}
+        import numpy as np
+        n = len(rows)
         normalized_freq = self._normalize_freq(freq)
         prefixed_code = self._stock_code_with_prefix_no_df(source=source, market=market, code=code)
 
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            raw_dt = row.get("datetime")
-            try:
-                parsed_dt = self._to_datetime_no_df(raw_dt)
-            except Exception:
-                continue
-            if parsed_dt < start_dt or parsed_dt > end_dt:
-                continue
-            dt_key = parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
+        timestamps = np.empty(n, dtype=np.int64)
+        opens = np.empty(n, dtype=np.float64)
+        closes = np.empty(n, dtype=np.float64)
+        highs = np.empty(n, dtype=np.float64)
+        lows = np.empty(n, dtype=np.float64)
+        volumes = np.empty(n, dtype=np.float64)
+        amounts = np.empty(n, dtype=np.float64)
+        datetime_texts = np.empty(n, dtype=object)
+        valid_mask = np.ones(n, dtype=bool)
 
+        for i, row in enumerate(rows):
+            if not isinstance(row, dict):
+                valid_mask[i] = False
+                continue
+            ts = row.get('_ts')
+            dt_raw = row.get('datetime')
+            if ts is not None:
+                timestamps[i] = int(ts)
+                datetime_texts[i] = str(dt_raw).strip() if dt_raw else None
+            else:
+                try:
+                    parsed_dt = self._to_datetime_no_df(dt_raw)
+                    timestamps[i] = int(parsed_dt.timestamp())
+                    datetime_texts[i] = parsed_dt.strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    valid_mask[i] = False
+                    continue
+            opens[i] = float(row.get('open') or 0)
+            closes[i] = float(row.get('close') or 0)
+            highs[i] = float(row.get('high') or 0)
+            lows[i] = float(row.get('low') or 0)
+            vol_v = float(row.get('vol') or 0)
+            trade_v = float(row.get('trade') or 0)
+            volumes[i] = vol_v if vol_v else trade_v
+            amounts[i] = float(row.get('amount') or 0)
+
+        if not valid_mask.any():
+            return []
+
+        ts_start = int(start_dt.timestamp())
+        ts_end = int(end_dt.timestamp())
+        valid_mask &= (timestamps >= ts_start) & (timestamps <= ts_end)
+        if not valid_mask.any():
+            return []
+
+        idx = np.where(valid_mask)[0]
+        timestamps = timestamps[idx]; opens = opens[idx]; closes = closes[idx]
+        highs = highs[idx]; lows = lows[idx]; volumes = volumes[idx]; amounts = amounts[idx]
+        datetime_texts = datetime_texts[idx]
+
+        _, unique_idx = np.unique(timestamps, return_index=True)
+        sort_order = np.argsort(timestamps[unique_idx])
+        final_idx = unique_idx[sort_order]
+
+        timestamps = timestamps[final_idx]
+        opens = opens[final_idx]
+        closes = closes[final_idx]
+        highs = highs[final_idx]
+        lows = lows[final_idx]
+        volumes = volumes[final_idx]
+        amounts = amounts[final_idx]
+        datetime_texts = datetime_texts[final_idx]
+
+        out = []
+        for i in range(len(timestamps)):
+            ts = int(timestamps[i])
+            dt_str = datetime_texts[i]
+            if not dt_str:
+                dt_str = dt.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+            out.append({
+                'code': prefixed_code, 'freq': normalized_freq,
+                'open': float(opens[i]), 'close': float(closes[i]),
+                'high': float(highs[i]), 'low': float(lows[i]),
+                'volume': int(volumes[i]), 'amount': int(amounts[i]),
+                'datetime': dt_str,
+            })
+        return out
+
+    def _index_route_fingerprint(self, route: Dict[str, Any]) -> str:
+        """输入路由字典，输出 source:market:code 指纹；用于 chunk 分区失效判断。"""
+        source = str(route.get("source", "")).strip().lower()
+        try:
+            market = int(route.get("market", -1))
+        except Exception:
+            market = -1
+        code = str(route.get("code", "")).strip()
+        return f"{source}:{market}:{code}"
+
+    def _reset_index_chunk_partition(self, partition: Dict[str, Any]) -> None:
+        """
+        输入：chunk 分区字典。
+        输出：无；原地清空指数分页缓存状态。
+        用途：路由变更或强制失效时重置分区。
+        边界条件：不释放 cache_rows 底层列表，仅归零 _n 与游标。
+        """
+        partition["_n"] = 0
+        partition["oldest_dt"] = None
+        partition["newest_dt"] = None
+        partition["page_start"] = 0
+        partition["fetched_pages"] = 0
+        partition["_route_fp"] = ""
+
+    def _ensure_index_chunk_route_valid(self, partition: Dict[str, Any], route: Dict[str, Any]) -> None:
+        """
+        输入：chunk 分区与当前路由。
+        输出：无；若路由指纹变化则清空分区缓存。
+        用途：避免混用旧 market/code 的 bar。
+        边界条件：首次写入 _route_fp 时不重置。
+        """
+        fp = self._index_route_fingerprint(route)
+        old_fp = str(partition.get("_route_fp", "") or "").strip()
+        if old_fp != "" and old_fp != fp:
+            self._reset_index_chunk_partition(partition)
+        partition["_route_fp"] = fp
+
+    def _normalize_index_kline_rows(
+        self,
+        rows: List[Dict[str, Any]],
+        index_name: str,
+        route_code: str,
+        freq: str,
+        start_dt: dt.datetime,
+        end_dt: dt.datetime,
+    ) -> List[Dict[str, Any]]:
+        """
+        输入：原始指数 K 线行、名称/代码/频率与时间窗。
+        输出：标准化指数 K 线 dict 列表。
+        用途：chunk 窗口过滤阶段批量归一化；仅使用 socket 层 datetime/_ts，不解析年月日时分分列。
+        边界条件：无有效行时返回 []。
+        """
+        if not rows:
+            return []
+        import numpy as np
+
+        n = len(rows)
+        normalized_freq = self._normalize_freq(freq)
+        route_name = str(index_name).strip()
+        route_code_text = str(route_code).strip()
+
+        timestamps = np.empty(n, dtype=np.int64)
+        opens = np.empty(n, dtype=np.float64)
+        closes = np.empty(n, dtype=np.float64)
+        highs = np.empty(n, dtype=np.float64)
+        lows = np.empty(n, dtype=np.float64)
+        volumes = np.empty(n, dtype=np.float64)
+        amounts = np.empty(n, dtype=np.float64)
+        datetime_texts = np.empty(n, dtype=object)
+        valid_mask = np.ones(n, dtype=bool)
+
+        for i, row in enumerate(rows):
+            if not isinstance(row, dict):
+                valid_mask[i] = False
+                continue
+            ts = row.get("_ts")
+            dt_raw = row.get("datetime")
+            if ts is not None:
+                timestamps[i] = int(ts)
+                datetime_texts[i] = str(dt_raw).strip() if dt_raw else None
+            else:
+                try:
+                    parsed_dt = self._to_datetime_no_df(dt_raw)
+                    timestamps[i] = int(parsed_dt.timestamp())
+                    datetime_texts[i] = parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    valid_mask[i] = False
+                    continue
             open_v = self._safe_float_no_df(row.get("open"))
             close_v = self._safe_float_no_df(row.get("close"))
             high_v = self._safe_float_no_df(row.get("high"))
             low_v = self._safe_float_no_df(row.get("low"))
-            amount_v = self._safe_float_no_df(row.get("amount"))
-
+            if open_v is None or close_v is None or high_v is None or low_v is None:
+                valid_mask[i] = False
+                continue
+            opens[i] = open_v
+            closes[i] = close_v
+            highs[i] = high_v
+            lows[i] = low_v
             vol_v = self._safe_float_no_df(row.get("vol"))
             trade_v = self._safe_float_no_df(row.get("trade"))
-            volume_v = vol_v if vol_v is not None else trade_v
+            volumes[i] = vol_v if vol_v is not None else (trade_v if trade_v is not None else 0.0)
+            amount_v = self._safe_float_no_df(row.get("amount"))
+            amounts[i] = amount_v if amount_v is not None else 0.0
 
-            if open_v is not None:
-                open_v = round(open_v, 2)
-            if close_v is not None:
-                close_v = round(close_v, 2)
-            if high_v is not None:
-                high_v = round(high_v, 2)
-            if low_v is not None:
-                low_v = round(low_v, 2)
+        if not valid_mask.any():
+            return []
 
-            normalized = {
-                "code": prefixed_code,
-                "freq": normalized_freq,
-                "open": open_v,
-                "close": close_v,
-                "high": high_v,
-                "low": low_v,
-                "volume": volume_v,
-                "amount": amount_v,
-                "datetime": dt_key,
-            }
-            by_datetime[dt_key] = normalized
+        ts_start = int(start_dt.timestamp())
+        ts_end = int(end_dt.timestamp())
+        valid_mask &= (timestamps >= ts_start) & (timestamps <= ts_end)
+        if not valid_mask.any():
+            return []
 
-        sorted_rows = [by_datetime[key] for key in sorted(by_datetime.keys())]
-        return self._filter_placeholder_ohlc_equal_rows_list(sorted_rows)
+        idx = np.where(valid_mask)[0]
+        timestamps = timestamps[idx]
+        opens = opens[idx]
+        closes = closes[idx]
+        highs = highs[idx]
+        lows = lows[idx]
+        volumes = volumes[idx]
+        amounts = amounts[idx]
+        datetime_texts = datetime_texts[idx]
+
+        _, unique_idx = np.unique(timestamps, return_index=True)
+        sort_order = np.argsort(timestamps[unique_idx])
+        final_idx = unique_idx[sort_order]
+
+        timestamps = timestamps[final_idx]
+        opens = opens[final_idx]
+        closes = closes[final_idx]
+        highs = highs[final_idx]
+        lows = lows[final_idx]
+        volumes = volumes[final_idx]
+        amounts = amounts[final_idx]
+        datetime_texts = datetime_texts[final_idx]
+
+        out: List[Dict[str, Any]] = []
+        for i in range(len(timestamps)):
+            ts = int(timestamps[i])
+            dt_str = datetime_texts[i]
+            if not dt_str:
+                dt_str = dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+            out.append(
+                {
+                    "index_name": route_name,
+                    "code": route_code_text,
+                    "freq": normalized_freq,
+                    "open": float(opens[i]),
+                    "close": float(closes[i]),
+                    "high": float(highs[i]),
+                    "low": float(lows[i]),
+                    "volume": int(volumes[i]),
+                    "amount": int(amounts[i]),
+                    "datetime": dt_str,
+                }
+            )
+        return out
 
     def _fetch_std_kline_rows(
         self,
@@ -1172,28 +1727,29 @@ class UnifiedTdxClient:
         start = 0
         rows: List[Dict[str, Any]] = []
         for _ in range(max_pages):
-            page = self.std_pool.call(
+            page = self._pool_call_allow_none_with_same_conn_retry(
+                self.std_pool,
                 "get_security_bars",
                 category,
                 int(market),
                 str(code),
                 int(start),
                 int(page_size),
-                allow_none=True,
             )
             if not page:
                 break
-            rows.extend(page)
-            oldest_raw = page[0].get("datetime") if isinstance(page[0], dict) else None
+            raw_page = list(page)
+            self._append_raw_kline_page_rows(rows, raw_page)
+            oldest_raw = raw_page[0].get("datetime") if isinstance(raw_page[0], dict) else None
             try:
                 oldest_dt = self._to_datetime_no_df(oldest_raw)
             except Exception:
                 oldest_dt = None
             if oldest_dt is not None and oldest_dt <= start_dt:
                 break
-            if len(page) < page_size:
+            if len(raw_page) < page_size:
                 break
-            start += len(page)
+            start += len(raw_page)
         return self._normalize_stock_kline_rows(
             rows=rows,
             source="std",
@@ -1219,28 +1775,30 @@ class UnifiedTdxClient:
         start = 0
         rows: List[Dict[str, Any]] = []
         for _ in range(max_pages):
-            page = self.ex_pool.call(
+            page = self._pool_call_allow_none_with_same_conn_retry(
+                self.ex_pool,
                 "get_instrument_bars",
                 category,
                 int(market),
                 str(code),
                 int(start),
                 int(page_size),
-                allow_none=True,
             )
             if not page:
                 break
-            rows.extend(page)
-            oldest_raw = page[0].get("datetime") if isinstance(page[0], dict) else None
+            raw_page = list(page)
+            self._append_raw_kline_page_rows(rows, raw_page)
+            # 页内升序：page[0] 即本页最老 bar，用于判断左边界 start_dt 是否已盖住
+            oldest_raw = raw_page[0].get("datetime") if isinstance(raw_page[0], dict) else None
             try:
                 oldest_dt = self._to_datetime_no_df(oldest_raw)
             except Exception:
                 oldest_dt = None
             if oldest_dt is not None and oldest_dt <= start_dt:
                 break
-            if len(page) < page_size:
+            if len(raw_page) < page_size:
                 break
-            start += len(page)
+            start += len(raw_page)  # 向更早历史翻页
         return self._normalize_stock_kline_rows(
             rows=rows,
             source="ex",
@@ -1267,70 +1825,130 @@ class UnifiedTdxClient:
         输入：
         1. source: 数据源标识（std/ex）。
         2. market/code/category: 查询定位参数。
-        3. start/page_size: 分页偏移与页大小（TDX 语义：从最新向更早偏移）。
+        3. start/page_size: 分页偏移与页大小。
         输出：
         1. 原始行字典列表。
         用途：
         1. 为 chunk 级缓存路径提供统一分页抓取入口，并统计网络页调用次数。
+        分页语义（socket 实测，见 scripts/probe_kline_pagination_direction.py）：
+        1. start=0 从「当前最新」一段 bar 起取；start+=len(page) 向更早历史翻页（下一页整体更旧）。
+        2. 单页内时间为升序：page[0] 为本页最老，page[-1] 为本页最新；停止条件用 page[0] 与任务 start_time 比较。
         边界条件：
         1. source 非法时抛 ValueError；空页返回空列表。
         """
         source_key = str(source).strip().lower()
         if source_key == "std":
-            rows = self.std_pool.call(
+            rows = self._pool_call_allow_none_with_same_conn_retry(
+                self.std_pool,
                 "get_security_bars",
                 int(category),
                 int(market),
                 str(code),
                 int(start),
                 int(page_size),
-                allow_none=True,
             )
             return list(rows or [])
         if source_key == "ex":
-            rows = self.ex_pool.call(
+            rows = self._pool_call_allow_none_with_same_conn_retry(
+                self.ex_pool,
                 "get_instrument_bars",
                 int(category),
                 int(market),
                 str(code),
                 int(start),
                 int(page_size),
-                allow_none=True,
             )
             return list(rows or [])
         raise ValueError(f"不支持的 source: {source}")
+
+    def _fetch_index_kline_page_rows_no_df(
+        self,
+        *,
+        route: Dict[str, Any],
+        category: int,
+        start: int,
+        page_size: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        按分页偏移抓取单页指数原始 K 线。
+
+        输入：
+        1. route: 指数路由（source/market/code）。
+        2. category/start/page_size: TDX 分页参数。
+        输出：
+        1. 原始行字典列表。
+        用途：
+        1. 为指数 chunk 级缓存提供统一分页入口。
+        边界条件：
+        1. 路由非法时抛 ValueError；空页返回 []。
+        """
+        source_key = str(route.get("source", "std")).strip().lower()
+        market = int(route.get("market", -1))
+        code = str(route.get("code", "")).strip()
+        if market < 0 or code == "":
+            raise ValueError(f"指数路由配置非法: {route}")
+        if source_key == "std":
+            rows = self._pool_call_allow_none_with_same_conn_retry(
+                self.std_pool,
+                "get_index_bars",
+                int(category),
+                int(market),
+                str(code),
+                int(start),
+                int(page_size),
+            )
+            return list(rows or [])
+        if source_key == "ex":
+            rows = self._pool_call_allow_none_with_same_conn_retry(
+                self.ex_pool,
+                "get_instrument_bars",
+                int(category),
+                int(market),
+                str(code),
+                int(start),
+                int(page_size),
+            )
+            return list(rows or [])
+        raise ValueError(f"不支持的 source: {source_key}")
 
     def _merge_chunk_cache_page_rows(
         self,
         *,
         page_rows: List[Dict[str, Any]],
-        cache_rows: Dict[dt.datetime, Dict[str, Any]],
-    ) -> Optional[dt.datetime]:
-        """
-        合并单页原始 K 线到 chunk 缓存并返回该页最早时间。
+        cache_rows: list,
+        _n_ref: Optional[list] = None,  # [_n] — mutable int via single-element list
+    ) -> Tuple[Optional[dt.datetime], Optional[dt.datetime]]:
+        """Append page rows to cache_rows, bump _n. Return (page_oldest_dt, page_newest_dt).
 
-        输入：
-        1. page_rows: 单页原始K线列表。
-        2. cache_rows: 以 datetime 为键的缓存字典。
-        输出：
-        1. 当前页最早 datetime；无有效行时返回 None。
-        用途：
-        1. 统一处理分页数据去重，并更新“缓存已覆盖到的最早时间”。
-        边界条件：
-        1. 非法 datetime 行会跳过；重复 datetime 后到数据会覆盖先到数据。
+        TDX 分页按 offset 不重叠；页内时间为升序（page[0] 最老、page[-1] 最新）。
+        start 增大表示向更早历史翻页（见 scripts/probe_kline_pagination_direction.py 实测）。
+        Overwrites at cache_rows[_n] if within existing allocation, else .append().
         """
         oldest_dt: Optional[dt.datetime] = None
-        for row in list(page_rows or []):
+        newest_dt: Optional[dt.datetime] = None
+        _n = _n_ref[0] if _n_ref else len(cache_rows)
+        for row in page_rows or []:
             if not isinstance(row, dict):
+                continue
+            if self._is_placeholder_raw_kline_row(row):
                 continue
             try:
                 parsed_dt = self._to_datetime_no_df(row.get("datetime"))
             except Exception:
                 continue
-            cache_rows[parsed_dt] = dict(row)
+            item = (parsed_dt, dict(row))
+            if _n < len(cache_rows):
+                cache_rows[_n] = item
+            else:
+                cache_rows.append(item)
+            _n += 1
             if oldest_dt is None or parsed_dt < oldest_dt:
                 oldest_dt = parsed_dt
-        return oldest_dt
+            if newest_dt is None or parsed_dt > newest_dt:
+                newest_dt = parsed_dt
+        if _n_ref:
+            _n_ref[0] = _n
+        return (oldest_dt, newest_dt)
 
     def _fetch_rows_for_task_with_route_no_df(
         self,
@@ -1450,67 +2068,124 @@ class UnifiedTdxClient:
         max_pages = int(self.pagination.get("max_kline_pages", 300))
         market = int(route.get("market", 0))
 
-        cache_rows: Dict[dt.datetime, Dict[str, Any]] = {}
-        oldest_cached_dt: Optional[dt.datetime] = None
-        page_start = 0
-        fetched_pages = 0
         chunk_hit_tasks = 0
         chunk_network_page_calls = 0
         results: List[Dict[str, Any]] = []
+        normalized_bar_by_dt_key: Dict[str, Dict[str, Any]] = {}
 
-        for task in task_items:
-            try:
-                start_dt = self._to_datetime_no_df(task["start_time"])
-                end_dt = self._to_datetime_no_df(task["end_time"])
-            except Exception as exc:
-                results.append({"task": task, "rows": [], "error": str(exc)[:200]})
-                continue
+        partition = self._shared_chunk_cache.acquire_partition(base_code, base_freq)
+        try:
+            cache_rows = partition["cache_rows"]
+            _n_ref = [partition["_n"]]
+            oldest_cached_dt = partition["oldest_dt"]
+            newest_cached_dt = partition["newest_dt"]
+            page_start = partition["page_start"]
+            fetched_pages = partition["fetched_pages"]
 
-            if start_dt > end_dt:
-                results.append({"task": task, "rows": [], "error": "start_time 不能晚于 end_time"})
-                continue
+            for task in task_items:
+                try:
+                    start_dt = self._to_datetime_no_df(task["start_time"])
+                    end_dt = self._to_datetime_no_df(task["end_time"])
+                except Exception as exc:
+                    results.append({"task": task, "rows": [], "error": str(exc)[:200]})
+                    continue
 
-            before_calls = int(chunk_network_page_calls)
-            while True:
-                covered = oldest_cached_dt is not None and oldest_cached_dt <= start_dt
-                if covered:
-                    break
-                if fetched_pages >= max_pages:
-                    break
-                page_rows = self._fetch_kline_page_rows_no_df(
-                    source=source,
-                    market=market,
-                    code=normalized_code,
-                    category=category,
-                    start=page_start,
-                    page_size=page_size,
-                )
-                fetched_pages += 1
-                chunk_network_page_calls += 1
-                if not page_rows:
-                    break
-                page_oldest = self._merge_chunk_cache_page_rows(page_rows=page_rows, cache_rows=cache_rows)
-                if page_oldest is not None and (oldest_cached_dt is None or page_oldest < oldest_cached_dt):
-                    oldest_cached_dt = page_oldest
-                if len(page_rows) < page_size:
-                    break
-                page_start += len(page_rows)
+                if start_dt > end_dt:
+                    results.append({"task": task, "rows": [], "error": "start_time 不能晚于 end_time"})
+                    continue
 
-            rows = self._normalize_stock_kline_rows(
-                rows=list(cache_rows.values()),
-                source=source,
-                market=market,
-                code=str(normalized_code),
-                freq=base_freq,
-                start_dt=start_dt,
-                end_dt=end_dt,
-            )
-            if int(chunk_network_page_calls) == int(before_calls):
-                chunk_hit_tasks += 1
-            if not rows:
-                results.append({"task": task, "rows": [], "error": "no_data"})
-            else:
-                results.append({"task": task, "rows": rows, "error": None})
+                before_calls = int(chunk_network_page_calls)
+                # 写分区：分页拉取并 merge 进租约分区（仅未命中缓存或需补新页时进入）
+                while True:
+                    covered = oldest_cached_dt is not None and oldest_cached_dt <= start_dt
+                    stale = not self._chunk_cache_covers_end_dt(newest_cached_dt, end_dt, base_freq)
+                    if covered and not stale:
+                        break
+                    if fetched_pages >= max_pages:
+                        break
+                    page_rows = self._fetch_kline_page_rows_no_df(
+                        source=source,
+                        market=market,
+                        code=normalized_code,
+                        category=category,
+                        start=page_start,
+                        page_size=page_size,
+                    )
+                    fetched_pages += 1
+                    chunk_network_page_calls += 1
+                    if not page_rows:
+                        break
+                    page_oldest, page_newest = self._merge_chunk_cache_page_rows(
+                        page_rows=page_rows, cache_rows=cache_rows, _n_ref=_n_ref)
+                    if page_oldest is not None and (oldest_cached_dt is None or page_oldest < oldest_cached_dt):
+                        oldest_cached_dt = page_oldest
+                    if page_newest is not None and (newest_cached_dt is None or page_newest > newest_cached_dt):
+                        newest_cached_dt = page_newest
+                    if (
+                        oldest_cached_dt is not None
+                        and oldest_cached_dt <= start_dt
+                        and not self._chunk_cache_covers_end_dt(newest_cached_dt, end_dt, base_freq)
+                    ):
+                        break
+                    if len(page_rows) < page_size:
+                        break
+                    page_start += len(page_rows)
+
+                # 读分区：仅扫描 [0,_n) 有效槽位，按任务时间窗过滤（不触碰 _n 之后残留槽位）
+                filtered_raw: List[Dict[str, Any]] = []
+                _n = _n_ref[0]
+                for j in range(_n):
+                    dt_key, row = cache_rows[j]
+                    if not isinstance(row, dict):
+                        continue
+                    if dt_key < start_dt or dt_key > end_dt:
+                        continue
+                    filtered_raw.append(row)
+
+                pending_raw = [
+                    row
+                    for row in filtered_raw
+                    if self._dt_key_for_raw_kline_row(row) not in normalized_bar_by_dt_key
+                ]
+                if pending_raw:
+                    newly = self._normalize_stock_kline_rows(
+                        rows=pending_raw,
+                        source=source,
+                        market=market,
+                        code=str(normalized_code),
+                        freq=base_freq,
+                        start_dt=start_dt,
+                        end_dt=end_dt,
+                    )
+                    for nr in newly:
+                        dt_key = self._dt_key_for_raw_kline_row({"datetime": nr.get("datetime")})
+                        if dt_key is not None:
+                            normalized_bar_by_dt_key[dt_key] = nr
+
+                window_keys: List[str] = []
+                seen_window_k: set[str] = set()
+                for row in filtered_raw:
+                    k = self._dt_key_for_raw_kline_row(row)
+                    if k is None or k in seen_window_k:
+                        continue
+                    seen_window_k.add(k)
+                    window_keys.append(k)
+                window_keys.sort()
+                rows = [normalized_bar_by_dt_key[k] for k in window_keys if k in normalized_bar_by_dt_key]
+                if int(chunk_network_page_calls) == int(before_calls):
+                    chunk_hit_tasks += 1
+                if not rows:
+                    results.append({"task": task, "rows": [], "error": "no_data"})
+                else:
+                    results.append({"task": task, "rows": rows, "error": None})
+
+            partition["_n"] = _n_ref[0]
+            partition["oldest_dt"] = oldest_cached_dt
+            partition["newest_dt"] = newest_cached_dt
+            partition["page_start"] = page_start
+            partition["fetched_pages"] = fetched_pages
+        finally:
+            self._shared_chunk_cache.soft_delete(base_code, base_freq)
 
         return {
             "results": results,
@@ -1607,135 +2282,153 @@ class UnifiedTdxClient:
             return {"results": results, "chunk_hit_tasks": 0, "chunk_network_page_calls": 0}
 
         category = self._freq_to_category(base_freq)
-        normalized_freq = self._normalize_freq(base_freq)
+        source = str(route.get("source", "std")).strip().lower()
+        route_code = str(route.get("code", "")).strip()
+        route_name = str(route.get("name", base_index_name)).strip() or base_index_name
         page_size = int(
             self.pagination.get(
-                "standard_kline_page_size" if str(route.get("source", "std")).strip().lower() == "std" else "extended_kline_page_size",
-                800 if str(route.get("source", "std")).strip().lower() == "std" else 700,
+                "standard_kline_page_size" if source == "std" else "extended_kline_page_size",
+                800 if source == "std" else 700,
             )
         )
         max_pages = int(self.pagination.get("max_kline_pages", 300))
 
-        cache_rows: Dict[str, Dict[str, Any]] = {}
-        oldest_cached_dt: Optional[dt.datetime] = None
-        page_start = 0
-        fetched_pages = 0
         chunk_hit_tasks = 0
         chunk_network_page_calls = 0
         results: List[Dict[str, Any]] = []
+        normalized_bar_by_dt_key: Dict[str, Dict[str, Any]] = {}
 
-        def _fetch_one_page(current_route: Dict[str, Any], start: int) -> List[Dict[str, Any]]:
-            source = str(current_route.get("source", "std")).strip().lower()
-            market = int(current_route.get("market", -1))
-            code = str(current_route.get("code", "")).strip()
-            if market < 0 or code == "":
-                raise ValueError(f"指数路由配置非法: {current_route}")
-            if source == "std":
-                return list(
-                    self.std_pool.call(
-                        "get_index_bars",
-                        int(category),
-                        int(market),
-                        str(code),
-                        int(start),
-                        int(page_size),
-                        allow_none=True,
+        partition = self._shared_chunk_cache.acquire_partition(base_index_name, base_freq)
+        try:
+            self._ensure_index_chunk_route_valid(partition, route)
+            cache_rows = partition["cache_rows"]
+            _n_ref = [partition["_n"]]
+            oldest_cached_dt = partition["oldest_dt"]
+            newest_cached_dt = partition["newest_dt"]
+            page_start = partition["page_start"]
+            fetched_pages = partition["fetched_pages"]
+
+            for task in task_items:
+                try:
+                    start_dt = self._to_datetime_no_df(task["start_time"])
+                    end_dt = self._to_datetime_no_df(task["end_time"])
+                except Exception as exc:
+                    results.append({"task": task, "rows": [], "error": str(exc)[:200]})
+                    continue
+                if start_dt > end_dt:
+                    results.append({"task": task, "rows": [], "error": "start_time 不能晚于 end_time"})
+                    continue
+
+                before_calls = int(chunk_network_page_calls)
+                # 写分区：分页拉取并 merge 进租约分区
+                while True:
+                    covered = oldest_cached_dt is not None and oldest_cached_dt <= start_dt
+                    stale = not self._chunk_cache_covers_end_dt(newest_cached_dt, end_dt, base_freq)
+                    if covered and not stale:
+                        break
+                    if fetched_pages >= max_pages:
+                        break
+                    try:
+                        page_rows = self._fetch_index_kline_page_rows_no_df(
+                            route=route,
+                            category=category,
+                            start=page_start,
+                            page_size=page_size,
+                        )
+                    except Exception:
+                        route = self.resolve_index_name(index_name=base_index_name, refresh=True)
+                        self._ensure_index_chunk_route_valid(partition, route)
+                        route_code = str(route.get("code", "")).strip()
+                        route_name = str(route.get("name", base_index_name)).strip() or base_index_name
+                        page_rows = self._fetch_index_kline_page_rows_no_df(
+                            route=route,
+                            category=category,
+                            start=page_start,
+                            page_size=page_size,
+                        )
+                    fetched_pages += 1
+                    chunk_network_page_calls += 1
+                    if not page_rows:
+                        break
+                    page_oldest, page_newest = self._merge_chunk_cache_page_rows(
+                        page_rows=page_rows,
+                        cache_rows=cache_rows,
+                        _n_ref=_n_ref,
                     )
-                    or []
-                )
-            return list(
-                self.ex_pool.call(
-                    "get_instrument_bars",
-                    int(category),
-                    int(market),
-                    str(code),
-                    int(start),
-                    int(page_size),
-                    allow_none=True,
-                )
-                or []
-            )
+                    if page_oldest is not None and (oldest_cached_dt is None or page_oldest < oldest_cached_dt):
+                        oldest_cached_dt = page_oldest
+                    if page_newest is not None and (newest_cached_dt is None or page_newest > newest_cached_dt):
+                        newest_cached_dt = page_newest
+                    if (
+                        oldest_cached_dt is not None
+                        and oldest_cached_dt <= start_dt
+                        and not self._chunk_cache_covers_end_dt(newest_cached_dt, end_dt, base_freq)
+                    ):
+                        break
+                    if (
+                        oldest_cached_dt is not None
+                        and oldest_cached_dt <= start_dt
+                        and self._chunk_cache_covers_end_dt(newest_cached_dt, end_dt, base_freq)
+                    ):
+                        break
+                    if len(page_rows) < page_size:
+                        break
+                    page_start += len(page_rows)
 
-        def _merge_index_cache_page_rows(page_rows: List[Dict[str, Any]]) -> Optional[dt.datetime]:
-            nonlocal cache_rows
-            page_oldest_dt: Optional[dt.datetime] = None
-            route_name = str(route.get("name", base_index_name))
-            route_code = str(route.get("code", ""))
-            for row in page_rows:
-                if not isinstance(row, dict):
-                    continue
-                try:
-                    parsed_dt = self._to_datetime_no_df(row.get("datetime"))
-                except Exception:
-                    continue
-                dt_key = parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
-                vol_v = self._safe_float_no_df(row.get("vol"))
-                trade_v = self._safe_float_no_df(row.get("trade"))
-                volume_v = vol_v if vol_v is not None else trade_v
-                cache_rows[dt_key] = {
-                    "index_name": route_name,
-                    "code": route_code,
-                    "freq": normalized_freq,
-                    "open": self._safe_float_no_df(row.get("open")),
-                    "close": self._safe_float_no_df(row.get("close")),
-                    "high": self._safe_float_no_df(row.get("high")),
-                    "low": self._safe_float_no_df(row.get("low")),
-                    "volume": volume_v,
-                    "amount": self._safe_float_no_df(row.get("amount")),
-                    "datetime": dt_key,
-                }
-                if page_oldest_dt is None or parsed_dt < page_oldest_dt:
-                    page_oldest_dt = parsed_dt
-            return page_oldest_dt
+                # 读分区：仅扫描 [0,_n) 有效槽位，按任务时间窗过滤
+                filtered_raw: List[Dict[str, Any]] = []
+                _n = _n_ref[0]
+                for j in range(_n):
+                    dt_key, row = cache_rows[j]
+                    if not isinstance(row, dict):
+                        continue
+                    if dt_key < start_dt or dt_key > end_dt:
+                        continue
+                    filtered_raw.append(row)
 
-        for task in task_items:
-            try:
-                start_dt = self._to_datetime_no_df(task["start_time"])
-                end_dt = self._to_datetime_no_df(task["end_time"])
-            except Exception as exc:
-                results.append({"task": task, "rows": [], "error": str(exc)[:200]})
-                continue
-            if start_dt > end_dt:
-                results.append({"task": task, "rows": [], "error": "start_time 不能晚于 end_time"})
-                continue
+                pending_raw = [
+                    row
+                    for row in filtered_raw
+                    if self._dt_key_for_raw_kline_row(row) not in normalized_bar_by_dt_key
+                ]
+                if pending_raw:
+                    newly = self._normalize_index_kline_rows(
+                        rows=pending_raw,
+                        index_name=route_name,
+                        route_code=route_code,
+                        freq=base_freq,
+                        start_dt=start_dt,
+                        end_dt=end_dt,
+                    )
+                    for nr in newly:
+                        dt_key = self._dt_key_for_raw_kline_row({"datetime": nr.get("datetime")})
+                        if dt_key is not None:
+                            normalized_bar_by_dt_key[dt_key] = nr
 
-            before_calls = int(chunk_network_page_calls)
-            while True:
-                covered = oldest_cached_dt is not None and oldest_cached_dt <= start_dt
-                if covered:
-                    break
-                if fetched_pages >= max_pages:
-                    break
-                try:
-                    page_rows = _fetch_one_page(route, page_start)
-                except Exception:
-                    route = self.resolve_index_name(index_name=base_index_name, refresh=True)
-                    page_rows = _fetch_one_page(route, page_start)
-                fetched_pages += 1
-                chunk_network_page_calls += 1
-                if not page_rows:
-                    break
-                page_oldest = _merge_index_cache_page_rows(page_rows)
-                if page_oldest is not None and (oldest_cached_dt is None or page_oldest < oldest_cached_dt):
-                    oldest_cached_dt = page_oldest
-                if len(page_rows) < page_size:
-                    break
-                page_start += len(page_rows)
+                window_keys: List[str] = []
+                seen_window_k: set[str] = set()
+                for row in filtered_raw:
+                    k = self._dt_key_for_raw_kline_row(row)
+                    if k is None or k in seen_window_k:
+                        continue
+                    seen_window_k.add(k)
+                    window_keys.append(k)
+                window_keys.sort()
+                task_rows = [normalized_bar_by_dt_key[k] for k in window_keys if k in normalized_bar_by_dt_key]
+                if int(chunk_network_page_calls) == int(before_calls):
+                    chunk_hit_tasks += 1
+                if not task_rows:
+                    results.append({"task": task, "rows": [], "error": "no_data"})
+                else:
+                    results.append({"task": task, "rows": task_rows, "error": None})
 
-            task_rows: List[Dict[str, Any]] = []
-            for dt_key in sorted(cache_rows.keys()):
-                try:
-                    bar_dt = self._to_datetime_no_df(dt_key)
-                except Exception:
-                    continue
-                if start_dt <= bar_dt <= end_dt:
-                    task_rows.append(dict(cache_rows[dt_key]))
-            if int(chunk_network_page_calls) == int(before_calls):
-                chunk_hit_tasks += 1
-            if not task_rows:
-                results.append({"task": task, "rows": [], "error": "no_data"})
-            else:
-                results.append({"task": task, "rows": task_rows, "error": None})
+            partition["_n"] = _n_ref[0]
+            partition["oldest_dt"] = oldest_cached_dt
+            partition["newest_dt"] = newest_cached_dt
+            partition["page_start"] = page_start
+            partition["fetched_pages"] = fetched_pages
+        finally:
+            self._shared_chunk_cache.soft_delete(base_index_name, base_freq)
 
         return {
             "results": results,
@@ -1852,6 +2545,26 @@ class UnifiedTdxClient:
         """输入周期字符串，输出频率字段；用于输出标准化；未知周期回退原值。"""
         p = str(freq).strip().lower()
         return self.FREQ_MAP.get(p, p)
+
+    def _chunk_cache_covers_end_dt(
+        self,
+        newest_cached_dt: Optional[dt.datetime],
+        end_dt: dt.datetime,
+        freq: str,
+    ) -> bool:
+        """
+        输入：缓存最新 bar 时间、任务 end_time、频率。
+        输出：True 表示缓存已覆盖 end_time 所需数据范围。
+        用途：chunk 分页终止；日线/周线/月线按日历日比较，避免 15:00 bar 对 16:00 end 误判 stale。
+        分钟/小时线按完整时刻比较：newest_cached_dt >= end_dt。
+        边界条件：newest_cached_dt 为 None 时返回 False。
+        """
+        if newest_cached_dt is None:
+            return False
+        normalized_freq = self._normalize_freq(freq)
+        if normalized_freq in {"d", "day", "daily", "w", "week", "weekly", "m", "month", "monthly"}:
+            return newest_cached_dt.date() >= end_dt.date()
+        return newest_cached_dt >= end_dt
 
     def _normalize_future_query_code(self, code: Any) -> str:
         """输入期货代码，输出标准化代码；用于容错查询；空代码会抛错。"""
@@ -2605,7 +3318,11 @@ class UnifiedTdxClient:
             pair_to_key = {(int(market), str(code)): key for key, market, code in chunk}
             resolved = set()
             try:
-                rows = self.std_pool.call("get_security_quotes", req, allow_none=True)
+                rows = self._pool_call_allow_none_with_same_conn_retry(
+                    self.std_pool,
+                    "get_security_quotes",
+                    req,
+                )
             except Exception as exc:
                 for key, _, _ in chunk:
                     self._record_failure("stock_latest_price", key, "exception", str(exc))
@@ -2629,7 +3346,12 @@ class UnifiedTdxClient:
 
         for key, market, code in ex_targets:
             try:
-                rows = self.ex_pool.call("get_instrument_quote", int(market), str(code), allow_none=True)
+                rows = self._pool_call_allow_none_with_same_conn_retry(
+                    self.ex_pool,
+                    "get_instrument_quote",
+                    int(market),
+                    str(code),
+                )
             except Exception as exc:
                 self._record_failure("stock_latest_price", key, "exception", str(exc))
                 result[key] = None
@@ -2685,7 +3407,12 @@ class UnifiedTdxClient:
             if canonical_code == "":
                 canonical_code = code
             try:
-                rows = self.ex_pool.call("get_instrument_quote", market, canonical_code, allow_none=True)
+                rows = self._pool_call_allow_none_with_same_conn_retry(
+                    self.ex_pool,
+                    "get_instrument_quote",
+                    market,
+                    canonical_code,
+                )
             except Exception as exc:
                 self._record_failure("future_latest_price", canonical_code, "exception", str(exc))
                 result[canonical_code] = None
@@ -2725,7 +3452,7 @@ class UnifiedTdxClient:
             return pd.DataFrame()
         for col in ["open", "close", "high", "low"]:
             if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
+                df[col] = pd.to_numeric(df[col], errors="coerce")
         df = self._filter_placeholder_ohlc_equal_rows(df)
         if df.empty:
             return pd.DataFrame()
@@ -2752,18 +3479,25 @@ class UnifiedTdxClient:
         start = 0
         rows = []
         for _ in range(max_pages):
-            page = self.std_pool.call(
-                "get_security_bars", category, int(market), str(code), int(start), int(page_size), allow_none=True
+            page = self._pool_call_allow_none_with_same_conn_retry(
+                self.std_pool,
+                "get_security_bars",
+                category,
+                int(market),
+                str(code),
+                int(start),
+                int(page_size),
             )
             if not page:
                 break
-            rows.extend(page)
-            oldest_ts = pd.to_datetime(page[0].get("datetime"), errors="coerce")
+            raw_page = list(page)
+            self._append_raw_kline_page_rows(rows, raw_page)
+            oldest_ts = pd.to_datetime(raw_page[0].get("datetime"), errors="coerce")
             if not pd.isna(oldest_ts) and oldest_ts <= start_ts:
                 break
-            if len(page) < page_size:
+            if len(raw_page) < page_size:
                 break
-            start += len(page)
+            start += len(raw_page)
         market_name = "深圳" if int(market) == 0 else "上海"
         return self._kline_dataframe(rows, code, int(market), market_name, "std", freq, start_ts, end_ts)
 
@@ -2782,18 +3516,25 @@ class UnifiedTdxClient:
         start = 0
         rows = []
         for _ in range(max_pages):
-            page = self.ex_pool.call(
-                "get_instrument_bars", category, int(market), str(code), int(start), int(page_size), allow_none=True
+            page = self._pool_call_allow_none_with_same_conn_retry(
+                self.ex_pool,
+                "get_instrument_bars",
+                category,
+                int(market),
+                str(code),
+                int(start),
+                int(page_size),
             )
             if not page:
                 break
-            rows.extend(page)
-            oldest_ts = pd.to_datetime(page[0].get("datetime"), errors="coerce")
+            raw_page = list(page)
+            self._append_raw_kline_page_rows(rows, raw_page)
+            oldest_ts = pd.to_datetime(raw_page[0].get("datetime"), errors="coerce")
             if not pd.isna(oldest_ts) and oldest_ts <= start_ts:
                 break
-            if len(page) < page_size:
+            if len(raw_page) < page_size:
                 break
-            start += len(page)
+            start += len(raw_page)
         market_name = self._get_ex_market_name(int(market))
         return self._kline_dataframe(rows, code, int(market), market_name, "ex", freq, start_ts, end_ts)
 
@@ -2834,9 +3575,7 @@ class UnifiedTdxClient:
         result["code"] = self._stock_code_with_prefix(source=source, market=market, code=code)
         result["freq"] = self._normalize_freq(freq)
         result = result[base_cols].copy()
-        for col in ["open", "close", "high", "low"]:
-            result[col] = pd.to_numeric(result[col], errors="coerce").round(2)
-        for col in ["volume", "amount"]:
+        for col in ["open", "close", "high", "low", "volume", "amount"]:
             result[col] = pd.to_numeric(result[col], errors="coerce")
         result["datetime"] = pd.to_datetime(result["datetime"], errors="coerce")
         result = result.dropna(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
@@ -2862,9 +3601,8 @@ class UnifiedTdxClient:
         result["freq"] = self._normalize_freq(freq)
         result = result[base_cols].copy()
 
-        for col in ["open", "close", "high", "low", "settlement_price"]:
-            result[col] = pd.to_numeric(result[col], errors="coerce").round(2)
-        result["volume"] = pd.to_numeric(result["volume"], errors="coerce")
+        for col in ["open", "close", "high", "low", "settlement_price", "volume"]:
+            result[col] = pd.to_numeric(result[col], errors="coerce")
         result["datetime"] = pd.to_datetime(result["datetime"], errors="coerce")
         result = result.dropna(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
         return result
@@ -3263,14 +4001,7 @@ class UnifiedTdxClient:
         """输入股票代码和分类列表，输出公司信息；作为公司信息统一别名入口；返回 code/category/content。"""
         return self.get_company_info_content(code=str(code), category=category, return_df=return_df)
 
-    def get_stock_company_info_content(
-        self,
-        code: str,
-        category: Optional[Any] = None,
-        return_df: Optional[bool] = None,
-    ):
-        """输入股票代码和分类列表，输出公司信息；用于单股联调；返回 code/category/content。"""
-        return self.get_company_info_content(code=str(code), category=category, return_df=return_df)
+    get_stock_company_info_content = get_all_company_info_content
 
     def get_failures_df(self) -> pd.DataFrame:
         """输入无，输出失败明细表；用于报告；无失败时返回空表头。"""

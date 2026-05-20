@@ -23,6 +23,13 @@ from zsdtdx.simple_api import (
 from zsdtdx.parallel_fetcher import StockKlineJob
 from zsdtdx.unified_client import UnifiedTdxClient
 
+try:
+    from zsdtdx.unified_client import refresh_tcp_probe_cache_from_config_path
+
+    refresh_tcp_probe_cache_from_config_path(None)
+except Exception:
+    pass
+
 __version__ = "1.4.7"
 
 __all__ = [

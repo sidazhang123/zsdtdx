@@ -353,11 +353,13 @@ class TdxHq_API(BaseSocketClient):
         :param filename the filename to download
         :param filesize the filesize to download , if you do not known the actually filesize, leave this value 0
         """
-        filecontent = bytearray(filesize)
+        filecontent = bytearray()
         current_downloaded_size = 0
         get_zero_length_package_times = 0
         while current_downloaded_size < filesize or filesize == 0:
             response = self.get_report_file(filename, current_downloaded_size)
+            if not response or not isinstance(response, dict):
+                break
             if response["chunksize"] > 0:
                 current_downloaded_size = current_downloaded_size + \
                     response["chunksize"]
@@ -424,5 +426,5 @@ class TdxHq_API(BaseSocketClient):
 
         data = data.assign(date=data['datetime'].apply(lambda x: str(x)[0:10])).assign(code=str(code))\
             .set_index('date', drop=False, inplace=False)\
-            .drop(['year', 'month', 'day', 'hour', 'minute', 'datetime'], axis=1)[start_date:end_date]
+            .drop(['datetime'], axis=1)[start_date:end_date]
         return data.assign(date=data['date'].apply(lambda x: str(x)[0:10]))
