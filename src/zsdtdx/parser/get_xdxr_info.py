@@ -96,9 +96,9 @@ class GetXdXrInfo(BaseParser):
                 return 0
             else:
                 return get_volume(v)
-
+        market, code = struct.unpack(u"<B6s", body_buf[:7])
         for i in range(num):
-            market, code = struct.unpack(u"<B6s", body_buf[:7])
+
             pos += 7
             # noused = struct.unpack(u"<B", body_buf[pos: pos+1])
             pos += 1 #skip a byte

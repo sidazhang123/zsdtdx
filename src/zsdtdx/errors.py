@@ -20,22 +20,21 @@ class TdxConnectionError(Exception):
 
 class TdxFunctionCallError(Exception):
     """
-    当函数调用出错的时候
+    通达信协议层 API 调用失败。
+
+    输入：
+    1. message: 人类可读错误摘要（建议含方法名与端点）。
+    输出：
+    1. 异常实例；`original_exception` 保存底层原因。
+    用途：
+    1. `raise_exception=True` 时由 socket 装饰器抛出，便于日志与上层捕获。
+    边界条件：
+    1. `original_exception` 可能为 None（仅消息、无包装原因时）。
     """
-    def __init__(self, *args, **kwargs):
-        """
-        输入：
-        1. *args: 输入参数，约束以协议定义与函数实现为准。
-        2. **kwargs: 输入参数，约束以协议定义与函数实现为准。
-        输出：
-        1. 返回值语义由函数实现定义；无返回时为 `None`。
-        用途：
-        1. 执行 `__init__` 对应的协议处理、数据解析或调用适配逻辑。
-        边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
-        """
-        super(TdxFunctionCallError, self).__init__(*args, **kwargs)
-        self.original_exception = None
+
+    def __init__(self, message: str = "", *, original_exception: BaseException | None = None):
+        super().__init__(message)
+        self.original_exception = original_exception
 
 
 

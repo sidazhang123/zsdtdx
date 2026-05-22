@@ -108,9 +108,12 @@ def update_last_ack_time(func):
             self.last_transaction_failed = True
             ret = None
             if self.raise_exception:
-                to_raise = TdxFunctionCallError("calling function error")
-                to_raise.original_exception = e
-                raise to_raise
+                method_name = getattr(func, "__name__", "unknown")
+                endpoint = ""
+                if self.ip is not None and self.port is not None:
+                    endpoint = f" @ {self.ip}:{self.port}"
+                message = f"TDX 协议调用失败: {method_name}{endpoint}: {e}"
+                raise TdxFunctionCallError(message, original_exception=e) from e
         return ret
     return wrapper
 
@@ -210,6 +213,13 @@ class BaseSocketClient(object):
             if bindport is not None:
                 self.client.bind((bindip, bindport))
             self.client.connect((ip, port))
+            # D1: 启用 TCP_NODELAY 关闭 Nagle 算法。
+            # K 线分页场景每页响应几十 KB，多请求高频小包；移除 Nagle 等待可降低 ~40ms/页延迟。
+            try:
+                self.client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except (OSError, AttributeError):
+                # TCP_NODELAY 在极少数嵌入式/精简 socket 模块上可能不可用，失败时静默降级。
+                pass
         except socket.timeout:
             # print(str(e))
             log.debug("connection expired")

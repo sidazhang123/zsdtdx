@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.4.8 - 2026-05-22
+
+### Summary
+1. TCP 可用地址探测统一由 `_ensure_availability_hosts_cache` 写入进程内缓存；移除 `pool.probe_on_init`、包 `import` 阶段预热及连接池内探测/shuffle。
+2. `set_config_path` 新增 `async_background_probe`（默认 True）：校验阶段不再构造会触发探测的 `UnifiedTdxClient`；后台或首次建连前完成缓存写入。
+3. 并行 worker 建池前按槽位随机起始下标旋转地址列表；spawn 子进程经 `_seed_probe_result_cache_from_snapshot` 复用槽位列表，禁止 worker 内重复探测。
+4. 连接池恢复策略收敛为固定三步（同连接再试 → 同 host 重连 → rotate 新 host 重复三步），删除 `max_retry` / `same_connection_retry_*` / `same_host_reconnect_*` 等 YAML 开关。
+5. worker/主进程 chunk 并发由 `ThreadPoolExecutor` 改为 `asyncio` 协程 + `to_thread`；配置键 `task_chunk_inproc_future_workers` 更名为 `task_chunk_inproc_coroutine_workers`。
+6. `chunk_timeout_seconds` 语义明确为单次抓取尝试墙钟上限（默认 15s）；`get_future_kline` 遗留并行项标注 `[DEPRECATED-E5]`。
+7. `get_volume` 与 pytdx 按位对齐（含 `dwEdx < 0` 历史分支），修复量价解码偏差；socket 层启用 `TCP_NODELAY`；`TdxFunctionCallError` 携带方法名与端点信息。
+8. 测试布局：`examples/` 大体积基准与演示脚本移除；新增 `tests/test_*.py` 离线验收与 `tests/manual/` 手工脚本；`pyproject.toml` 配置 pytest 与显式 `numpy` 依赖。
+
 ## v1.4.7 - 2026-04-20
 
 ### Summary

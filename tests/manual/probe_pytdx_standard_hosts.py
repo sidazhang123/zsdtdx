@@ -28,8 +28,8 @@ except Exception as exc:  # pragma: no cover - 导入失败为环境问题
     raise RuntimeError("未检测到 pytdx，请先安装 pytdx 后再执行本脚本。") from exc
 
 
-EXAMPLES_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = EXAMPLES_DIR.parent
+MANUAL_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = MANUAL_DIR.parents[1]
 CONFIG_PATH = PROJECT_ROOT / "src" / "zsdtdx" / "config.yaml"
 RESULT_FILENAME = "pytdx_standard_hosts_probe_result.json"
 
@@ -194,7 +194,7 @@ def main() -> None:
     输入：
     1. 无显式输入参数。
     输出：
-    1. 控制台摘要与 `examples/pytdx_standard_hosts_probe_result.json`。
+    1. 控制台摘要与 `tests/manual/pytdx_standard_hosts_probe_result.json`。
     用途：
     1. 提供可重复执行的标准行情 IP 池可用性自测入口。
     边界条件：
@@ -203,7 +203,7 @@ def main() -> None:
     hosts = _load_standard_hosts(CONFIG_PATH)
     report = _build_report(config_path=CONFIG_PATH, hosts=hosts)
 
-    out_path = EXAMPLES_DIR / RESULT_FILENAME
+    out_path = MANUAL_DIR / RESULT_FILENAME
     out_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("=" * 96)

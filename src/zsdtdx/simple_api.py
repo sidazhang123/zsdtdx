@@ -9,10 +9,11 @@
 调用约定：
 1. 程序启动阶段先调用 `set_config_path()` 设置配置路径；后续各接口无需重复传参。
 2. 若未调用 `set_config_path()`，首次调用相关接口会打印提醒并回退到包内默认配置。
-3. 进入 `with get_client():` 后，可在同一个 with 块连续调用多个“主进程 API”（如 `get_supported_markets`、`get_stock_latest_price`、`get_stock_kline(mode="sync")`）复用主进程连接。
+3. `get_stock_kline` / `get_index_kline` 的 sync/async task 路径不要求前置 `with get_client()`（并行层自带连接）；进入 `with get_client():` 后仍可连续调用其它主进程 API（如 `get_supported_markets`）复用主进程连接。
 4. `get_stock_kline(mode="async")` 的数据抓取在并行 worker 进程内执行，worker 会独立创建并复用自己的连接，不复用 `with get_client()` 的主进程连接。
-5. async 模式通过 `job.queue` 持续消费结果，直到收到 `event="done"`。
-6. 对 async 冷启动敏感场景可在启动阶段手动调用 `prewarm_parallel_fetcher()`；异常恢复可调用 `restart_parallel_fetcher()`；进程退出前可调用 `destroy_parallel_fetcher()`。
+5. `get_future_kline` 走主进程 `fetch_stock` → `_fetch_parallel` DataFrame 路径，建议在 `with get_client():` 内调用以复用主进程连接。
+6. async 模式通过 `job.queue` 持续消费结果，直到收到 `event="done"`。
+7. 对 async 冷启动敏感场景可在启动阶段手动调用 `prewarm_parallel_fetcher()`；异常恢复可调用 `restart_parallel_fetcher()`；进程退出前可调用 `destroy_parallel_fetcher()`。
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ from zsdtdx.parallel_fetcher import (
     prewarm_parallel_fetcher as _prewarm_parallel_fetcher,
     set_active_config_path,
 )
-from zsdtdx.unified_client import UnifiedTdxClient, get_probe_result_cache
+from zsdtdx.unified_client import UnifiedTdxClient
 
 _TASK_FREQ_MAP: Dict[str, str] = {
     "d": "d",
@@ -259,12 +260,13 @@ class IndexKlineTask:
         return task
 
 
-def set_config_path(config_path: str) -> str:
+def set_config_path(config_path: str, async_background_probe: bool = True) -> str:
     """
     设置 simple_api 全局配置路径（主进程与并行 worker 统一生效）。
 
     输入:
     - config_path: 配置文件路径（建议在程序启动阶段调用一次）。
+    - async_background_probe: 缓存不可用时是否在后台线程预热 TCP 可用地址缓存。
 
     输出:
     - 解析后的绝对配置路径字符串。
@@ -278,23 +280,12 @@ def set_config_path(config_path: str) -> str:
 
     边界条件:
     - 配置非法时会直接抛出异常，调用方可在启动阶段尽早失败。
+    - async_background_probe=True 时函数立即返回，探测在后台完成。
     """
-    return _apply_active_config_path(config_path=config_path)
-
-
-def _probe_presorted_hosts_or_none() -> Optional[Dict[str, List[Any]]]:
-    """
-    读取 import 阶段填充的 TCP 探测排序结果。
-
-    输入：无。
-    输出：含 standard/extended 的 presorted 字典；缓存为空时返回 None。
-    用途：主进程建连时显式复用探测缓存，避免重复 probe。
-    边界条件：仅读快照，不触发网络探测。
-    """
-    cache = get_probe_result_cache()
-    if cache.get("standard") or cache.get("extended"):
-        return cache
-    return None
+    return _apply_active_config_path(
+        config_path=config_path,
+        async_background_probe=async_background_probe,
+    )
 
 
 def get_client(
@@ -336,10 +327,7 @@ def get_client(
         return active_context_client
 
     new_path = _ensure_active_config_ready(caller_name="get_client")
-    return UnifiedTdxClient(
-        config_path=new_path,
-        presorted_hosts=_probe_presorted_hosts_or_none(),
-    )
+    return UnifiedTdxClient(config_path=new_path)
 
 
 def get_supported_markets(return_df: Optional[bool] = None):
@@ -438,8 +426,8 @@ def get_stock_kline(
     """获取股票 K 线任务结果（任务化输入，支持同步/异步与队列实时回传）。
 
     调用前置约定:
-    - `mode="sync"`：可进入 `with get_client():` 在主进程复用连接并统一资源释放。
-    - `mode="async"`：使用多进程内的独立连接，不依赖get_client()。
+    - `mode="sync"` / `mode="async"`：均不要求前置 `with get_client()`；可选 with 以复用主进程连接并调用其它主进程 API。
+    - `mode="async"`：数据抓取在 worker 进程内执行，不依赖 with 上下文。
     - `preprocessor_operator`：可选钩子，签名 `f(payload)->dict|None`，返回 None 时丢弃该条 data；OHLC/成交额/成交量默认刻度由协议解析层统一完成。
 
     调用示例（写法一：with 主进程上下文 + sync + 其它接口）:
@@ -559,8 +547,8 @@ def get_index_kline(
     获取指数 K 线任务结果（按指数名称输入，支持 sync/async）。
 
     调用前置约定:
-    - `mode="sync"`：走 `ParallelFetcher` 的主进程 inproc chunk 路径；若当前已进入 `with get_client():`，其他主进程 API 仍可继续复用该上下文连接。
-    - `mode="async"`：走 `ParallelFetcher` 的进程池 chunk 路径，worker 会独立创建并复用自己的连接，不依赖 with 上下文。
+    - `mode="sync"` / `mode="async"`：均不要求前置 `with get_client()`；sync 走主进程 inproc chunk 协程路径，async 走进程池 bundle + worker chunk。
+    - 若已进入 `with get_client():`，其它主进程 API 仍可继续复用该上下文连接。
 
     输入:
     - task: 指数任务列表，元素支持 dict 或 `IndexKlineTask`，字段:
@@ -728,17 +716,17 @@ def prewarm_parallel_fetcher() -> Dict[str, Any]:
 
 
 def restart_parallel_fetcher(
-    prewarm: bool = True,
-    prewarm_timeout_seconds: float = 60.0,
-    max_rounds: int = 3,
+    prewarm: Optional[bool] = None,
+    prewarm_timeout_seconds: Optional[float] = None,
+    max_rounds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     强制重启 async 并行抓取进程池（终止旧 worker 并按需预热）。
 
     输入:
-    - prewarm: 重启后是否立即预热新池。
-    - prewarm_timeout_seconds: 重启后预热总超时（秒）。
-    - max_rounds: 重启后预热轮次上限。
+    - prewarm: 重启后是否立即预热新池；None 时默认 True。
+    - prewarm_timeout_seconds: 重启后预热总超时（秒）；None 时从 config 的 parallel.auto_prewarm_timeout_seconds 读取。
+    - max_rounds: 重启后预热轮次上限；None 时从 config 的 parallel.auto_prewarm_max_rounds 读取。
 
     输出:
     - 重启摘要字典（旧 pid、终止结果、预热摘要、耗时等）。
@@ -749,12 +737,25 @@ def restart_parallel_fetcher(
 
     边界条件:
     - 即便旧池不存在也会返回摘要，不抛错。
+    - 未传预热参数时与 prewarm_parallel_fetcher 一样从当前 fetcher 配置读取。
     """
     _ensure_active_config_ready(caller_name="restart_parallel_fetcher")
+    fetcher = get_fetcher()
+    resolved_prewarm = True if prewarm is None else bool(prewarm)
+    resolved_timeout = (
+        float(prewarm_timeout_seconds)
+        if prewarm_timeout_seconds is not None
+        else float(getattr(fetcher, "auto_prewarm_timeout_seconds", 60.0))
+    )
+    resolved_max_rounds = (
+        int(max_rounds)
+        if max_rounds is not None
+        else int(getattr(fetcher, "auto_prewarm_max_rounds", 3))
+    )
     return _force_restart_parallel_fetcher(
-        prewarm=bool(prewarm),
-        prewarm_timeout_seconds=float(prewarm_timeout_seconds),
-        max_rounds=int(max_rounds),
+        prewarm=resolved_prewarm,
+        prewarm_timeout_seconds=resolved_timeout,
+        max_rounds=resolved_max_rounds,
     )
 
 
@@ -787,8 +788,8 @@ def get_future_kline(
     """获取商品期货 K 线（支持多周期并行获取，返回合并后的 DataFrame）。
 
     调用前置约定:
-    - 请先进入 `with get_client():`；
-      一个 with 块内可连续调用多个 `get_*` 函数。
+    - 本接口走主进程 `ParallelKlineFetcher.fetch_stock` → `_fetch_parallel`（DataFrame 批处理），与 `get_stock_kline` task 路径不同。
+    - 建议在 `with get_client():` 内调用以复用主进程连接；超时回收受 `parallel_total_timeout_seconds` 等配置约束。
 
     输入:
     - codes: 期货代码，支持 str/list/tuple/set；代码不含数字会自动补 `L8`（如 `AL` -> `ALL8`）。

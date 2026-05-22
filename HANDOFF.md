@@ -23,21 +23,21 @@
 1. `task`：单个 K 线请求，股票任务字段 `{code,freq,start_time,end_time}`，指数任务字段 `{index_name,freq,start_time,end_time}`。
 2. `chunk`：同 `code+freq` 的 task 集合，按 `start_time` 升序执行。
 3. `bundle`：提交给单个进程池 future 的 chunk 批次。
-4. `inproc future`：worker 进程内的 chunk 线程 future（上限由 `task_chunk_inproc_future_workers` 控制）。
+4. `inproc 协程`：worker/主进程内的 chunk 协程并发（上限由 `task_chunk_inproc_coroutine_workers` 控制）。
 
 ## 4. 关键调用链
 
 1. 用户调用 `simple_api.get_stock_kline(task, mode=...)`。
 2. `parallel_fetcher` 将 task 分组为 chunk，并构建 bundle。
 3. async 模式下，父进程通过 `ProcessPoolExecutor.submit(_fetch_chunk_bundle, ...)` 派发 bundle。
-4. worker 进程内通过 `ThreadPoolExecutor` 并发执行 chunk。
+4. worker 进程内通过 `asyncio` 协程 + `to_thread` 并发执行 chunk（`Semaphore` 上限由 `task_chunk_inproc_coroutine_workers` 控制）。
 5. chunk 内通过 `unified_client.get_stock_kline_rows_for_chunk_tasks(...)` 拉取并复用缓存。
 6. 主进程按 bundle 完成顺序归集结果并写入队列，最终追加 `event=done`。
 7. 指数入口 `simple_api.get_index_kline(task, mode=...)` 现已接入 `ParallelFetcher`：sync 走主进程 inproc chunk，async 走进程池 bundle + worker chunk；chunk 内按 `(index_name, freq)` 分组后顺序调用 `unified_client.get_index_kline_rows_for_task(...)`。
 
 ## 5. sync/async 当前语义
 
-1. sync：主进程内执行，不要求多进程；可启用主进程 chunk 并发（配置控制）。
+1. sync：主进程内执行，不要求多进程，也不要求前置 `with get_client()`（task/chunk 路径自带 worker/主进程连接）；可启用主进程 chunk 协程并发（配置控制）。
 2. sync：返回值为合并后的 `list[payload]`，队列可选。
 3. async：后台任务立即返回 `StockKlineJob`。
 4. async：队列产出粒度为“bundle 回收后逐 payload 写入”，不是 worker 内 chunk 完成即跨进程直推。
@@ -47,20 +47,15 @@
 ## 6. 关键配置项（`config.yaml.parallel`）
 
 1. `task_chunk_cache_min_tasks`
-2. `task_chunk_inproc_future_workers`
+2. `task_chunk_inproc_coroutine_workers`
 3. `task_chunk_max_inflight_multiplier`
 4. `chunk_reconnect_on_unavailable`
-5. `auto_prewarm_on_async`
-6. `auto_prewarm_require_all_workers`
-7. `auto_prewarm_timeout_seconds`
-8. `auto_prewarm_max_rounds`
-9. `auto_prewarm_spread_standard_hosts`
-5. `chunk_reconnect_max_attempts`
-6. `auto_prewarm_on_async`
-7. `auto_prewarm_require_all_workers`
-8. `auto_prewarm_timeout_seconds`
-9. `auto_prewarm_max_rounds`
-10. `auto_prewarm_spread_standard_hosts`
+5. `chunk_timeout_seconds`
+6. `chunk_retry_max_attempts`
+7. `auto_prewarm_on_async`
+8. `auto_prewarm_require_all_workers`
+9. `auto_prewarm_timeout_seconds`
+10. `auto_prewarm_max_rounds`
 11. `index_kline.prefer_ex_markets`
 12. `index_kline.aliases`
 13. `index_kline.lookup`
@@ -75,13 +70,14 @@
 
 1. 连接风险：hosts 不可达会导致全链路失败，先检查 `hosts.*` 连通性与配置内容。
 2. 超时风险：并行总超时触发后会回收未完成 future；确认 `parallel_total_timeout_seconds` 与任务规模匹配。
-3. 吞吐异常：优先检查 `task_chunk_inproc_future_workers`、`task_chunk_max_inflight_multiplier`。
-4. 进程残留：测试脚本结束后应确认无残留 python 进程。
+3. 吞吐异常：优先检查 `task_chunk_inproc_coroutine_workers`、`task_chunk_max_inflight_multiplier`。
+4. `parallel_total_timeout_seconds` 仅用于 `get_future_kline` → `fetch_stock` → `_fetch_parallel`，不用于 task/chunk/bundle K 线路径。
+5. 进程残留：测试脚本结束后应确认无残留 python 进程。
 
 ## 9. 建议回归清单
 
-1. 小样本：`10 code * 2 freq * 3 time` 验证功能正确性。
-2. 中样本：`200 * 5 * 15` 比较 sync/async 总耗时与失败率。
+1. 离线单元/验收：`py -m pytest tests/ -q`（不收集 `tests/manual/`，不依赖真实行情网络）。
+2. 手工脚本清单与命令见 `tests/manual/README.md`（冒烟、单点探测、chunk/弱网离线单测）。
 3. 队列保障：async 消费端用 `timeout=20s` 验证连续返回与 done 收敛。
 
 ## 10. 发布流程（PyPI）

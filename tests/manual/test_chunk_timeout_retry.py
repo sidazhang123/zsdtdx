@@ -9,9 +9,8 @@
 4. shutdown(wait=False)：验证超时后调用方不被 __exit__ 阻塞。
 5. 正常路径：模拟成功场景，验证不触发重试。
 
-运行方式：
-    cd examples
-    python test_chunk_timeout_retry.py
+运行方式（项目根目录）：
+    py tests/manual/test_chunk_timeout_retry.py
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ from typing import Any, Dict, List
 from unittest.mock import MagicMock
 
 # 把 src 加到 path
-sys.path.insert(0, str(os.path.join(os.path.dirname(__file__), "..", "src")))
+sys.path.insert(0, str(os.path.join(os.path.dirname(__file__), "..", "..", "src")))
 
 from zsdtdx.parallel_fetcher import (
     _fetch_one_task_chunk,

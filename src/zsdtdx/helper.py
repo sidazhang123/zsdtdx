@@ -18,25 +18,24 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Type
 
-import six
-
 # imported inside functions to avoid circular dependency
 # from zsdtdx.parallel_fetcher import set_active_config_path
 # from zsdtdx.unified_client import UnifiedTdxClient
 
 
-#### XXX: 分析了一下，貌似是类似utf-8的编码方式保存有符号数字
 def get_price(data, pos):
     """
+    从协议缓冲区解析变长有符号价格（类似 UTF-8 的多字节延续编码）。
+
     输入：
-    1. data: 输入参数，约束以协议定义与函数实现为准。
-    2. pos: 输入参数，约束以协议定义与函数实现为准。
+    1. data: bytes/bytearray 缓冲区。
+    2. pos: 起始下标。
     输出：
-    1. 返回值语义由函数实现定义；无返回时为 `None`。
+    1. `(price, next_pos)`：解析出的有符号整数与下一读取位置。
     用途：
-    1. 执行 `get_price` 对应的协议处理、数据解析或调用适配逻辑。
+    1. K 线等行情字段的增量价格解码。
     边界条件：
-    1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+    1. 缓冲区越界由调用方保证；符号位与延续位按通达信协议约定解析。
     """
     pos_byte = 6
     bdata = indexbytes(data, pos)
@@ -64,7 +63,8 @@ def get_price(data, pos):
     return intdata, pos
 
 
-# P1: pow2 预计算查找表，避免每次 get_volume 调用 pow(2.0, x)
+# pow2 预计算查找表：覆盖 get_volume 中实际访问的全部 exponent 范围。
+# 仅在"已知与 pytdx 数学等价"的分支使用；与 pytdx 行为不一致的分支沿用 pow(2.0,x)。
 _POW2_CACHE_MIN = -300
 _POW2_CACHE_MAX = 600
 _POW2_CACHE: dict = {}
@@ -73,7 +73,22 @@ for _e in range(_POW2_CACHE_MIN, _POW2_CACHE_MAX + 1):
 
 
 def get_volume(ivol):
-    """P1 优化：使用预计算查找表替代 pow(2.0, x) 调用。"""
+    """
+    通达信量能/成交额 IEEE-754-like 解码。
+
+    输入：
+    1. ivol: 4 字节无符号整数（从协议体直接 unpack 出）。
+    输出：
+    1. float，量能/成交额数值。
+    用途：
+    1. K 线 vol 与 amount 的协议出口解码；输出会被 `format_socket_kline_page_inplace`
+       做 `np.rint` 整数化（项目内 schema 设计）。
+    边界条件：
+    1. **行为必须与 pytdx 原版按位等价**——包括 pytdx 在 `dwEdx < 0` 时
+       `1 / pow(2.0, dwEdx) = pow(2.0, -dwEdx)`（与"取倒数"惯例方向相反）这一历史保留特性，
+       否则会让量价偏差几百倍。
+    2. `if hleax > 0x80` 是严格大于；`hleax == 0x80` 必须走 else 分支。
+    """
     logpoint = ivol >> 24
     hleax = (ivol >> 16) & 0xff
     lheax = (ivol >> 8) & 0xff
@@ -84,23 +99,29 @@ def get_volume(ivol):
     esi = (logpoint << 1) - 0x8e
     eax = (logpoint << 1) - 0x96
 
+    # dbl_xmm6 = pow(2.0, |ecx|)；ecx<0 时取倒数（与 pytdx 一致：abs(ecx) 后再倒）。
     abs_ecx = -ecx if ecx < 0 else ecx
     dbl_xmm6 = _POW2_CACHE[abs_ecx]
     if ecx < 0:
         dbl_xmm6 = 1.0 / dbl_xmm6
 
-    hleax_hi = hleax & 0x80
-    if hleax_hi:
+    # hleax 分支：严格 > 0x80 走大分支（pytdx 行为，hleax == 0x80 走 else）。
+    if hleax > 0x80:
+        # pytdx: pow(2, edx) * 128 + (hleax&0x7f) * pow(2, edx+1)；edx 可正可负，缓存覆盖。
         dbl_xmm0 = _POW2_CACHE[edx] * 128.0 + (hleax & 0x7f) * _POW2_CACHE[edx + 1]
     else:
         if edx >= 0:
             dbl_xmm0 = _POW2_CACHE[edx] * hleax
         else:
-            dbl_xmm0 = (1.0 / _POW2_CACHE[-edx]) * hleax
+            # pytdx 历史行为：dwEdx<0 时用 `1/pow(2.0, dwEdx) = pow(2.0, -dwEdx)`。
+            # 这一分支与"取倒数"方向相反，但必须保持以与 pytdx 按位等价。
+            dbl_xmm0 = _POW2_CACHE[-edx] * hleax
 
+    # 末两段 pow 累加：pytdx 在所有分支都直接 pow(2.0, esi)/pow(2.0, eax)，不取倒数。
     dbl_xmm3 = _POW2_CACHE[esi] * lheax
-    dbl_xmm1 = _POW2_CACHE[eax] * lleax if eax >= 0 else (1.0 / _POW2_CACHE[-eax]) * lleax
-    if hleax_hi:
+    dbl_xmm1 = _POW2_CACHE[eax] * lleax
+    # `if hleax & 0x80`：包含 0x80-0xFF（与 pytdx 一致，与上方 `> 0x80` 不冲突）。
+    if hleax & 0x80:
         dbl_xmm3 *= 2.0
         dbl_xmm1 *= 2.0
 
@@ -259,25 +280,20 @@ def get_time(buffer, pos):
     return hour, minute, pos
 
 def indexbytes(data, pos):
+    """
+    读取缓冲区指定下标的单字节（0–255）。
 
-    """
     输入：
-    1. data: 输入参数，约束以协议定义与函数实现为准。
-    2. pos: 输入参数，约束以协议定义与函数实现为准。
+    1. data: bytes 或 bytearray。
+    2. pos: 下标。
     输出：
-    1. 返回值语义由函数实现定义；无返回时为 `None`。
+    1. int，单字节无符号值。
     用途：
-    1. 执行 `indexbytes` 对应的协议处理、数据解析或调用适配逻辑。
+    1. `get_price` 等解码路径的统一字节访问。
     边界条件：
-    1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+    1. 要求 Python 3；越界由调用方保证。
     """
-    if six.PY2:
-        if type(data) is bytearray:
-            return data[pos]
-        else:
-            return six.indexbytes(data, pos)
-    else:
-        return data[pos]
+    return data[pos]
 
 
 def parse_task_datetime(raw_value: Any) -> tuple[datetime, str]:
@@ -498,39 +514,111 @@ _ACTIVE_CONFIG_PATH: Optional[str] = None
 _DEFAULT_CONFIG_NOTICE_PRINTED: bool = False
 
 
-def _apply_active_config_path(config_path: str) -> str:
+def _validate_config_or_raise(cfg: Dict[str, Any], resolved_path: str) -> None:
     """
-    解析并激活 simple_api 的全局配置路径。
+    校验配置文件结构（不触发 TCP 探测或 UnifiedTdxClient 建连）。
 
-    输入:
-    - config_path: 待激活配置路径（支持相对/绝对路径）。
+    输入：
+    1. cfg: 已加载 YAML 字典。
+    2. resolved_path: 解析后的绝对路径（用于错误信息）。
+    输出：无。
+    边界条件：
+    1. standard hosts 缺失或无效时抛出 ValueError。
+    2. extended 配置存在但无效时抛出 ValueError。
+    """
+    from zsdtdx.unified_client import normalize_hosts_entries
 
-    输出:
-    - 解析后的绝对配置路径字符串。
+    if not isinstance(cfg, dict):
+        raise ValueError(f"配置无效（非字典）: {resolved_path}")
 
-    边界条件:
-    - 配置路径不存在、YAML 非法或 hosts 配置无效时会抛出异常。
+    hosts_cfg = cfg.get("hosts", {}) or {}
+    std_raw = hosts_cfg.get("standard", [])
+    if not std_raw:
+        raise ValueError(f"配置缺少 hosts.standard: {resolved_path}")
+    normalize_hosts_entries(std_raw)
+
+    ex_raw = hosts_cfg.get("extended", []) or []
+    if ex_raw:
+        normalize_hosts_entries(ex_raw)
+
+
+def _apply_active_config_path(
+    config_path: str,
+    *,
+    async_background_probe: bool = True,
+) -> str:
+    """
+    解析并激活 simple_api 的全局配置路径，并按需预热 TCP 可用地址缓存。
+
+    输入：
+    1. config_path: 待激活配置路径（支持相对/绝对路径）。
+    2. async_background_probe: True 时后台线程调用 `_ensure_availability_hosts_cache`。
+    输出：
+    1. 解析后的绝对配置路径字符串。
+    边界条件：
+    1. 路径不存在、YAML 非法或 hosts 无效时抛出异常。
+    2. 校验阶段不构造 UnifiedTdxClient，避免同步探测破坏异步语义。
     """
     global _ACTIVE_CONFIG_PATH
+
+    import threading
+
+    import yaml
+    from zsdtdx.parallel_fetcher import set_active_config_path
+    from zsdtdx.unified_client import (
+        _cache_usable_for_cfg,
+        _ensure_availability_hosts_cache,
+        _resolve_zsdtdx_config_path,
+    )
 
     requested = str(config_path or "").strip()
     if requested == "":
         raise ValueError("config_path 不能为空")
 
-    # import here to avoid circular imports
-    from zsdtdx.unified_client import UnifiedTdxClient
-    from zsdtdx.parallel_fetcher import set_active_config_path
+    resolved = _resolve_zsdtdx_config_path(requested)
+    resolved_str = str(resolved.resolve())
+    with open(resolved, "r", encoding="utf-8") as fp:
+        cfg = yaml.safe_load(fp) or {}
 
-    client = UnifiedTdxClient(config_path=requested)
-    resolved_path = str(client.config_path)
-    try:
-        client.close()
-    except Exception:
-        pass
+    _validate_config_or_raise(cfg, resolved_str)
 
-    _ACTIVE_CONFIG_PATH = resolved_path
-    set_active_config_path(resolved_path)
-    return resolved_path
+    _ACTIVE_CONFIG_PATH = resolved_str
+    set_active_config_path(resolved_str)
+
+    if not _cache_usable_for_cfg(cfg):
+        if async_background_probe:
+
+            def _background_ensure() -> None:
+                try:
+                    _ensure_availability_hosts_cache(
+                        config_path=resolved_str,
+                        cfg=cfg,
+                    )
+                except Exception as exc:
+                    from zsdtdx.log import log
+
+                    log.error(
+                        "[set_config_path] 后台 TCP 可用地址探测失败: %s",
+                        exc,
+                    )
+
+            threading.Thread(
+                target=_background_ensure,
+                name="zsdtdx-tcp-probe",
+                daemon=True,
+            ).start()
+        else:
+            try:
+                _ensure_availability_hosts_cache(config_path=resolved_str, cfg=cfg)
+            except Exception as exc:
+                from zsdtdx.log import log
+
+                log.error(
+                    "[set_config_path] 同步 TCP 可用地址探测失败: %s",
+                    exc,
+                )
+
+    return resolved_str
 
 
 def _ensure_active_config_ready(caller_name: str) -> str:

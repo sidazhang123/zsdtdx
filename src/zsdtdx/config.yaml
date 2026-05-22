@@ -45,30 +45,15 @@ pool:
   # 取值: 正浮点数
   # 影响: 值越小故障切换越快，但弱网下误判会增加。
   connect_timeout: 1.5
-  # 封装层单次调用总重试预算（含同连接重试/同host重连/轮换IP）。
-  # 取值: 正整数，建议 >= 1
-  max_retry: 3
-  # 同一连接上的快速重试次数（不重连）。
-  # 取值: 非负整数
-  same_connection_retry_times: 2
-  # 同一连接快速重试间隔（毫秒）。
-  # 取值: 非负整数
-  same_connection_retry_interval_ms: 800
-  # 同一 host 重连尝试次数（disconnect -> connect 同 host）。
-  # 取值: 非负整数
-  same_host_reconnect_times: 3
-  # 同一 host 重连间隔（毫秒）。
-  # 取值: 非负整数
-  same_host_reconnect_interval_ms: 50
+  # 单次 pool.call 固定恢复（无额外 YAML 开关）：
+  # 每 host 三步：请求1 → 同连接再请求1 → 同host重连再请求1；
+  # 多 host 时三步仍失败则 rotate 一次，在新 host 上重复同样三步；
+  # 失败含抛错或 allow_none 时返回 None；最坏 3 次（单 host）或 6 次（多 host）底层请求。
   # 是否开启底层心跳线程。
   # 取值: true/false
   # 影响: true 可降低长时间空闲断连概率。
   heartbeat: false
-  # 首次连接前是否对地址池做 TCP 延迟探测，按延迟排序后优先连最快节点。
-  # 取值: true/false
-  # 影响: true 启动时多约 0.8s 探测耗时，但后续始终连接最快节点。
-  probe_on_init: true
-  # TCP 探测单个 host 的超时（秒）。
+  # TCP 探测单个 host 的超时（秒）；由 _ensure_availability_hosts_cache 在写缓存前使用。
   # 取值: 正浮点数（建议 0.5~2.0）
   # 影响: 值越大能探测到更多高延迟 host，但首次连接等待更久。
   probe_timeout: 0.8
@@ -78,32 +63,31 @@ parallel:
   # 取值: 正浮点数（建议 0.5~3.0）
   # 影响: 倍率越大并发越高，吞吐可能提升，但 CPU/内存占用也会上升。
   process_count_core_multiplier: 5
-  # （仅供 get_future_kline 旧路径 _fetch_parallel 使用，get_stock_kline 的 async/sync 模式不使用）
+  # [DEPRECATED-E5] 以下 4 项仅用于尚未迁移的 get_future_kline → ParallelKlineFetcher.fetch_stock
+  # → _fetch_parallel DataFrame 批处理路径；该路径预计在后续 release 中迁移到 task/chunk/bundle 链路，
+  # 届时本组配置将整体删除。新工程不要在 task 链路上读取这些字段。
   # 单次并行抓取的总超时（秒）。
   # 取值: 正浮点数
   # 影响: 超时后会回收未完成 future，并按策略触发强制回收与串行补拉。
   parallel_total_timeout_seconds: 300
-  # （仅供 get_future_kline 旧路径 _fetch_parallel 使用）
-  # 单个 future.result 的超时（秒）。
+  # [DEPRECATED-E5] 单个 future.result 的超时（秒）。
   # 取值: 正浮点数
   # 影响: 防止 worker 返回阶段异常阻塞。
   parallel_result_timeout_seconds: 600
-  # （仅供 get_future_kline 旧路径 _fetch_parallel 使用）
-  # 总超时后是否触发并行进程强制回收。
+  # [DEPRECATED-E5] 总超时后是否触发并行进程强制回收。
   # 取值: true/false
   force_recycle_on_timeout: true
-  # （仅供 get_future_kline 旧路径 _fetch_parallel 使用）
-  # 总超时后是否对未完成任务回退串行补拉。
+  # [DEPRECATED-E5] 总超时后是否对未完成任务回退串行补拉。
   # 取值: true/false
   timeout_fallback_to_serial: true
   # chunk 级缓存启用阈值（适用于 get_stock_kline(task) / get_index_kline(task) 并行链路）。
   # 取值: 正整数
   # 影响: 当同一 chunk 任务数达到阈值时启用轻量缓存（stock 按 code+freq；index 按 index_name+freq）。
   task_chunk_cache_min_tasks: 2
-  # worker 进程内 chunk 级 future 并发数。
+  # worker/主进程内 chunk 协程并发上限（Semaphore）。
   # 取值: 正整数
-  # 影响: 每个进程一次最多并发执行的 chunk 数。
-  task_chunk_inproc_future_workers: 3
+  # 影响: 每个进程一次最多并发执行的 chunk 数（阻塞 IO 并行度）。
+  task_chunk_inproc_coroutine_workers: 3
   # 父进程提交 chunk 批次的在飞窗口倍率。
   # 取值: 正整数
   # 影响: 在飞 future 上限 = 进程数 × 该倍率。
@@ -112,10 +96,12 @@ parallel:
   # 取值: true/false
   # 影响: true 时可降低长任务尾部因连接失效导致的批量失败。
   chunk_reconnect_on_unavailable: true
-  # 单个 chunk 执行超时（秒）。
+  # 单次 chunk 抓取尝试墙钟上限（秒）：仅约束每一次 get_*_kline_rows_for_chunk_tasks（含该次建连与网络 IO）。
+  # 不含入口归一化失败；不含 bundle 级预热建连；不含重试累计（重试由 chunk_retry_max_attempts 单独控制，每次尝试各算本上限）。
   # 取值: 正浮点数
-  # 影响: 超时后触发 chunk 级重试，重试耗尽后标记该 chunk 所有任务为失败。
-  chunk_timeout_seconds: 30
+  # 影响: 单次尝试超时/失败可触发重试；最坏墙钟约 chunk_timeout_seconds × (1 + chunk_retry_max_attempts)。
+  # 调优指南（D4）: 5s 适合超低延迟内网；公网/弱网建议 15s+，避免短超时频繁触发重连放大尾延迟。
+  chunk_timeout_seconds: 15
   # chunk 超时或报错后的最大重试次数。
   # 取值: 非负整数
   # 影响: 每个 chunk 最多重试 N 次（超时、连接不可用、其他异常均触发），避免无限重试拖慢整体吞吐。

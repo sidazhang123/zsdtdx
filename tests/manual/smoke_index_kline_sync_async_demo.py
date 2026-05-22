@@ -5,7 +5,7 @@
 2. 同时跑 sync 和 async 两种模式，输出总耗时与任务级摘要。
 
 运行方式：
-1. 在项目根目录执行：`py examples/run_index_kline_sync_async_demo.py`
+1. 在项目根目录执行：`py tests/manual/smoke_index_kline_sync_async_demo.py`
 """
 
 from __future__ import annotations

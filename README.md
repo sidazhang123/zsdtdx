@@ -47,11 +47,19 @@ pip install zsdtdx
 
 设置全局配置路径（主进程与并行 worker 统一生效），如不调用则后续函数使用包内默认配置(见文档最后的示例)。
 
+TCP 可用地址探测在后台或首次建连前由 `_ensure_availability_hosts_cache` 统一写入进程内缓存；默认 `async_background_probe=True` 时函数立即返回，不阻塞启动。
+
+**输入:**
+- `config_path`: 配置文件路径。
+- `async_background_probe`: 缓存不可用时是否在后台线程预热（默认 True）；设为 False 则同步探测后再返回。
+
 **调用示例:**
 ```python
 from zsdtdx import set_config_path
 
-set_config_path(r"D:\\configs\\zsdtdx.yaml") 
+set_config_path(r"D:\\configs\\zsdtdx.yaml")
+# 或启动阶段同步等待探测完成：
+# set_config_path(r"D:\\configs\\zsdtdx.yaml", async_background_probe=False)
 call other functions...
 ```
 
@@ -177,8 +185,8 @@ with get_client():
   - `mode="sync"` 且传 queue：返回值仍是完整结果列表，同时会向 queue 增量写入 data/done 事件。
   - `mode="async"` 且不传 queue：函数会自动创建 queue 并挂到返回的 `job.queue`。
   - `mode="async"` 且传 queue：返回的 `job.queue` 即该 queue。
-- preprocessor_operator: 可选预处理函数，签名 `f(payload)->dict|None`；
-  返回 None 或空 dict 时该条结果不入队也不进入返回值。
+- preprocessor_operator: 可选钩子，签名 `f(payload)->dict|None`；
+  返回 None 或空 dict 时该条结果不入队也不进入返回值（默认 OHLC 两位小数、成交额/量为整数由协议解析层统一）。
 - mode: `"sync"` 或 `"async"`，默认 `"async"`。sync 阻塞直到完成；async 立即返回句柄。
 
 **调用示例（写法一：with 主进程上下文 + sync + 其它接口）:**
@@ -263,7 +271,7 @@ finally:
   > ```json
   > {"event": "data",
   >  "task": {"code": "600000", "freq": "d", "start_time": "2026-02-01 09:30:00", "end_time": "2026-02-02 16:00:00"},
-  >  "rows": [{"code": "sh.600000", "freq": "d", "open": 10.07, "close": 10.06, "high": 10.25, "low": 10.03, "volume": 105771232.0, "amount": 1072786048.0, "datetime": "2026-02-02 15:00:00"}],
+  >  "rows": [{"code": "sh.600000", "freq": "d", "open": 10.07, "close": 10.06, "high": 10.25, "low": 10.03, "volume": 105771232, "amount": 1072786048, "datetime": "2026-02-02 15:00:00"}],
   >  "error": null, "worker_pid": 7200}
   > ```
 - 队列最终会额外推送 done 事件:
@@ -281,7 +289,7 @@ finally:
 - task: 任务列表，元素是 `IndexKlineTask` 或 dict，字段:
   `{index_name, freq, start_time, end_time}`。
 - queue: 可选队列，需支持 `put()`。
-- preprocessor_operator: 可选预处理函数，签名 `f(payload)->dict|None`。
+- preprocessor_operator: 可选钩子，签名 `f(payload)->dict|None`（默认数值刻度由协议解析层统一）。
 - mode: `"sync"` 或 `"async"`，默认 `"async"`。
 
 **调用示例:**
@@ -587,25 +595,16 @@ pool:
   # 取值: 正浮点数
   # 影响: 值越小故障切换越快，但弱网下误判会增加。
   connect_timeout: 1.5
-  # 封装层单次调用总重试预算（含同连接重试/同host重连/轮换IP）。
-  # 取值: 正整数，建议 >= 1
-  max_retry: 3
-  # 同一连接上的快速重试次数（不重连）。
-  # 取值: 非负整数
-  same_connection_retry_times: 2
-  # 同一连接快速重试间隔（毫秒）。
-  # 取值: 非负整数
-  same_connection_retry_interval_ms: 800
-  # 同一 host 重连尝试次数（disconnect -> connect 同 host）。
-  # 取值: 非负整数
-  same_host_reconnect_times: 3
-  # 同一 host 重连间隔（毫秒）。
-  # 取值: 非负整数
-  same_host_reconnect_interval_ms: 50
+  # 单次 pool.call 固定恢复（无 YAML 开关）：
+  # 每 host 三步：请求 → 同连接再请求 → 同 host 重连后再请求；
+  # 多 host 时三步仍失败则 rotate 一次，在新 host 上重复同样三步；
+  # 失败含抛错或 allow_none 时返回 None；最坏 3 次（单 host）或 6 次（多 host）底层请求。
   # 是否开启底层心跳线程。
   # 取值: true/false
   # 影响: true 可降低长时间空闲断连概率。
   heartbeat: true
+  # TCP 探测单个 host 的超时（秒）；由 _ensure_availability_hosts_cache 在写缓存前使用。
+  probe_timeout: 0.8
 
 parallel:
   # 并行进程数倍率：推荐进程数 = max(2, int(物理核心数 * 该倍率))。
@@ -633,7 +632,7 @@ parallel:
   # worker 进程内 chunk 级 future 并发数。
   # 取值: 正整数
   # 影响: 每个进程一次最多并发执行的 chunk 数。
-  task_chunk_inproc_future_workers: 3
+  task_chunk_inproc_coroutine_workers: 3
   # 父进程提交 chunk 批次的在飞窗口倍率。
   # 取值: 正整数
   # 影响: 在飞 future 上限 = 进程数 × 该倍率。
@@ -666,10 +665,6 @@ parallel:
   # 取值: 正整数
   # 影响: 每轮会向进程池提交探针任务以拉齐 worker 预热状态。
   auto_prewarm_max_rounds: 3
-  # async 自动预热时是否让各 worker 尽量分散连接到不同标准行情有效 IP。
-  # 取值: true/false
-  # 影响: true 时会先探测标准行情有效 IP，再按 worker 轮询分配，降低单 IP 集中压力。
-  auto_prewarm_spread_standard_hosts: false
 
 pagination:
   # 标准行情 get_security_list 单页数量。
@@ -793,7 +788,7 @@ output:
 - 常用并行配置位于 `config.yaml.parallel`：
   - `process_count_core_multiplier`
   - `task_chunk_cache_min_tasks`
-  - `task_chunk_inproc_future_workers`
+  - `task_chunk_inproc_coroutine_workers`
   - `task_chunk_max_inflight_multiplier`
   - `chunk_reconnect_on_unavailable`
   - `chunk_timeout_seconds`
@@ -802,7 +797,6 @@ output:
   - `auto_prewarm_require_all_workers`
   - `auto_prewarm_timeout_seconds`
   - `auto_prewarm_max_rounds`
-  - `auto_prewarm_spread_standard_hosts`
 
 
 ```

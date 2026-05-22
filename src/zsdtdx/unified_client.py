@@ -6,7 +6,6 @@ import datetime as dt
 import ipaddress
 import json
 import math
-import random
 import re
 import socket as _socket_mod
 import threading
@@ -14,7 +13,7 @@ import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple
 
 import pandas as pd
 import yaml
@@ -31,6 +30,7 @@ from zsdtdx.log import log
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
 _DEFAULT_CONFIG_PATH = _PACKAGE_DIR / "config.yaml"
+_DEFAULT_MAX_KLINE_PAGES = 400
 
 
 def _resolve_zsdtdx_config_path(config_path: Optional[str]) -> Path:
@@ -207,86 +207,345 @@ def _tcp_probe_and_trim_available_hosts(
     return trimmed
 
 
-_last_tcp_probe_hosts_fingerprint: Optional[
-    Tuple[Tuple[Tuple[str, int], ...], Tuple[Tuple[str, int], ...]]
-] = None
-
-
-def refresh_tcp_probe_cache_from_config_path(
-    config_path: Optional[str] = None,
-    *,
-    force: bool = False,
-) -> Dict[str, Any]:
-    """
-    读取配置并对 standard / extended 执行探测、裁剪后写入 `_probe_result_cache`。
-
-    输入：
-    1. config_path: YAML 路径；None 表示包内默认。
-    2. force: True 时忽略指纹短路，强制重新探测。
-    输出：
-    1. 摘要字典（skipped、路径、各级数量等）。
-    用途：
-    1. 包导入、`set_config_path`、建进程池前保证缓存可用。
-    边界条件：
-    1. YAML 无法读取或 hosts 无效时向上抛出；指纹相同且非 force 时不访问网络。
-    """
-    global _last_tcp_probe_hosts_fingerprint
-
-    resolved = _resolve_zsdtdx_config_path(config_path)
-    with open(resolved, "r", encoding="utf-8") as fp:
-        cfg = yaml.safe_load(fp) or {}
-    pool_cfg = cfg.get("pool", {}) or {}
-    probe_on_init_flag = bool(pool_cfg.get("probe_on_init", False))
-    probe_timeout = float(pool_cfg.get("probe_timeout", 0.8))
-
-    std_hosts = normalize_hosts_entries(cfg.get("hosts", {}).get("standard", []))
-    ex_hosts = normalize_hosts_entries(cfg.get("hosts", {}).get("extended", []))
-    fp_new = compute_hosts_fingerprint(std_hosts, ex_hosts)
-
-    with _probe_result_cache_lock:
-        last_fp = _last_tcp_probe_hosts_fingerprint
-        if not force and last_fp is not None and fp_new == last_fp:
-            return {
-                "skipped": True,
-                "config_path": str(resolved),
-                "reason": "hosts_fingerprint_unchanged",
-            }
-
-    if probe_on_init_flag:
-        std_trimmed = _tcp_probe_and_trim_available_hosts(
-            std_hosts, probe_timeout, std_hosts, "standard"
-        )
-        ex_trimmed = _tcp_probe_and_trim_available_hosts(
-            ex_hosts, probe_timeout, ex_hosts, "extended"
-        )
-    else:
-        std_trimmed = list(std_hosts)
-        ex_trimmed = list(ex_hosts)
-
-    with _probe_result_cache_lock:
-        _probe_result_cache["standard"] = list(std_trimmed)
-        _probe_result_cache["extended"] = list(ex_trimmed)
-        _last_tcp_probe_hosts_fingerprint = fp_new
-
-    return {
-        "skipped": False,
-        "config_path": str(resolved),
-        "standard_count": len(std_trimmed),
-        "extended_count": len(ex_trimmed),
-    }
-
-
 # ---------------------------------------------------------------------------
-# TCP 延迟探测：主进程探测结果缓存（供 worker 子进程复用）
+# TCP 延迟探测：进程内可用地址缓存（主进程全量列表；worker 经种子化写入槽位列表）
 # ---------------------------------------------------------------------------
 _probe_result_cache: Dict[str, List[Tuple[str, int]]] = {}
 _probe_result_cache_lock = threading.Lock()
+_last_tcp_probe_hosts_fingerprint: Optional[
+    Tuple[Tuple[Tuple[str, int], ...], Tuple[Tuple[str, int], ...]]
+] = None
+_ensure_availability_lock = threading.Lock()
+_ensure_inflight_event = threading.Event()
+_ensure_inflight_event.set()
 
 
 def get_probe_result_cache() -> Dict[str, List[Tuple[str, int]]]:
-    """返回主进程 TCP 探测排序结果的快照，key 为池名称（standard/extended）。"""
+    """
+    返回当前进程 TCP 探测排序结果快照。
+
+    输入：无。
+    输出：含 standard/extended 列表副本的字典。
+    边界条件：未写入过时可能缺少 key 或为空列表。
+    """
     with _probe_result_cache_lock:
         return {k: list(v) for k, v in _probe_result_cache.items()}
+
+
+def _normalize_hosts_from_cfg(cfg: Dict[str, Any]) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
+    """
+    从配置字典解析 standard / extended 地址列表。
+
+    输入：
+    1. cfg: 已加载 YAML 字典。
+    输出：
+    1. (std_hosts, ex_hosts)；extended 配置为空时 ex_hosts 为 []。
+    边界条件：
+    1. standard 无效或为空时抛出 ValueError。
+    """
+    hosts_cfg = cfg.get("hosts", {}) or {}
+    std_hosts = normalize_hosts_entries(hosts_cfg.get("standard", []))
+    ex_raw = hosts_cfg.get("extended", []) or []
+    if not ex_raw:
+        ex_hosts: List[Tuple[str, int]] = []
+    else:
+        try:
+            ex_hosts = normalize_hosts_entries(ex_raw)
+        except ValueError:
+            ex_hosts = []
+    return std_hosts, ex_hosts
+
+
+def _cache_usable_for_cfg(cfg: Dict[str, Any]) -> bool:
+    """
+    判断当前进程内 `_probe_result_cache` 是否可用于该配置。
+
+    输入：
+    1. cfg: 已加载 YAML 字典。
+    输出：
+    1. True 表示缓存非空且指纹与 cfg 中 hosts 一致。
+    边界条件：
+    1. 配置侧为空的池不要求缓存项；指纹不一致视为不可用。
+    """
+    std_hosts, ex_hosts = _normalize_hosts_from_cfg(cfg)
+    fp_new = compute_hosts_fingerprint(std_hosts, ex_hosts)
+    with _probe_result_cache_lock:
+        if _last_tcp_probe_hosts_fingerprint != fp_new:
+            return False
+        if std_hosts and not _probe_result_cache.get("standard"):
+            return False
+        if ex_hosts and not _probe_result_cache.get("extended"):
+            return False
+        return True
+
+
+def _probe_trim_and_write_availability_cache(
+    std_hosts: List[Tuple[str, int]],
+    ex_hosts: List[Tuple[str, int]],
+    probe_timeout: float,
+) -> Dict[str, List[Tuple[str, int]]]:
+    """
+    对 std/ex 执行 TCP 探测裁剪并写入 `_probe_result_cache`。
+
+    输入：
+    1. std_hosts / ex_hosts: 配置侧规范化地址。
+    2. probe_timeout: 单地址探测超时（秒）。
+    输出：
+    1. 写入后的 standard/extended 列表字典。
+    边界条件：
+    1. 某池配置为空则跳过探测，缓存中不写该 key。
+    """
+    global _last_tcp_probe_hosts_fingerprint
+
+    std_trimmed: List[Tuple[str, int]] = []
+    ex_trimmed: List[Tuple[str, int]] = []
+    if std_hosts:
+        std_trimmed = _tcp_probe_and_trim_available_hosts(
+            std_hosts, probe_timeout, std_hosts, "standard"
+        )
+    if ex_hosts:
+        ex_trimmed = _tcp_probe_and_trim_available_hosts(
+            ex_hosts, probe_timeout, ex_hosts, "extended"
+        )
+    fp_new = compute_hosts_fingerprint(std_hosts, ex_hosts)
+    with _probe_result_cache_lock:
+        if std_trimmed:
+            _probe_result_cache["standard"] = list(std_trimmed)
+        elif not std_hosts:
+            _probe_result_cache.pop("standard", None)
+        if ex_trimmed:
+            _probe_result_cache["extended"] = list(ex_trimmed)
+        elif not ex_hosts:
+            _probe_result_cache.pop("extended", None)
+        _last_tcp_probe_hosts_fingerprint = fp_new
+    return {
+        "standard": list(std_trimmed),
+        "extended": list(ex_trimmed),
+    }
+
+
+def _load_cfg_for_ensure(
+    config_path: Optional[str] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Tuple[Path, Dict[str, Any]]:
+    """
+    为 ensure 解析配置路径并加载 cfg。
+
+    输入：
+    1. config_path: YAML 路径；cfg 非空时可仅用于解析路径。
+    2. cfg: 已加载配置；非空时不再读盘。
+    输出：
+    1. (resolved_path, cfg_dict)。
+    边界条件：
+    1. cfg 与 config_path 均为空时使用包内默认 config.yaml。
+    """
+    if cfg is not None:
+        if config_path is not None and str(config_path).strip():
+            resolved = _resolve_zsdtdx_config_path(config_path)
+        else:
+            resolved = _DEFAULT_CONFIG_PATH.resolve()
+        return resolved, cfg
+    resolved = _resolve_zsdtdx_config_path(config_path)
+    with open(resolved, "r", encoding="utf-8") as fp:
+        loaded = yaml.safe_load(fp) or {}
+    return resolved, loaded
+
+
+def _ensure_availability_hosts_cache(
+    config_path: Optional[str] = None,
+    *,
+    cfg: Optional[Dict[str, Any]] = None,
+    force: bool = False,
+    wait_timeout: float = 120.0,
+) -> Dict[str, Any]:
+    """
+    检查可用地址缓存；不可用时从配置读取 hosts 并探测写入缓存。
+
+    输入：
+    1. config_path: 配置文件路径。
+    2. cfg: 已加载 YAML；优先使用以避免重复读盘。
+    3. force: True 时强制重新探测。
+    4. wait_timeout: single-flight 等待进行中的探测完成的超时（秒）。
+    输出：
+    1. 摘要字典（skipped、config_path、各级数量等）。
+    用途：
+    1. 进程内唯一触发 TCP 探测并写入 `_probe_result_cache` 的入口。
+    边界条件：
+    1. 并发调用时仅一次真实探测，其余等待完成后返回 skipped/结果。
+    """
+    resolved, loaded_cfg = _load_cfg_for_ensure(config_path=config_path, cfg=cfg)
+
+    if not force and _cache_usable_for_cfg(loaded_cfg):
+        return {
+            "skipped": True,
+            "config_path": str(resolved),
+            "reason": "cache_usable",
+        }
+
+    if not _ensure_inflight_event.is_set():
+        if not _ensure_inflight_event.wait(timeout=max(1.0, float(wait_timeout))):
+            raise TimeoutError("等待可用地址缓存探测完成超时")
+        if not force and _cache_usable_for_cfg(loaded_cfg):
+            return {
+                "skipped": True,
+                "config_path": str(resolved),
+                "reason": "cache_usable_after_wait",
+            }
+
+    with _ensure_availability_lock:
+        if not force and _cache_usable_for_cfg(loaded_cfg):
+            return {
+                "skipped": True,
+                "config_path": str(resolved),
+                "reason": "cache_usable",
+            }
+        if not _ensure_inflight_event.is_set():
+            _ensure_inflight_event.wait(timeout=max(1.0, float(wait_timeout)))
+            if not force and _cache_usable_for_cfg(loaded_cfg):
+                return {
+                    "skipped": True,
+                    "config_path": str(resolved),
+                    "reason": "cache_usable_after_wait",
+                }
+        _ensure_inflight_event.clear()
+
+    try:
+        pool_cfg = loaded_cfg.get("pool", {}) or {}
+        probe_timeout = float(pool_cfg.get("probe_timeout", 0.8))
+        std_hosts, ex_hosts = _normalize_hosts_from_cfg(loaded_cfg)
+        trimmed = _probe_trim_and_write_availability_cache(std_hosts, ex_hosts, probe_timeout)
+        return {
+            "skipped": False,
+            "config_path": str(resolved),
+            "standard_count": len(trimmed.get("standard") or []),
+            "extended_count": len(trimmed.get("extended") or []),
+        }
+    finally:
+        _ensure_inflight_event.set()
+
+
+def _presorted_hosts_valid(presorted: Optional[Dict[str, Any]]) -> bool:
+    """
+    判断 presorted_hosts 是否可作为建连用的有效快照。
+
+    输入：
+    1. presorted: 含 standard/extended 的字典。
+    输出：
+    1. True 表示至少一侧有非空列表。
+    边界条件：
+    1. 空列表或缺 key 视为无效。
+    """
+    if not isinstance(presorted, dict) or not presorted:
+        return False
+    std_list = presorted.get("standard")
+    ex_list = presorted.get("extended")
+    if isinstance(std_list, list) and len(std_list) > 0:
+        return True
+    if isinstance(ex_list, list) and len(ex_list) > 0:
+        return True
+    return False
+
+
+def resolve_presorted_hosts_for_connection(
+    config_path: Optional[str] = None,
+    *,
+    cfg: Optional[Dict[str, Any]] = None,
+    presorted_hosts: Optional[Dict[str, List[Tuple[str, int]]]] = None,
+    sync_if_missing: bool = True,
+) -> Dict[str, List[Tuple[str, int]]]:
+    """
+    解析建连用的 standard/extended 地址列表。
+
+    输入：
+    1. config_path / cfg: 配置来源。
+    2. presorted_hosts: worker 槽位列表等调用方已有快照。
+    3. sync_if_missing: True 时缓存不可用则调用 ensure；False 时不可用则抛错。
+    输出：
+    1. 含 standard/extended 列表的字典（副本）。
+    用途：
+    1. UnifiedTdxClient 与 worker 建连前统一取址。
+    边界条件：
+    1. worker 应传入有效 presorted_hosts 且 sync_if_missing=False，避免子进程探测。
+    """
+    if _presorted_hosts_valid(presorted_hosts):
+        presorted_map = dict(presorted_hosts or {})
+        return {
+            "standard": list(presorted_map.get("standard") or []),
+            "extended": list(presorted_map.get("extended") or []),
+        }
+
+    if cfg is None and config_path is not None:
+        _, cfg = _load_cfg_for_ensure(config_path=config_path)
+    elif cfg is None:
+        _, cfg = _load_cfg_for_ensure(config_path=None)
+
+    if _cache_usable_for_cfg(cfg):
+        cache = get_probe_result_cache()
+        return {
+            "standard": list(cache.get("standard") or []),
+            "extended": list(cache.get("extended") or []),
+        }
+
+    if not sync_if_missing:
+        raise RuntimeError(
+            "可用地址缓存不可用且 sync_if_missing=False，"
+            "请先在主进程调用 set_config_path 或 _ensure_availability_hosts_cache"
+        )
+
+    _ensure_availability_hosts_cache(config_path=config_path, cfg=cfg)
+    cache = get_probe_result_cache()
+    return {
+        "standard": list(cache.get("standard") or []),
+        "extended": list(cache.get("extended") or []),
+    }
+
+
+def _seed_probe_result_cache_from_snapshot(
+    snapshot: Dict[str, List[Tuple[str, int]]],
+    fingerprint: Tuple[Tuple[Tuple[str, int], ...], Tuple[Tuple[str, int], ...]],
+) -> None:
+    """
+    将快照写入当前进程 `_probe_result_cache`（供 worker 子进程使用）。
+
+    输入：
+    1. snapshot: 槽位旋转后的 standard/extended 列表。
+    2. fingerprint: 与主进程一致的 hosts 指纹。
+    输出：无。
+    边界条件：
+    1. 不触发网络探测；仅内存写入。
+    """
+    global _last_tcp_probe_hosts_fingerprint
+
+    with _probe_result_cache_lock:
+        _probe_result_cache.clear()
+        std_list = snapshot.get("standard")
+        ex_list = snapshot.get("extended")
+        if isinstance(std_list, list) and std_list:
+            _probe_result_cache["standard"] = list(std_list)
+        if isinstance(ex_list, list) and ex_list:
+            _probe_result_cache["extended"] = list(ex_list)
+        _last_tcp_probe_hosts_fingerprint = fingerprint
+
+
+def rotate_hosts_list(
+    hosts: List[Tuple[str, int]],
+    start_index: int,
+) -> List[Tuple[str, int]]:
+    """
+    对地址列表做循环旋转，用于 worker 槽位起始下标分配。
+
+    输入：
+    1. hosts: 全量探测排序列表。
+    2. start_index: 起始下标（可大于 len-1，自动取模）。
+    输出：
+    1. 旋转后的新列表。
+    边界条件：
+    1. hosts 为空时返回 []。
+    """
+    if not hosts:
+        return []
+    k = int(start_index) % len(hosts)
+    return list(hosts[k:]) + list(hosts[:k])
 
 
 def _tcp_probe_one(host: str, port: int, timeout: float) -> Tuple[Tuple[str, int], Optional[float]]:
@@ -316,42 +575,26 @@ class PersistentFailoverPool:
         api_cls,
         hosts: List[Tuple[str, int]],
         connect_timeout: float,
-        max_retry: int,
-        same_connection_retry_times: int = 2,
-        same_connection_retry_interval_ms: int = 100,
-        same_host_reconnect_times: int = 1,
-        same_host_reconnect_interval_ms: int = 200,
         api_kwargs: Optional[Dict[str, Any]] = None,
-        probe_on_init: bool = False,
-        probe_timeout: float = 0.8,
-        presorted_hosts: Optional[List[Tuple[str, int]]] = None,
-        shuffle_initial_connect_order: bool = False,
     ):
-        """输入连接参数，输出连接池实例；用于稳定调用；host 为空会抛错。"""
+        """
+        输入连接参数，输出连接池实例。
+
+        输入：
+        1. hosts: 建连用的 (host, port) 列表（须来自缓存或槽位分配，已排序）。
+        输出：
+        1. PersistentFailoverPool 实例。
+        边界条件：
+        1. hosts 为空时抛出 ValueError。
+        2. 单次 call 单 host 最多 3 次、多 host 最多 6 次请求（见 call 方法注释），无 YAML 重试参数。
+        """
         if not hosts:
             raise ValueError(f"{name} host 列表为空")
         self.name = name
         self.api_cls = api_cls
-        self._fallback_hosts_order = list(hosts)
-        self.hosts = hosts
+        self.hosts = list(hosts)
         self.connect_timeout = float(connect_timeout)
-        self.max_retry = int(max_retry)
-        self.same_connection_retry_times = max(0, int(same_connection_retry_times))
-        self.same_connection_retry_interval = max(0.0, float(same_connection_retry_interval_ms) / 1000.0)
-        self.same_host_reconnect_times = max(0, int(same_host_reconnect_times))
-        self.same_host_reconnect_interval = max(0.0, float(same_host_reconnect_interval_ms) / 1000.0)
         self.api_kwargs = api_kwargs or {}
-
-        # TCP 延迟探测参数
-        self.probe_on_init = bool(probe_on_init)
-        self.probe_timeout = float(probe_timeout)
-        self._hosts_probed = False
-        self.shuffle_initial_connect_order = bool(shuffle_initial_connect_order)
-
-        # 若调用方已提供排序结果（worker 子进程场景），直接使用
-        if presorted_hosts is not None:
-            self.hosts = list(presorted_hosts)
-            self._hosts_probed = True
 
         # P0改造：线程本地存储
         self._local = threading.local()
@@ -480,26 +723,19 @@ class PersistentFailoverPool:
         return True
 
     def _ensure_connected(self) -> bool:
-        """输入无，输出连接是否可用；用于请求前检查；全部不可用返回 False。"""
+        """
+        输入无，输出连接是否可用；按 hosts 下标 0→n 顺序尝试建连。
+
+        输入：无。
+        输出：
+        1. True 表示至少一个 host 连接成功。
+        边界条件：
+        1. 全部失败返回 False；不在池内做 TCP 探测。
+        """
         thread_data = self._get_thread_data()
         if thread_data['api'] is not None and thread_data['active_index'] >= 0:
             return True
-        # 首次连接前做 TCP 延迟探测排序（仅一次）
-        if self.probe_on_init and not self._hosts_probed:
-            self._hosts_probed = True
-            trimmed = _tcp_probe_and_trim_available_hosts(
-                self.hosts,
-                self.probe_timeout,
-                self._fallback_hosts_order,
-                self.name,
-            )
-            self.hosts = trimmed
-            with _probe_result_cache_lock:
-                _probe_result_cache[self.name] = list(self.hosts)
-        indices = list(range(len(self.hosts)))
-        if self.shuffle_initial_connect_order:
-            random.shuffle(indices)
-        for index in indices:
+        for index in range(len(self.hosts)):
             if self._connect_to_index(index):
                 return True
         return False
@@ -507,6 +743,56 @@ class PersistentFailoverPool:
     def ensure_connected(self) -> bool:
         """输入无，输出连接是否可用；用于外部预连接；失败返回 False。"""
         return self._ensure_connected()
+
+    def set_thread_socket_read_timeout(self, timeout_seconds: float) -> None:
+        """
+        设置当前线程活跃连接的 socket 读超时。
+
+        输入：
+        1. timeout_seconds: 读超时秒数。
+        输出：
+        1. 无返回值。
+        用途：
+        1. chunk 单次抓取尝试超时时，使阻塞 recv 能在该次剩余预算内结束。
+        边界条件：
+        1. 无活跃连接时静默跳过。
+        """
+        data = self._get_thread_data()
+        api_obj = data.get("api")
+        if api_obj is None:
+            return
+        sock_client = getattr(api_obj, "client", None)
+        if sock_client is None:
+            return
+        try:
+            sock_client.settimeout(max(0.1, float(timeout_seconds)))
+        except Exception:
+            pass
+
+    def restore_thread_socket_read_timeout(self) -> None:
+        """
+        D3 优化：将当前线程活跃连接的 socket 读超时还原为 pool 默认。
+
+        输入：1. 无显式输入参数。
+        输出：1. 无返回值。
+        用途：
+        1. chunk 结束 finally 分支调用，避免短超时残留影响心跳/后续 chunk 读路径。
+        边界条件：
+        1. 无活跃连接时静默跳过；pool 没有显式 default 时使用 BaseSocketClient.CONNECT_TIMEOUT(5)。
+        """
+        data = self._get_thread_data()
+        api_obj = data.get("api")
+        if api_obj is None:
+            return
+        sock_client = getattr(api_obj, "client", None)
+        if sock_client is None:
+            return
+        # 还原默认值：从 pool 实例属性读取（如有），否则使用 socket 模块默认 None（阻塞）。
+        default_timeout = getattr(self, "_default_socket_read_timeout", None)
+        try:
+            sock_client.settimeout(default_timeout)
+        except Exception:
+            pass
 
     def reset_thread_connection(self, reconnect: bool = True) -> bool:
         """
@@ -556,120 +842,141 @@ class PersistentFailoverPool:
             self._global_stats["same_host_reconnects"] += 1
         return self._connect_to_index(thread_data['active_index'])
 
-    def _invoke(self, method_name: str, allow_none: bool, *args, **kwargs):
-        """输入方法参数，输出调用结果；用于统一单次调用；None 按 allow_none 处理。"""
-        thread_data = self._get_thread_data()
-        result = getattr(thread_data['api'], method_name)(*args, **kwargs)
-        if result is None:
-            if allow_none:
-                with self._stats_lock:
-                    self._global_stats["none_as_end"] += 1
-                return None
-            raise RuntimeError(f"{self.name}.{method_name} 返回 None")
-        return result
-
-    def _call_with_none_same_connection_confirm(self, method_name: str, *args, **kwargs):
+    def _attempt_call_step(
+        self,
+        method_name: str,
+        allow_none: bool,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Tuple[Any, Optional[Exception], bool]:
         """
-        对 socket 失败返回 None 的场景做同连接立刻确认重试（仅 1 次）。
+        执行一次底层 API 请求。
 
         输入：
         1. method_name: API 方法名。
-        2. *args/**kwargs: 透传到底层 API。
+        2. allow_none: 是否允许 None 作为合法返回值。
         输出：
-        1. 非 None 结果（含空列表 []）；确认后仍为 None 则返回 None。
+        1. (result, exception, needs_retry) 三元组。
         用途：
-        1. 供 K 线/最新价等 allow_none 路径吸收瞬态抖动，不触发 reconnect/rotate。
+        1. 供 call 单 host 三步流水线逐步调用。
         边界条件：
-        1. 须已 ensure_connected；API 抛错向上冒泡，不按 None 失败处理。
-        2. 不使用 interval sleep；至多 2 次直调（初调 + 1 次确认）。
+        1. 抛错或（allow_none 且返回 None）视为 needs_retry=True。
+        2. 空列表等非 None 结果视为成功。
         """
         thread_data = self._get_thread_data()
-        api = thread_data["api"]
+        api = thread_data.get("api")
         if api is None:
-            raise RuntimeError(f"{self.name} 无可用连接")
+            return None, RuntimeError(f"{self.name} 无可用连接"), True
+        try:
+            result = getattr(api, method_name)(*args, **kwargs)
+        except Exception as exc:
+            return None, exc, True
+        if result is None:
+            if allow_none:
+                return None, None, True
+            return None, RuntimeError(f"{self.name}.{method_name} 返回 None"), True
+        return result, None, False
 
-        result = getattr(api, method_name)(*args, **kwargs)
-        if result is not None:
-            return result
+    def _run_host_call_ladder(
+        self,
+        method_name: str,
+        allow_none: bool,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Tuple[Any, Optional[Exception], bool]:
+        """
+        在当前 host 上执行固定三步：请求 → 同连接再请求 → 同 host 重连后再请求。
+
+        输入：
+        1. method_name: API 方法名。
+        2. allow_none: 是否允许 None 作为合法返回值。
+        输出：
+        1. (result, last_exception, succeeded) 三元组。
+        用途：
+        1. 供 call 在当前 host 与 rotate 后的 host 各执行一轮。
+        边界条件：
+        1. 单轮最多 3 次底层请求；成功时 succeeded=True 且 result 有效。
+        """
+        last_exception: Optional[Exception] = None
+
+        def _remember_failure(exc: Optional[Exception]) -> None:
+            nonlocal last_exception
+            if exc is not None:
+                last_exception = exc
+
+        result, exc, needs_retry = self._attempt_call_step(
+            method_name, allow_none, *args, **kwargs
+        )
+        if not needs_retry:
+            return result, None, True
+        _remember_failure(exc)
 
         with self._stats_lock:
             self._global_stats["same_conn_retries"] += 1
+            self._global_stats["retries"] += 1
+        result, exc, needs_retry = self._attempt_call_step(
+            method_name, allow_none, *args, **kwargs
+        )
+        if not needs_retry:
+            return result, None, True
+        _remember_failure(exc)
 
-        result = getattr(api, method_name)(*args, **kwargs)
-        if result is not None:
-            return result
+        if self._reconnect_active_host():
+            with self._stats_lock:
+                self._global_stats["retries"] += 1
+            result, exc, needs_retry = self._attempt_call_step(
+                method_name, allow_none, *args, **kwargs
+            )
+            if not needs_retry:
+                return result, None, True
+            _remember_failure(exc)
+        else:
+            with self._stats_lock:
+                self._global_stats["retries"] += 1
 
-        with self._stats_lock:
-            self._global_stats["none_as_end"] += 1
-        return None
+        return None, last_exception, False
 
     def call(
         self,
         method_name: str,
         *args,
         allow_none: bool = False,
-        retry_none_with_same_connection: bool = False,
         **kwargs,
     ):
-        """输入方法与参数，输出调用结果；用于粘滞重试；优先保当前连接，最后才轮换 IP。"""
+        """
+        输入方法与参数，输出调用结果；固定 host 内三步 + 可选换 host 再走三步。
+
+        单 host 流水线（无 sleep，最多 3 次请求）：
+        1. 当前连接请求 1 次；
+        2. 失败则同连接再请求 1 次；
+        3. 仍失败则同 host 重连后再请求 1 次。
+
+        多 host：上述三步失败后 rotate 一次，在新 host 上重复同样三步（最多再 3 次）。
+
+        失败定义：抛错，或 allow_none=True 时返回 None。
+        最坏情况：单 host 3 次请求；多 host 6 次请求后返回失败。
+        """
+
         with self._stats_lock:
             self._global_stats["total_calls"] += 1
         if not self._ensure_connected():
             raise RuntimeError(f"{self.name} 无可用连接")
 
-        if bool(retry_none_with_same_connection) and bool(allow_none):
-            return self._call_with_none_same_connection_confirm(method_name, *args, **kwargs)
+        result, last_exception, succeeded = self._run_host_call_ladder(
+            method_name, allow_none, *args, **kwargs
+        )
+        if succeeded:
+            return result
 
-        last_exception = None
-        total_budget = max(1, self.max_retry)
-        consumed_budget = 0
+        if len(self.hosts) > 1 and self._rotate():
+            result, rotate_exc, succeeded = self._run_host_call_ladder(
+                method_name, allow_none, *args, **kwargs
+            )
+            if succeeded:
+                return result
+            if rotate_exc is not None:
+                last_exception = rotate_exc
 
-        while consumed_budget < total_budget:
-            max_same_conn_try = 1 + self.same_connection_retry_times
-            for idx in range(max_same_conn_try):
-                try:
-                    return self._invoke(method_name, allow_none, *args, **kwargs)
-                except Exception as exc:
-                    last_exception = exc
-                    consumed_budget += 1
-                    with self._stats_lock:
-                        self._global_stats["retries"] += 1
-                    if consumed_budget >= total_budget:
-                        break
-                    if idx < max_same_conn_try - 1:
-                        with self._stats_lock:
-                            self._global_stats["same_conn_retries"] += 1
-                        if self.same_connection_retry_interval > 0:
-                            time.sleep(self.same_connection_retry_interval)
-            if consumed_budget >= total_budget:
-                break
-
-            reconnected = False
-            for idx in range(self.same_host_reconnect_times):
-                if self.same_host_reconnect_interval > 0 and idx > 0:
-                    time.sleep(self.same_host_reconnect_interval)
-                if not self._reconnect_active_host():
-                    continue
-                reconnected = True
-                try:
-                    return self._invoke(method_name, allow_none, *args, **kwargs)
-                except Exception as exc:
-                    last_exception = exc
-                    consumed_budget += 1
-                    with self._stats_lock:
-                        self._global_stats["retries"] += 1
-                    if consumed_budget >= total_budget:
-                        break
-            if consumed_budget >= total_budget:
-                break
-
-            if not self._rotate():
-                if not reconnected:
-                    break
-                break
-
-        # allow_none 仅用于“目标接口确实返回 None”场景；
-        # 若本次调用链发生了真实异常（last_exception 非空），不能吞错返回 None。
         if allow_none and last_exception is None:
             with self._stats_lock:
                 self._global_stats["none_as_end"] += 1
@@ -734,69 +1041,66 @@ class PersistentFailoverPool:
             data["active_index"] = -1
 
 
-class SharedChunkCache:
-    """二维分区池：_free 软复用 + 线程租约（acquire / soft_delete）。
+class ChunkLocalRowCache:
+    """单进程内的 chunk 级行缓存：每次 chunk 入口新建分区，chunk 出口释放。
 
-    - cache_rows：有序 list[(dt_key, row)]；_n 为有效下标（不 list.clear，覆写槽位，靠 _n 防脏读）。
-    - acquire_partition：从 _free 取可复用分区或新建，绑定当前线程租约；跨 (code,freq) 时重置 _n/游标。
+    设计要点：
+    1. **无锁**：移除原 `_pool_lock` 与 `threading.local` 租约；同进程同 chunk 内的访问天然串行（async 路径
+       下每个 chunk 在 `asyncio.to_thread` worker 内独立运行；sync 路径单线程顺序执行）。
+    2. **无 free 池**：移除分区软复用，避免跨 chunk 复用 list 槽位的复杂性；分区由 Python GC 在 chunk 结束后回收。
+    3. **API 兼容**：保留 `acquire_partition` / `soft_delete` / `get_partition` 调用契约，外部调用零改动。
+    4. **命中率统计**：保留 partition 的 `_partition_key/_n/oldest_dt/newest_dt/page_start/fetched_pages`
+       字段集与 SharedChunkCache 完全一致，外层调用方逻辑透明迁移。
+
+    - cache_rows：有序 list[(dt_key, row)]，按时间升序追加；_n 为有效下标（chunk 内单调递增）。
+    - acquire_partition：返回该 chunk 的私有分区；同一 chunk 内重复 acquire 等价（返回同一对象）。
     - chunk 内：首次分页填充为写分区（merge 增 _n）；后续 task 命中缓存为读分区（range(_n) 过滤）。
-    - soft_delete：解除租约并归还 _free，供任意线程下次 acquire；读写期外仅 _free 有锁。
+    - soft_delete：清除分区引用，让 GC 回收；不再有内存复用语义。
     """
 
     def __init__(self):
-        self._free: List[Dict[str, Any]] = []
-        self._pool_lock = threading.Lock()
-        self._local = threading.local()
+        # 当前 chunk 持有的分区（同进程内最多 1 个；async 路径每个协程独立 to_thread 不会重叠）。
+        # 用 dict 表存 (partition_key -> partition) 以支持理论上的并发；实际只会有 1 个 entry。
+        self._partitions: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
-    def _new_partition() -> Dict[str, Any]:
+    def _new_partition(partition_key: str) -> Dict[str, Any]:
+        """构造一个空分区，字段与原 SharedChunkCache._new_partition 一致以保持上层兼容。"""
         return {
             "cache_rows": [],
             "_n": 0,
-            "_partition_key": "",
+            "_partition_key": partition_key,
             "oldest_dt": None,
             "newest_dt": None,
             "page_start": 0,
             "fetched_pages": 0,
         }
 
-    @staticmethod
-    def _reset_partition_for_key(partition: Dict[str, Any], partition_key: str) -> None:
-        partition["_n"] = 0
-        partition["oldest_dt"] = None
-        partition["newest_dt"] = None
-        partition["page_start"] = 0
-        partition["fetched_pages"] = 0
-        partition["_partition_key"] = partition_key
-
     def acquire_partition(self, code: str, freq: str) -> Dict[str, Any]:
-        """输入 code/freq，输出当前线程租约分区；chunk 入口调用一次，chunk 内只读/写该对象。
+        """输入 code/freq，输出 chunk 私有分区。
 
-        每次 acquire 均归零 _n/游标（新 chunk 可见范围）；仅保留 cache_rows 底层槽位供覆写。
-        跨 (code,freq) 时更新 _partition_key；同 key 从 _free 复用也只复用内存，不继承上一 chunk 可见长度。
+        输入：
+        1. code/freq: 分区 key 维度。
+        输出：
+        1. 全新或已有的分区 dict（_n 归零、oldest/newest/page_start/fetched_pages 归零）。
+        用途：
+        1. chunk 入口处调用一次；chunk 内只读/写该对象。
+        边界条件：
+        1. 同 chunk 内对同 (code,freq) 重复 acquire 返回同一分区（幂等）。
+        2. 跨 chunk 之间不复用内存：上一 chunk 的 list 在 soft_delete 后被丢弃。
         """
         partition_key = f"{code}|{freq}"
-        leased = getattr(self._local, "lease", None)
-        if leased is not None:
-            if leased.get("_partition_key") != partition_key:
-                raise RuntimeError(
-                    f"线程已有未释放分区租约: {leased.get('_partition_key')}，不能再 acquire {partition_key}"
-                )
-            return leased
-
-        with self._pool_lock:
-            if self._free:
-                partition = self._free.pop()
-            else:
-                partition = self._new_partition()
-
-        partition["_partition_key"] = partition_key
-        partition["_n"] = 0
-        partition["oldest_dt"] = None
-        partition["newest_dt"] = None
-        partition["page_start"] = 0
-        partition["fetched_pages"] = 0
-        self._local.lease = partition
+        existing = self._partitions.get(partition_key)
+        if existing is not None:
+            # 同 chunk 内幂等：复用现有分区但归零游标，保持与 SharedChunkCache.acquire 相同语义。
+            existing["_n"] = 0
+            existing["oldest_dt"] = None
+            existing["newest_dt"] = None
+            existing["page_start"] = 0
+            existing["fetched_pages"] = 0
+            return existing
+        partition = self._new_partition(partition_key)
+        self._partitions[partition_key] = partition
         return partition
 
     def get_partition(self, code: str, freq: str) -> Dict[str, Any]:
@@ -804,23 +1108,19 @@ class SharedChunkCache:
         return self.acquire_partition(code, freq)
 
     def soft_delete(self, code: str, freq: str) -> None:
-        """chunk 结束：解除租约，归零 _n/游标后归还 _free（可复用内存，不可复用上一 chunk 可见数据）。"""
-        expected_key = f"{code}|{freq}"
-        leased = getattr(self._local, "lease", None)
-        if leased is None:
-            return
-        if str(leased.get("_partition_key", "") or "") != expected_key:
-            raise RuntimeError(
-                f"soft_delete 与租约 key 不一致: lease={leased.get('_partition_key')} expected={expected_key}"
-            )
-        leased["_n"] = 0
-        leased["oldest_dt"] = None
-        leased["newest_dt"] = None
-        leased["page_start"] = 0
-        leased["fetched_pages"] = 0
-        self._local.lease = None
-        with self._pool_lock:
-            self._free.append(leased)
+        """chunk 结束：从内部表中移除分区引用，等待 GC 回收。
+
+        输入：code/freq；输出：无。
+        边界：
+        1. 重复调用安全（key 不存在时静默 no-op）。
+        2. 与 SharedChunkCache.soft_delete 不同：不再"归还 free 池"。
+        """
+        partition_key = f"{code}|{freq}"
+        self._partitions.pop(partition_key, None)
+
+
+# 兼容别名：旧代码与外部测试可能仍引用 SharedChunkCache。
+SharedChunkCache = ChunkLocalRowCache
 
 
 class UnifiedTdxClient:
@@ -894,79 +1194,40 @@ class UnifiedTdxClient:
 
         pool_cfg = self.config.get("pool", {})
         connect_timeout = float(pool_cfg.get("connect_timeout", 1.5))
-        max_retry = int(pool_cfg.get("max_retry", 3))
-        same_connection_retry_times = int(pool_cfg.get("same_connection_retry_times", 2))
-        same_connection_retry_interval_ms = int(pool_cfg.get("same_connection_retry_interval_ms", 800))
-        same_host_reconnect_times = int(pool_cfg.get("same_host_reconnect_times", 3))
-        same_host_reconnect_interval_ms = int(pool_cfg.get("same_host_reconnect_interval_ms", 50))
-        probe_on_init_flag = bool(pool_cfg.get("probe_on_init", False))
-        probe_timeout = float(pool_cfg.get("probe_timeout", 0.8))
         api_kwargs = {
             "multithread": True,
             "heartbeat": bool(pool_cfg.get("heartbeat", True)),
             "raise_exception": False,
         }
 
-        std_hosts = self._normalize_hosts(self.config.get("hosts", {}).get("standard", []))
-        ex_hosts = self._normalize_hosts(self.config.get("hosts", {}).get("extended", []))
-        fp_local = compute_hosts_fingerprint(std_hosts, ex_hosts)
-
-        presorted_map = dict(presorted_hosts or {})
-        std_presorted = presorted_map.get("standard")
-        ex_presorted = presorted_map.get("extended")
-
-        if not worker_client and presorted_hosts is None:
-            with _probe_result_cache_lock:
-                cache_hit = (
-                    _last_tcp_probe_hosts_fingerprint == fp_local
-                    and bool(_probe_result_cache.get("standard"))
-                    and bool(_probe_result_cache.get("extended"))
-                )
-                if cache_hit:
-                    std_presorted = list(_probe_result_cache["standard"])
-                    ex_presorted = list(_probe_result_cache["extended"])
-
-        if worker_client and not std_presorted and not ex_presorted:
-            log.warning(
-                "[UnifiedTdxClient] worker 未收到 presorted_hosts，首次建连可能重复 TCP 探测"
-            )
-
-        std_probe_on_init = bool(probe_on_init_flag) if not std_presorted else False
-        ex_probe_on_init = bool(probe_on_init_flag) if not ex_presorted else False
-
-        shuffle_conn = bool(worker_client)
+        resolved_hosts = resolve_presorted_hosts_for_connection(
+            config_path=str(resolved_config_path),
+            cfg=self.config,
+            presorted_hosts=presorted_hosts,
+            sync_if_missing=not bool(worker_client),
+        )
+        std_list = list(resolved_hosts.get("standard") or [])
+        ex_list = list(resolved_hosts.get("extended") or [])
+        if not std_list:
+            std_list = self._normalize_hosts(self.config.get("hosts", {}).get("standard", []))
+        if not ex_list:
+            ex_raw = self.config.get("hosts", {}).get("extended", []) or []
+            if ex_raw:
+                ex_list = self._normalize_hosts(ex_raw)
 
         self.std_pool = PersistentFailoverPool(
             "standard",
             TdxHq_API,
-            std_hosts,
+            std_list,
             connect_timeout,
-            max_retry,
-            same_connection_retry_times=same_connection_retry_times,
-            same_connection_retry_interval_ms=same_connection_retry_interval_ms,
-            same_host_reconnect_times=same_host_reconnect_times,
-            same_host_reconnect_interval_ms=same_host_reconnect_interval_ms,
             api_kwargs=api_kwargs,
-            probe_on_init=std_probe_on_init,
-            probe_timeout=probe_timeout,
-            presorted_hosts=std_presorted,
-            shuffle_initial_connect_order=shuffle_conn,
         )
         self.ex_pool = PersistentFailoverPool(
             "extended",
             TdxExHq_API,
-            ex_hosts,
+            ex_list if ex_list else std_list[:1],
             connect_timeout,
-            max_retry,
-            same_connection_retry_times=same_connection_retry_times,
-            same_connection_retry_interval_ms=same_connection_retry_interval_ms,
-            same_host_reconnect_times=same_host_reconnect_times,
-            same_host_reconnect_interval_ms=same_host_reconnect_interval_ms,
             api_kwargs=api_kwargs,
-            probe_on_init=ex_probe_on_init,
-            probe_timeout=probe_timeout,
-            presorted_hosts=ex_presorted,
-            shuffle_initial_connect_order=shuffle_conn,
         )
 
         self._markets_df = None
@@ -978,6 +1239,11 @@ class UnifiedTdxClient:
         self._instrument_cache = None
         self._runtime_failures: List[Dict[str, Any]] = []
         self._entered_client = None
+        self._worker_client_flag = bool(worker_client)
+        self._presorted_hosts_snapshot: Dict[str, List[Tuple[str, int]]] = {
+            "standard": list(self.std_pool.hosts),
+            "extended": list(self.ex_pool.hosts),
+        }
         # chunk 级 2D 分区缓存（(code|index_name, freq) → 分区）；股票/指数共用
         self._shared_chunk_cache = SharedChunkCache()
 
@@ -1007,7 +1273,7 @@ class UnifiedTdxClient:
             raise ValueError(f"不支持的频率: {freq}")
         return self.PERIOD_MAP[p]
 
-    def _pool_call_allow_none_with_same_conn_retry(
+    def _pool_call_allow_none(
         self,
         pool: PersistentFailoverPool,
         method_name: str,
@@ -1015,26 +1281,20 @@ class UnifiedTdxClient:
         **kwargs: Any,
     ) -> Any:
         """
-        K 线/最新价专用 pool 调用：allow_none 且对 None 做同连接立刻确认重试。
+        K 线/最新价专用 pool 调用：allow_none=True，语义与 pool.call 相同。
 
         输入：
         1. pool: 标准或扩展连接池。
         2. method_name: API 方法名。
         3. *args/**kwargs: 透传参数。
         输出：
-        1. API 返回值；确认后仍为 None 时返回 None。
+        1. API 返回值；重试耗尽后仍为 None 则返回 None。
         用途：
-        1. 统一开启 retry_none_with_same_connection，避免漏接。
+        1. 集中 K 线/报价等 allow_none 调用点，避免漏写 allow_none=True。
         边界条件：
-        1. 固定 allow_none=True；不在此封装内改为 allow_none=False。
+        1. 固定 allow_none=True；重试逻辑仅在 pool.call 内实现一次。
         """
-        return pool.call(
-            method_name,
-            *args,
-            allow_none=True,
-            retry_none_with_same_connection=True,
-            **kwargs,
-        )
+        return pool.call(method_name, *args, allow_none=True, **kwargs)
 
     def _to_datetime(self, value: Any) -> pd.Timestamp:
         """输入时间值，输出 Timestamp；用于统一过滤；非法时间抛错。"""
@@ -1188,7 +1448,7 @@ class UnifiedTdxClient:
         normalized_task: Dict[str, Any],
         route: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        """输入标准化任务和路由，输出指数K线；用于无 DataFrame 任务执行；路由失效时自动刷新一次。"""
+        """输入标准化任务和路由，输出指数K线；用于无 DataFrame 任务执行；同请求内路由发现最多 refresh 一次。"""
         index_name = str(normalized_task.get("index_name", "")).strip()
         freq = str(normalized_task.get("freq", "")).strip().lower()
         start_dt = self._to_datetime_no_df(normalized_task.get("start_time"))
@@ -1209,12 +1469,9 @@ class UnifiedTdxClient:
                     800 if source == "std" else 700,
                 )
             )
-            max_pages = int(self.pagination.get("max_kline_pages", 300))
-            rows: List[Dict[str, Any]] = []
-            start = 0
-            for _ in range(max_pages):
+            def _fetch_index_page(start: int) -> Any:
                 if source == "std":
-                    page = self._pool_call_allow_none_with_same_conn_retry(
+                    return self._pool_call_allow_none(
                         self.std_pool,
                         "get_index_bars",
                         int(category),
@@ -1223,40 +1480,38 @@ class UnifiedTdxClient:
                         int(start),
                         int(page_size),
                     )
-                else:
-                    page = self._pool_call_allow_none_with_same_conn_retry(
-                        self.ex_pool,
-                        "get_instrument_bars",
-                        int(category),
-                        int(market),
-                        str(code),
-                        int(start),
-                        int(page_size),
-                    )
-                if not page:
-                    break
-                raw_page = list(page)
-                self._append_raw_kline_page_rows(rows, raw_page)
-                oldest_raw = raw_page[0].get("datetime") if isinstance(raw_page[0], dict) else None
-                try:
-                    oldest_dt = self._to_datetime_no_df(oldest_raw)
-                except Exception:
-                    oldest_dt = None
-                if oldest_dt is not None and oldest_dt <= start_dt:
-                    break
-                if len(raw_page) < page_size:
-                    break
-                start += len(raw_page)
+                return self._pool_call_allow_none(
+                    self.ex_pool,
+                    "get_instrument_bars",
+                    int(category),
+                    int(market),
+                    str(code),
+                    int(start),
+                    int(page_size),
+                )
+
+            rows = self._paginate_kline_pages(
+                page_size=page_size,
+                start_boundary=start_dt,
+                boundary_mode="no_df",
+                fetch_page=_fetch_index_page,
+            )
             return {"source": source, "market": market, "code": code}, rows
 
         resolved_route = dict(route)
+        route_refreshed = False
         try:
             effective_route, raw_rows = _fetch_route_rows(resolved_route)
         except Exception:
+            if not route_refreshed:
+                resolved_route = self.resolve_index_name(index_name=index_name, refresh=True)
+                route_refreshed = True
+                effective_route, raw_rows = _fetch_route_rows(resolved_route)
+            else:
+                raise
+        if not raw_rows and not route_refreshed:
             resolved_route = self.resolve_index_name(index_name=index_name, refresh=True)
-            effective_route, raw_rows = _fetch_route_rows(resolved_route)
-        if not raw_rows:
-            resolved_route = self.resolve_index_name(index_name=index_name, refresh=True)
+            route_refreshed = True
             effective_route, raw_rows = _fetch_route_rows(resolved_route)
 
         return self._normalize_index_kline_rows(
@@ -1403,6 +1658,10 @@ class UnifiedTdxClient:
         """
         输入：socket 原始 K 线行。
         输出：True 表示 o=h=l=c 且成交量/额近零的占位条，取 bar 时应跳过。
+
+        实现说明：OHLC 在 parser 层经 `np.round(..., 2)` 原地刻度后位级稳定，
+        因此此处 `==` 浮点等比较不会因 IEEE-754 微差出现假阴性；
+        若上游改动 OHLC 精度策略需同步评估此判定。
         """
         if not bool(self.output_cfg.get("filter_suspended_placeholder_bar", True)):
             return False
@@ -1444,6 +1703,59 @@ class UnifiedTdxClient:
             if isinstance(row, dict) and not self._is_placeholder_raw_kline_row(row):
                 rows.append(row)
         return len(raw_page)
+
+    def _paginate_kline_pages(
+        self,
+        *,
+        page_size: int,
+        start_boundary: Any,
+        boundary_mode: Literal["no_df", "pandas"],
+        fetch_page: Callable[[int], Any],
+        rows: Optional[List[Dict[str, Any]]] = None,
+        max_pages: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        K 线向更早历史翻页的统一循环。
+
+        输入：
+        1. page_size: 单页条数上限。
+        2. start_boundary: 左时间边界（`datetime` 或 `pd.Timestamp`）。
+        3. boundary_mode: `no_df` 用 `_to_datetime_no_df`；`pandas` 用 `pd.to_datetime`。
+        4. fetch_page: `(start) -> page | None`，由调用方封装 pool/API/参数差异。
+        5. rows: 可选已有列表；为 None 时新建。
+        6. max_pages: 最大页数；None 时读 `pagination.max_kline_pages`。
+        输出：
+        1. 追加后的原始 K 线 dict 列表（未做 normalize/DataFrame）。
+        边界条件：
+        1. 空页、达左边界、末页不足 `page_size` 时结束；`fetch_page` 差异由调用方保证。
+        """
+        effective_max_pages = int(
+            max_pages if max_pages is not None else self.pagination.get("max_kline_pages", _DEFAULT_MAX_KLINE_PAGES)
+        )
+        out_rows: List[Dict[str, Any]] = list(rows) if rows is not None else []
+        start = 0
+        for _ in range(effective_max_pages):
+            page = fetch_page(start)
+            if not page:
+                break
+            raw_page = list(page)
+            self._append_raw_kline_page_rows(out_rows, raw_page)
+            oldest_raw = raw_page[0].get("datetime") if isinstance(raw_page[0], dict) else None
+            if boundary_mode == "pandas":
+                oldest_ts = pd.to_datetime(oldest_raw, errors="coerce")
+                if not pd.isna(oldest_ts) and oldest_ts <= start_boundary:
+                    break
+            else:
+                try:
+                    oldest_dt = self._to_datetime_no_df(oldest_raw)
+                except Exception:
+                    oldest_dt = None
+                if oldest_dt is not None and oldest_dt <= start_boundary:
+                    break
+            if len(raw_page) < page_size:
+                break
+            start += len(raw_page)
+        return out_rows
 
     def _filter_placeholder_ohlc_equal_rows_list(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """输入K线字典列表，输出过滤结果；用于无 DataFrame 占位条剔除；空列表直接返回。"""
@@ -1543,7 +1855,9 @@ class UnifiedTdxClient:
             ts = int(timestamps[i])
             dt_str = datetime_texts[i]
             if not dt_str:
-                dt_str = dt.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+                # parser 已写入五段 datetime；此分支仅在 _ts 存在而 datetime 缺失时触发，
+                # 强制按五段格式生成，避免与 pytdx/parser 输出 schema 不一致。
+                dt_str = dt.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
             out.append({
                 'code': prefixed_code, 'freq': normalized_freq,
                 'open': float(opens[i]), 'close': float(closes[i]),
@@ -1695,7 +2009,8 @@ class UnifiedTdxClient:
             ts = int(timestamps[i])
             dt_str = datetime_texts[i]
             if not dt_str:
-                dt_str = dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+                # parser 已写入五段 datetime；fallback 强制按五段格式生成，确保 schema 一致。
+                dt_str = dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
             out.append(
                 {
                     "index_name": route_name,
@@ -1723,11 +2038,9 @@ class UnifiedTdxClient:
     ) -> List[Dict[str, Any]]:
         """输入标准行情参数，输出标准化K线列表；用于无 DataFrame 路径；空页即结束。"""
         page_size = int(self.pagination.get("standard_kline_page_size", 800))
-        max_pages = int(self.pagination.get("max_kline_pages", 200))
-        start = 0
-        rows: List[Dict[str, Any]] = []
-        for _ in range(max_pages):
-            page = self._pool_call_allow_none_with_same_conn_retry(
+
+        def _fetch_page(start: int) -> Any:
+            return self._pool_call_allow_none(
                 self.std_pool,
                 "get_security_bars",
                 category,
@@ -1736,20 +2049,13 @@ class UnifiedTdxClient:
                 int(start),
                 int(page_size),
             )
-            if not page:
-                break
-            raw_page = list(page)
-            self._append_raw_kline_page_rows(rows, raw_page)
-            oldest_raw = raw_page[0].get("datetime") if isinstance(raw_page[0], dict) else None
-            try:
-                oldest_dt = self._to_datetime_no_df(oldest_raw)
-            except Exception:
-                oldest_dt = None
-            if oldest_dt is not None and oldest_dt <= start_dt:
-                break
-            if len(raw_page) < page_size:
-                break
-            start += len(raw_page)
+
+        rows = self._paginate_kline_pages(
+            page_size=page_size,
+            start_boundary=start_dt,
+            boundary_mode="no_df",
+            fetch_page=_fetch_page,
+        )
         return self._normalize_stock_kline_rows(
             rows=rows,
             source="std",
@@ -1771,11 +2077,9 @@ class UnifiedTdxClient:
     ) -> List[Dict[str, Any]]:
         """输入扩展行情参数，输出标准化K线列表；用于无 DataFrame 路径；空页即结束。"""
         page_size = int(self.pagination.get("extended_kline_page_size", 700))
-        max_pages = int(self.pagination.get("max_kline_pages", 300))
-        start = 0
-        rows: List[Dict[str, Any]] = []
-        for _ in range(max_pages):
-            page = self._pool_call_allow_none_with_same_conn_retry(
+
+        def _fetch_page(start: int) -> Any:
+            return self._pool_call_allow_none(
                 self.ex_pool,
                 "get_instrument_bars",
                 category,
@@ -1784,21 +2088,13 @@ class UnifiedTdxClient:
                 int(start),
                 int(page_size),
             )
-            if not page:
-                break
-            raw_page = list(page)
-            self._append_raw_kline_page_rows(rows, raw_page)
-            # 页内升序：page[0] 即本页最老 bar，用于判断左边界 start_dt 是否已盖住
-            oldest_raw = raw_page[0].get("datetime") if isinstance(raw_page[0], dict) else None
-            try:
-                oldest_dt = self._to_datetime_no_df(oldest_raw)
-            except Exception:
-                oldest_dt = None
-            if oldest_dt is not None and oldest_dt <= start_dt:
-                break
-            if len(raw_page) < page_size:
-                break
-            start += len(raw_page)  # 向更早历史翻页
+
+        rows = self._paginate_kline_pages(
+            page_size=page_size,
+            start_boundary=start_dt,
+            boundary_mode="no_df",
+            fetch_page=_fetch_page,
+        )
         return self._normalize_stock_kline_rows(
             rows=rows,
             source="ex",
@@ -1830,7 +2126,7 @@ class UnifiedTdxClient:
         1. 原始行字典列表。
         用途：
         1. 为 chunk 级缓存路径提供统一分页抓取入口，并统计网络页调用次数。
-        分页语义（socket 实测，见 scripts/probe_kline_pagination_direction.py）：
+        分页语义（socket 实测，见 tests/manual/probe_kline_pagination_direction.py）：
         1. start=0 从「当前最新」一段 bar 起取；start+=len(page) 向更早历史翻页（下一页整体更旧）。
         2. 单页内时间为升序：page[0] 为本页最老，page[-1] 为本页最新；停止条件用 page[0] 与任务 start_time 比较。
         边界条件：
@@ -1838,7 +2134,7 @@ class UnifiedTdxClient:
         """
         source_key = str(source).strip().lower()
         if source_key == "std":
-            rows = self._pool_call_allow_none_with_same_conn_retry(
+            rows = self._pool_call_allow_none(
                 self.std_pool,
                 "get_security_bars",
                 int(category),
@@ -1849,7 +2145,7 @@ class UnifiedTdxClient:
             )
             return list(rows or [])
         if source_key == "ex":
-            rows = self._pool_call_allow_none_with_same_conn_retry(
+            rows = self._pool_call_allow_none(
                 self.ex_pool,
                 "get_instrument_bars",
                 int(category),
@@ -1888,7 +2184,7 @@ class UnifiedTdxClient:
         if market < 0 or code == "":
             raise ValueError(f"指数路由配置非法: {route}")
         if source_key == "std":
-            rows = self._pool_call_allow_none_with_same_conn_retry(
+            rows = self._pool_call_allow_none(
                 self.std_pool,
                 "get_index_bars",
                 int(category),
@@ -1899,7 +2195,7 @@ class UnifiedTdxClient:
             )
             return list(rows or [])
         if source_key == "ex":
-            rows = self._pool_call_allow_none_with_same_conn_retry(
+            rows = self._pool_call_allow_none(
                 self.ex_pool,
                 "get_instrument_bars",
                 int(category),
@@ -1921,7 +2217,7 @@ class UnifiedTdxClient:
         """Append page rows to cache_rows, bump _n. Return (page_oldest_dt, page_newest_dt).
 
         TDX 分页按 offset 不重叠；页内时间为升序（page[0] 最老、page[-1] 最新）。
-        start 增大表示向更早历史翻页（见 scripts/probe_kline_pagination_direction.py 实测）。
+        start 增大表示向更早历史翻页（见 tests/manual/probe_kline_pagination_direction.py 实测）。
         Overwrites at cache_rows[_n] if within existing allocation, else .append().
         """
         oldest_dt: Optional[dt.datetime] = None
@@ -2065,7 +2361,7 @@ class UnifiedTdxClient:
                 800 if source == "std" else 700,
             )
         )
-        max_pages = int(self.pagination.get("max_kline_pages", 300))
+        max_pages = int(self.pagination.get("max_kline_pages", _DEFAULT_MAX_KLINE_PAGES))
         market = int(route.get("market", 0))
 
         chunk_hit_tasks = 0
@@ -2291,7 +2587,7 @@ class UnifiedTdxClient:
                 800 if source == "std" else 700,
             )
         )
-        max_pages = int(self.pagination.get("max_kline_pages", 300))
+        max_pages = int(self.pagination.get("max_kline_pages", _DEFAULT_MAX_KLINE_PAGES))
 
         chunk_hit_tasks = 0
         chunk_network_page_calls = 0
@@ -2307,6 +2603,7 @@ class UnifiedTdxClient:
             newest_cached_dt = partition["newest_dt"]
             page_start = partition["page_start"]
             fetched_pages = partition["fetched_pages"]
+            route_refreshed = False
 
             for task in task_items:
                 try:
@@ -2336,8 +2633,10 @@ class UnifiedTdxClient:
                             page_size=page_size,
                         )
                     except Exception:
-                        route = self.resolve_index_name(index_name=base_index_name, refresh=True)
-                        self._ensure_index_chunk_route_valid(partition, route)
+                        if not route_refreshed:
+                            route = self.resolve_index_name(index_name=base_index_name, refresh=True)
+                            route_refreshed = True
+                            self._ensure_index_chunk_route_valid(partition, route)
                         route_code = str(route.get("code", "")).strip()
                         route_name = str(route.get("name", base_index_name)).strip() or base_index_name
                         page_rows = self._fetch_index_kline_page_rows_no_df(
@@ -2458,11 +2757,16 @@ class UnifiedTdxClient:
         std_df["source"] = "std"
         ex_df["source"] = "ex"
         self._markets_df = pd.concat([std_df, ex_df], ignore_index=True)
-        self._ex_market_name_map = {
-            int(row["market"]): row.get("name", "")
-            for _, row in ex_df.iterrows()
-            if pd.notna(row.get("market"))
-        }
+        self._ex_market_name_map = {}
+        if not ex_df.empty and "market" in ex_df.columns:
+            for rec in ex_df.to_dict(orient="records"):
+                market_val = rec.get("market")
+                if market_val is None or (isinstance(market_val, float) and pd.isna(market_val)):
+                    continue
+                name_val = rec.get("name", "")
+                self._ex_market_name_map[int(market_val)] = (
+                    "" if (name_val is None or (isinstance(name_val, float) and pd.isna(name_val))) else str(name_val)
+                )
 
     def get_supported_markets(self, return_df: Optional[bool] = None):
         """输入返回开关，输出市场列表；用于统一市场发现；首次会触发网络请求。"""
@@ -2778,6 +3082,7 @@ class UnifiedTdxClient:
         1. 在运行时通过标准/扩展行情清单动态定位指数名称对应路由。
         边界条件：
         1. 网络异常时返回当前已缓存结果（可能为空）。
+        2. 扩展侧合约遍历复用 `_fetch_all_instrument_info`，避免与路由发现重复分页。
         """
         # refresh=False 时优先复用进程内快照，避免重复全市场扫描。
         if (not bool(refresh)) and self._index_catalog_records:
@@ -2823,45 +3128,36 @@ class UnifiedTdxClient:
                     break
 
         ex_index_markets = set(self.index_kline_cfg.get("prefer_ex_markets", [62, 102, 37, 27]))
-        ex_page_size = int(self.pagination.get("extended_instrument_info_page_size", 800))
-        start = 0
-        while True:
-            page = self.ex_pool.call("get_instrument_info", start, ex_page_size, allow_none=True)
-            if not page:
-                break
-            for item in page:
-                name = str(item.get("name", "")).strip()
-                code = str(item.get("code", "")).strip()
-                try:
-                    market = int(item.get("market", -1))
-                except Exception:
-                    market = -1
-                if name == "" or code == "" or market < 0:
-                    continue
-                market_name = str(self._get_ex_market_name(market) or "").strip()
-                should_keep = (
-                    market in ex_index_markets
-                    or "指数" in market_name
-                    or any(marker in name for marker in index_name_markers)
-                )
-                if not should_keep:
-                    continue
-                key = f"ex|{market}|{code}|{name}"
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                records.append(
-                    {
-                        "name": name,
-                        "source": "ex",
-                        "market": int(market),
-                        "code": code,
-                        "market_name": market_name,
-                    }
-                )
-            start += len(page)
-            if len(page) < ex_page_size:
-                break
+        for item in self._fetch_all_instrument_info(refresh=bool(refresh)):
+            name = str(item.get("name", "")).strip()
+            code = str(item.get("code", "")).strip()
+            try:
+                market = int(item.get("market", -1))
+            except Exception:
+                market = -1
+            if name == "" or code == "" or market < 0:
+                continue
+            market_name = str(self._get_ex_market_name(market) or "").strip()
+            should_keep = (
+                market in ex_index_markets
+                or "指数" in market_name
+                or any(marker in name for marker in index_name_markers)
+            )
+            if not should_keep:
+                continue
+            key = f"ex|{market}|{code}|{name}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            records.append(
+                {
+                    "name": name,
+                    "source": "ex",
+                    "market": int(market),
+                    "code": code,
+                    "market_name": market_name,
+                }
+            )
 
         self._index_catalog_records = list(records)
         self._index_name_route_map = self._rebuild_index_name_route_map(self._index_catalog_records)
@@ -3079,17 +3375,18 @@ class UnifiedTdxClient:
         if not scopes:
             return df.iloc[0:0].copy().reset_index(drop=True)
 
-        mask = df.apply(
-            lambda row: self._route_in_scopes(
+        records = df.to_dict(orient="records")
+        mask = [
+            self._route_in_scopes(
                 {
-                    "source": row.get("source", ""),
-                    "market": row.get("market", -1),
-                    "code": row.get("code", ""),
+                    "source": rec.get("source", ""),
+                    "market": rec.get("market", -1),
+                    "code": rec.get("code", ""),
                 },
                 scopes,
-            ),
-            axis=1,
-        )
+            )
+            for rec in records
+        ]
         return df.loc[mask].copy().reset_index(drop=True)
 
     def _safe_float(self, value: Any) -> Optional[float]:
@@ -3181,7 +3478,13 @@ class UnifiedTdxClient:
                 by=["source", "market", "code"]
             ).reset_index(drop=True)
         self._stock_df = df
-        self._stock_route = {row["code"]: row.to_dict() for _, row in df.iterrows()}
+        if df.empty:
+            self._stock_route = {}
+        else:
+            stock_records = df.to_dict(orient="records")
+            self._stock_route = {
+                str(rec["code"]): rec for rec in stock_records if rec.get("code") is not None
+            }
 
         if self._default_return_df(return_df):
             return df.copy()
@@ -3196,13 +3499,13 @@ class UnifiedTdxClient:
             return {}
 
         result: Dict[str, str] = {}
-        for _, row in scoped_df.iterrows():
-            code = str(row.get("code", "")).strip()
+        for rec in scoped_df.to_dict(orient="records"):
+            code = str(rec.get("code", "")).strip()
             if code == "":
                 continue
-            source = str(row.get("source", "")).strip().lower()
+            source = str(rec.get("source", "")).strip().lower()
             try:
-                market = int(row.get("market", -1))
+                market = int(rec.get("market", -1))
             except Exception:
                 market = -1
 
@@ -3216,7 +3519,7 @@ class UnifiedTdxClient:
                 prefixed_code = self._stock_code_prefix_fallback_by_rule(code)
             if prefixed_code == "":
                 continue
-            result[prefixed_code] = str(row.get("name", "")).strip()
+            result[prefixed_code] = str(rec.get("name", "")).strip()
         return result
 
     def get_all_future_list(self, return_df: Optional[bool] = None, use_cache: bool = True):
@@ -3251,8 +3554,7 @@ class UnifiedTdxClient:
             ).reset_index(drop=True)
         self._future_df = df
         self._future_route = {}
-        for _, row in df.iterrows():
-            row_dict = row.to_dict()
+        for row_dict in df.to_dict(orient="records"):
             code_raw = str(row_dict.get("code", "")).strip()
             if not code_raw:
                 continue
@@ -3318,7 +3620,7 @@ class UnifiedTdxClient:
             pair_to_key = {(int(market), str(code)): key for key, market, code in chunk}
             resolved = set()
             try:
-                rows = self._pool_call_allow_none_with_same_conn_retry(
+                rows = self._pool_call_allow_none(
                     self.std_pool,
                     "get_security_quotes",
                     req,
@@ -3346,7 +3648,7 @@ class UnifiedTdxClient:
 
         for key, market, code in ex_targets:
             try:
-                rows = self._pool_call_allow_none_with_same_conn_retry(
+                rows = self._pool_call_allow_none(
                     self.ex_pool,
                     "get_instrument_quote",
                     int(market),
@@ -3407,7 +3709,7 @@ class UnifiedTdxClient:
             if canonical_code == "":
                 canonical_code = code
             try:
-                rows = self._pool_call_allow_none_with_same_conn_retry(
+                rows = self._pool_call_allow_none(
                     self.ex_pool,
                     "get_instrument_quote",
                     market,
@@ -3475,11 +3777,9 @@ class UnifiedTdxClient:
     ) -> pd.DataFrame:
         """输入标准股票参数，输出区间 K 线；用于自动分页；None/空页即结束。"""
         page_size = int(self.pagination.get("standard_kline_page_size", 800))
-        max_pages = int(self.pagination.get("max_kline_pages", 200))
-        start = 0
-        rows = []
-        for _ in range(max_pages):
-            page = self._pool_call_allow_none_with_same_conn_retry(
+
+        def _fetch_page(start: int) -> Any:
+            return self._pool_call_allow_none(
                 self.std_pool,
                 "get_security_bars",
                 category,
@@ -3488,16 +3788,13 @@ class UnifiedTdxClient:
                 int(start),
                 int(page_size),
             )
-            if not page:
-                break
-            raw_page = list(page)
-            self._append_raw_kline_page_rows(rows, raw_page)
-            oldest_ts = pd.to_datetime(raw_page[0].get("datetime"), errors="coerce")
-            if not pd.isna(oldest_ts) and oldest_ts <= start_ts:
-                break
-            if len(raw_page) < page_size:
-                break
-            start += len(raw_page)
+
+        rows = self._paginate_kline_pages(
+            page_size=page_size,
+            start_boundary=start_ts,
+            boundary_mode="pandas",
+            fetch_page=_fetch_page,
+        )
         market_name = "深圳" if int(market) == 0 else "上海"
         return self._kline_dataframe(rows, code, int(market), market_name, "std", freq, start_ts, end_ts)
 
@@ -3512,11 +3809,9 @@ class UnifiedTdxClient:
     ) -> pd.DataFrame:
         """输入扩展参数，输出区间 K 线；用于自动分页；None/空页即结束。"""
         page_size = int(self.pagination.get("extended_kline_page_size", 700))
-        max_pages = int(self.pagination.get("max_kline_pages", 300))
-        start = 0
-        rows = []
-        for _ in range(max_pages):
-            page = self._pool_call_allow_none_with_same_conn_retry(
+
+        def _fetch_page(start: int) -> Any:
+            return self._pool_call_allow_none(
                 self.ex_pool,
                 "get_instrument_bars",
                 category,
@@ -3525,16 +3820,13 @@ class UnifiedTdxClient:
                 int(start),
                 int(page_size),
             )
-            if not page:
-                break
-            raw_page = list(page)
-            self._append_raw_kline_page_rows(rows, raw_page)
-            oldest_ts = pd.to_datetime(raw_page[0].get("datetime"), errors="coerce")
-            if not pd.isna(oldest_ts) and oldest_ts <= start_ts:
-                break
-            if len(raw_page) < page_size:
-                break
-            start += len(raw_page)
+
+        rows = self._paginate_kline_pages(
+            page_size=page_size,
+            start_boundary=start_ts,
+            boundary_mode="pandas",
+            fetch_page=_fetch_page,
+        )
         market_name = self._get_ex_market_name(int(market))
         return self._kline_dataframe(rows, code, int(market), market_name, "ex", freq, start_ts, end_ts)
 
@@ -4085,8 +4377,17 @@ class UnifiedTdxClient:
         return cls._CONTEXT_STACK[-1]
 
     def __enter__(self):
-        """输入无，输出独立上下文客户端；用于with管理；退出时仅关闭上下文实例。"""
-        context_client = UnifiedTdxClient(config_path=self.config_path)
+        """
+        输入无，输出上下文客户端；用于 with 管理；退出时仅关闭上下文实例。
+
+        内层客户端复用本实例连接池已确定的地址顺序（含 worker presorted 快照），
+        避免 worker 路径再次触发全池 TCP 探测。
+        """
+        context_client = UnifiedTdxClient(
+            config_path=self.config_path,
+            presorted_hosts=dict(self._presorted_hosts_snapshot),
+            worker_client=self._worker_client_flag,
+        )
         if context_client.preconnect_on_enter:
             context_client._warmup_connections()
         self._entered_client = context_client
