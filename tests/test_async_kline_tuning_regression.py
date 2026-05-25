@@ -21,7 +21,7 @@ from unittest import mock
 
 import pytest
 
-# 把工程 src 加入 sys.path，与同目录已有 test_pytdx_alignment.py 一致。
+# 把工程 src 加入 sys.path（与 pyproject.toml pythonpath 一致，便于直接 py 本文件调试）。
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _SRC_DIR = os.path.join(_PROJECT_ROOT, "src")
 if _SRC_DIR not in sys.path:
@@ -524,6 +524,146 @@ class TestPoolRestoreDefaultTimeout:
         pool.restore_thread_socket_read_timeout()
 
         assert timeouts_set == [12.5]
+
+
+# =============================================================================
+# F6b: chunk deadline 覆盖首次建连与底层请求
+# =============================================================================
+
+class TestPoolChunkDeadline:
+    """
+    chunk deadline 线程级状态：
+    1. 未建连前设置 read timeout，后续新建 socket 也必须继承该预算；
+    2. deadline 过期时底层请求应快速失败，避免进入阻塞 I/O。
+    """
+
+    def test_timeout_set_before_connect_applies_to_new_socket(self):
+        """先设置线程读超时、再建连；新 socket 应收到 settimeout。"""
+        from zsdtdx.unified_client import PersistentFailoverPool
+
+        class _Sock:
+            def __init__(self):
+                self.timeouts: List[float] = []
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+        class _Api:
+            instances: List[Any] = []
+
+            def __init__(self, **_kwargs):
+                self.client = _Sock()
+                _Api.instances.append(self)
+
+            def connect(self, _host, _port, time_out=0, **_kwargs):
+                self.client.settimeout(time_out)
+                return True
+
+            def disconnect(self):
+                pass
+
+        pool = PersistentFailoverPool("test", _Api, [("127.0.0.1", 7709)], 1.5)
+        pool.set_thread_socket_read_timeout(5.0)
+
+        assert pool.ensure_connected() is True
+        api = _Api.instances[-1]
+        assert api.client.timeouts, "新 socket 应至少设置过 timeout"
+        assert api.client.timeouts[-1] <= 5.0
+        assert api.client.timeouts[-1] > 0
+
+    def test_expired_deadline_fails_before_api_call(self, monkeypatch):
+        """deadline 已过期时，_attempt_call_step 不应调用底层 API。"""
+        from zsdtdx.unified_client import PersistentFailoverPool
+
+        called = {"n": 0}
+
+        class _Api:
+            client = object()
+
+            def quote(self):
+                called["n"] += 1
+                return {"ok": True}
+
+        pool = PersistentFailoverPool.__new__(PersistentFailoverPool)
+        pool.name = "test"
+        monkeypatch.setattr(
+            pool,
+            "_get_thread_data",
+            lambda: {
+                "api": _Api(),
+                "active_index": 0,
+                "socket_read_deadline": time.monotonic() - 1.0,
+                "socket_read_timeout_override": 0.1,
+            },
+        )
+
+        result, exc, needs_retry = pool._attempt_call_step("quote", False)
+
+        assert result is None
+        assert needs_retry is True
+        assert isinstance(exc, TimeoutError)
+        assert called["n"] == 0
+
+
+# =============================================================================
+# F6c: 父级 bundle watchdog 兜底并保持 done 事件
+# =============================================================================
+
+class TestBundleWatchdog:
+    """
+    父级 watchdog：
+    当进程池 future 长时间不完成时，父级应补失败 payload，结束 async worker 并发送 done。
+    """
+
+    def test_async_watchdog_emits_failure_and_done(self, monkeypatch):
+        """模拟永不完成的 bundle future，验证 async 队列最终包含 data + done。"""
+        import queue as py_queue
+        from concurrent.futures import Future
+
+        import zsdtdx.parallel_fetcher as pf
+
+        class _NeverDoneExecutor:
+            def submit(self, *_args, **_kwargs):
+                return Future()
+
+        monkeypatch.setattr(pf, "_get_global_process_pool", lambda _workers: _NeverDoneExecutor())
+        monkeypatch.setattr(pf, "force_restart_parallel_fetcher", lambda **_kwargs: {"ok": True})
+
+        fetcher = pf.ParallelKlineFetcher.__new__(pf.ParallelKlineFetcher)
+        fetcher.num_processes = 1
+        fetcher.task_chunk_max_inflight_multiplier = 1
+        fetcher.task_chunk_inproc_coroutine_workers = 1
+        fetcher.task_chunk_cache_min_tasks = 1
+        fetcher.chunk_reconnect_on_unavailable = False
+        fetcher.chunk_timeout_seconds = 0.1
+        fetcher.chunk_retry_max_attempts = 0
+        fetcher.bundle_watchdog_grace_seconds = 0.0
+        fetcher.force_recycle_on_timeout = True
+        fetcher._ensure_async_prewarm = lambda: None
+        fetcher._build_chunk_task_detail = lambda _detail: {}
+
+        task = {
+            "code": "000001",
+            "freq": "d",
+            "start_time": "2026-01-01",
+            "end_time": "2026-01-02",
+        }
+        chunk = pf.TaskChunk(chunk_id="c1", code="000001", freq="d", tasks=[task])
+        fetcher._build_task_chunks = lambda _tasks: [chunk]
+        fetcher._build_index_task_chunks = lambda _tasks: []
+        fetcher._build_chunk_bundles = lambda chunks, _workers: [pf.ChunkBundle(bundle_id=1, chunks=chunks)]
+
+        q = py_queue.Queue()
+        job = fetcher.fetch_stock_tasks_async(tasks=[task], queue=q)
+        result = job.result(timeout=5)
+
+        assert len(result) == 1
+        assert result[0]["error"] == "bundle watchdog timeout"
+        events = []
+        while not q.empty():
+            events.append(q.get_nowait())
+        assert [item.get("event") for item in events] == ["data", "done"]
+        assert events[-1]["failed_tasks"] == 1
 
 
 # =============================================================================

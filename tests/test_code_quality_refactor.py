@@ -375,14 +375,12 @@ def test_fetch_one_task_chunk_async_timeout_marks_all_tasks_failed():
         "chunk_retry_max_attempts": 0,
     }
 
-    async def instant_timeout(coro, timeout):
-        coro.close()
-        raise asyncio.TimeoutError()
+    async def instant_timeout(_prep):
+        raise asyncio.TimeoutError("chunk attempt timeout")
 
-    with patch.object(pf.asyncio, "wait_for", side_effect=instant_timeout):
-        with patch.object(pf.asyncio, "to_thread", return_value={}):
-            with patch.object(pf, "_recover_worker_pools_current_thread", return_value={"std": {}, "ex": {}}):
-                report = asyncio.run(pf._fetch_one_task_chunk_async(chunk_payload))
+    with patch.object(pf, "_fetch_one_chunk_attempt_with_timeout_async", side_effect=instant_timeout):
+        with patch.object(pf, "_recover_worker_pools_current_thread", return_value={"std": {}, "ex": {}}):
+            report = asyncio.run(pf._fetch_one_task_chunk_async(chunk_payload))
 
     assert int(report.get("chunk_hit_tasks", 0)) == 0
     payloads = list(report.get("payloads") or [])

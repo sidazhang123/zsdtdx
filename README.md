@@ -31,7 +31,7 @@ pip install zsdtdx
 ## 运行环境与依赖
 
 - Python: `>=3.10`
-- 依赖：`pandas`、`PyYAML`、`six`、`psutil`
+- 依赖：`numpy`、`pandas`、`PyYAML`、`six`、`psutil`
 
 
 
@@ -188,6 +188,10 @@ with get_client():
 - preprocessor_operator: 可选钩子，签名 `f(payload)->dict|None`；
   返回 None 或空 dict 时该条结果不入队也不进入返回值（默认 OHLC 两位小数、成交额/量为整数由协议解析层统一）。
 - mode: `"sync"` 或 `"async"`，默认 `"async"`。sync 阻塞直到完成；async 立即返回句柄。
+- start_time/end_time: 支持字符串/date/datetime。若仅传入日期（无时分秒），自动补齐为 `start_time="… 09:30:00"`、`end_time="… 16:00:00"`（股票/指数任务共用，与 `get_future_kline` 的 09:00/15:00 不同）。
+
+**K 线 `datetime` 输出契约:**
+- `rows` 中每条 K 线的 `datetime` 为 `YYYY-MM-DD HH:MM:SS`，秒位固定 `:00`（例如 `"2026-02-02 15:00:00"`）。
 
 **调用示例（写法一：with 主进程上下文 + sync + 其它接口）:**
 ```python
@@ -291,6 +295,11 @@ finally:
 - queue: 可选队列，需支持 `put()`。
 - preprocessor_operator: 可选钩子，签名 `f(payload)->dict|None`（默认数值刻度由协议解析层统一）。
 - mode: `"sync"` 或 `"async"`，默认 `"async"`。
+- start_time/end_time: 规则与 `get_stock_kline` 相同（仅日期时补齐为 09:30:00 / 16:00:00）。
+- task 缺省行为：`mode="async"` 且 `task` 为 `None` 或空列表时，自动构建默认任务（全量指数目录 × 日线 × 近 7 天）；`mode="sync"` 必须显式传入非空 task。
+
+**K 线 `datetime` 输出契约:**
+- 与 `get_stock_kline` 相同：`YYYY-MM-DD HH:MM:SS`，秒位固定 `:00`。
 
 **调用示例:**
 ```python
@@ -544,11 +553,14 @@ with get_client():
 {"config_path": "<auto>", "std_active_host": "120.76.1.198:7709"}
 ```
 
-### 默认配置文件内容
+### 默认配置文件内容（可复制）
+
+以下内容与包内默认 `config.yaml` 一致，请直接复制保存为自有配置文件，再通过 `set_config_path()` 指定路径。
 
 ```yaml
 # ---------------------------------------------------------------------------
 # zsdtdx 封装配置（YAML 支持注释，注释使用 "#"）
+# 完整 API 与可复制配置示例见项目 README.md
 # ---------------------------------------------------------------------------
 # 基本书写格式
 # 1) 缩进必须用空格（建议 2 空格），不要用 Tab。
@@ -566,7 +578,6 @@ client:
   preconnect_on_enter: true
 
 hosts:
-  # 海王星金融终端
   # 标准行情 IP 池（A股主站）。
   # 格式: "ip:port" 字符串列表
   standard:
@@ -595,61 +606,73 @@ pool:
   # 取值: 正浮点数
   # 影响: 值越小故障切换越快，但弱网下误判会增加。
   connect_timeout: 1.5
-  # 单次 pool.call 固定恢复（无 YAML 开关）：
-  # 每 host 三步：请求 → 同连接再请求 → 同 host 重连后再请求；
+  # 单次 pool.call 固定恢复（无额外 YAML 开关）：
+  # 每 host 三步：请求1 → 同连接再请求1 → 同host重连再请求1；
   # 多 host 时三步仍失败则 rotate 一次，在新 host 上重复同样三步；
   # 失败含抛错或 allow_none 时返回 None；最坏 3 次（单 host）或 6 次（多 host）底层请求。
   # 是否开启底层心跳线程。
   # 取值: true/false
   # 影响: true 可降低长时间空闲断连概率。
-  heartbeat: true
+  heartbeat: false
   # TCP 探测单个 host 的超时（秒）；由 _ensure_availability_hosts_cache 在写缓存前使用。
+  # 取值: 正浮点数（建议 0.5~2.0）
+  # 影响: 值越大能探测到更多高延迟 host，但首次连接等待更久。
   probe_timeout: 0.8
 
 parallel:
   # 并行进程数倍率：推荐进程数 = max(2, int(物理核心数 * 该倍率))。
   # 取值: 正浮点数（建议 0.5~3.0）
   # 影响: 倍率越大并发越高，吞吐可能提升，但 CPU/内存占用也会上升。
-  process_count_core_multiplier: 1.5
-  # [仅供 get_future_kline 旧路径 _fetch_parallel 使用] 单次并行抓取的总超时（秒）。
+  process_count_core_multiplier: 5
+  # [DEPRECATED-E5] 以下 4 项仅用于尚未迁移的 get_future_kline → ParallelKlineFetcher.fetch_stock
+  # → _fetch_parallel DataFrame 批处理路径；该路径预计在后续 release 中迁移到 task/chunk/bundle 链路，
+  # 届时本组配置将整体删除。新工程不要在 task 链路上读取这些字段。
+  # 单次并行抓取的总超时（秒）。
   # 取值: 正浮点数
   # 影响: 超时后会回收未完成 future，并按策略触发强制回收与串行补拉。
   parallel_total_timeout_seconds: 300
-  # [仅供 get_future_kline 旧路径 _fetch_parallel 使用] 单个 future.result 的超时（秒）。
+  # [DEPRECATED-E5] 单个 future.result 的超时（秒）。
   # 取值: 正浮点数
   # 影响: 防止 worker 返回阶段异常阻塞。
   parallel_result_timeout_seconds: 600
-  # [仅供 get_future_kline 旧路径 _fetch_parallel 使用] 总超时后是否触发并行进程强制回收。
+  # [DEPRECATED-E5] 总超时后是否触发并行进程强制回收。
   # 取值: true/false
   force_recycle_on_timeout: true
-  # [仅供 get_future_kline 旧路径 _fetch_parallel 使用] 总超时后是否对未完成任务回退串行补拉。
+  # [DEPRECATED-E5] 总超时后是否对未完成任务回退串行补拉。
   # 取值: true/false
   timeout_fallback_to_serial: true
-  # chunk 级缓存启用阈值（以 get_stock_kline(task) 任务链路计）。
+  # chunk 级缓存启用阈值（适用于 get_stock_kline(task) / get_index_kline(task) 并行链路）。
   # 取值: 正整数
-  # 影响: 当 code+freq 的 chunk 任务数达到阈值时启用轻量缓存。
+  # 影响: 当同一 chunk 任务数达到阈值时启用轻量缓存（stock 按 code+freq；index 按 index_name+freq）。
   task_chunk_cache_min_tasks: 2
-  # worker 进程内 chunk 级 future 并发数。
+  # worker/主进程内 chunk 协程并发上限（Semaphore）。
   # 取值: 正整数
-  # 影响: 每个进程一次最多并发执行的 chunk 数。
+  # 影响: 每个进程一次最多并发执行的 chunk 数（阻塞 IO 并行度）。
   task_chunk_inproc_coroutine_workers: 3
   # 父进程提交 chunk 批次的在飞窗口倍率。
   # 取值: 正整数
   # 影响: 在飞 future 上限 = 进程数 × 该倍率。
   task_chunk_max_inflight_multiplier: 2
-  # chunk 重试循环中，若错误匹配连接不可用关键词，重试前自动尝试重建连接。
+  # chunk 重试时，若错误匹配"连接不可用"关键词，是否在重试前重建标准连接。
   # 取值: true/false
   # 影响: true 时可降低长任务尾部因连接失效导致的批量失败。
   chunk_reconnect_on_unavailable: true
-  # 单个 chunk 执行超时（秒），适用于 get_stock_kline / get_index_kline 的 async/sync mode。
+  # 单次 chunk 抓取尝试墙钟上限（秒）：仅约束每一次 get_*_kline_rows_for_chunk_tasks（含该次建连与网络 IO）。
+  # 不含入口归一化失败；不含 bundle 级预热建连；不含重试累计（重试由 chunk_retry_max_attempts 单独控制，每次尝试各算本上限）。
   # 取值: 正浮点数
-  # 影响: 超时后进入重试循环，由 _fetch_one_task_chunk 内部处理。
-  chunk_timeout_seconds: 30
-  # chunk 超时或报错后的最大重试次数，适用于 get_stock_kline / get_index_kline 的 async/sync mode。
+  # 影响: 单次尝试超时/失败可触发重试；最坏墙钟约 chunk_timeout_seconds × (1 + chunk_retry_max_attempts)。
+  # 调优指南（D4）: 5s 适合超低延迟内网；公网/弱网建议 15s+，避免短超时频繁触发重连放大尾延迟。
+  chunk_timeout_seconds: 15
+  # chunk 超时或报错后的最大重试次数。
   # 取值: 非负整数
-  # 影响: 每个 chunk 最多额外重试 N 次，重试耗尽则标记失败。
+  # 影响: 每个 chunk 最多重试 N 次（超时、连接不可用、其他异常均触发），避免无限重试拖慢整体吞吐。
   chunk_retry_max_attempts: 2
-  # async 调用时是否自动预热进程池与 worker 常驻连接。
+  # bundle watchdog 额外宽限时间（秒）：父进程按 chunk_timeout_seconds × (1 + chunk_retry_max_attempts)
+  # 推导单个 bundle 理论上限，再额外增加该宽限；超出后视为 worker 内线程/协程超时失效。
+  # 取值: 非负浮点数
+  # 影响: 值越小越快回收卡死 worker，但弱网下误判概率增加。
+  bundle_watchdog_grace_seconds: 10
+  # async 调用时是否自动预热进程池与 worker 常驻连接（适用于 stock/index）。
   # 取值: true/false
   # 影响: true 时 async 首次调用会自动触发 prewarm，降低冷启动抖动。
   auto_prewarm_on_async: true
@@ -701,6 +724,7 @@ market_rules:
     - "003"
     - "300"
     - "301"
+    - "302"
   # 上海 A 股前缀集合（标准市场）。
   stock_prefix_sh:
     - "600"
@@ -745,23 +769,6 @@ stock_scope:
     get_stock_kline:
       - "szsh"
 
-index_kline:
-  # 动态发现扩展指数时优先考虑的 ex 市场列表。
-  prefer_ex_markets:
-    - 62
-  route_cache:
-    # true: 启用磁盘缓存；false: 每次按现有内存/网络流程解析
-    enabled: true
-    # day: 按自然日刷新缓存（当天首次全量更新，日内复用）
-    refresh_granularity: day
-    # 可选缓存路径（文件或目录）；留空自动选择用户可写目录
-    path: ""
-  aliases:
-    上证综指: 上证指数
-  lookup:
-    max_candidates: 10
-    normalize_whitespace: true
-
 output:
   # 默认返回 DataFrame 还是 list[dict]。
   # 取值: true/false
@@ -778,6 +785,28 @@ output:
   # 占位K线成交量/成交额“极小值”阈值。
   # 取值: 非负浮点数（科学计数法可用）
   suspended_placeholder_eps: 1.0e-20
+
+index_kline:
+  # 运行时动态发现 ex 指数市场的优先候选列表（用于名称->路由解析）。
+  # 默认优先：中证指数(62)、国证指数(102)、全球指数(37)、香港指数(27)。
+  prefer_ex_markets:
+    - 62
+  route_cache:
+    # 是否启用指数路由磁盘缓存（仅影响名称->路由解析，不影响K线拉取逻辑）。
+    enabled: true
+    # 刷新粒度：day 表示按自然日刷新（当天首次运行全量更新，日内复用缓存）。
+    refresh_granularity: day
+    # 可选：手动指定缓存文件路径（文件或目录均可）。
+    # 留空时自动选择用户可写目录；不可写会回退系统临时目录。
+    path: ""
+  # 指数别名：先将用户输入转换为标准名称，再执行精确匹配。
+  aliases:
+    上证综指: 上证指数
+  lookup:
+    # 名称未命中时，错误中最多返回多少个候选名称。
+    max_candidates: 10
+    # 名称匹配前是否移除空白字符（半角/全角空格等）。
+    normalize_whitespace: true
 ```
 
 - `index_kline.route_cache` 说明：
@@ -785,7 +814,7 @@ output:
   - 默认缓存位置会自动选择用户可写目录（Windows: `LOCALAPPDATA`，Linux: `XDG_CACHE_HOME` 或 `~/.cache`）。
   - 若目标目录不可写，会自动回退到系统临时目录；仍不可写时自动禁用磁盘缓存，不影响主流程。
 
-- 常用并行配置位于 `config.yaml.parallel`：
+- 常用并行配置位于 `parallel` 段：
   - `process_count_core_multiplier`
   - `task_chunk_cache_min_tasks`
   - `task_chunk_inproc_coroutine_workers`
@@ -793,11 +822,8 @@ output:
   - `chunk_reconnect_on_unavailable`
   - `chunk_timeout_seconds`
   - `chunk_retry_max_attempts`
+  - `bundle_watchdog_grace_seconds`
   - `auto_prewarm_on_async`
   - `auto_prewarm_require_all_workers`
   - `auto_prewarm_timeout_seconds`
   - `auto_prewarm_max_rounds`
-
-
-```
-

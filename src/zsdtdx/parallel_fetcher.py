@@ -10,6 +10,7 @@
 1. 全局进程池在首次并行调用时创建，程序退出时统一关闭。
 2. 旧接口返回 DataFrame；任务接口返回 list[dict] 并支持队列实时事件。
 """
+
 import asyncio
 import atexit
 import copy
@@ -20,7 +21,13 @@ import threading
 import time
 import warnings
 from collections import defaultdict
-from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, TimeoutError, as_completed
+from concurrent.futures import (
+    Future,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    TimeoutError,
+    as_completed,
+)
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -103,7 +110,9 @@ def _build_worker_host_slot_assignments(
     return assignments
 
 
-def set_log_callback(callback: Optional[Callable[[str, str, Optional[Dict[str, Any]]], None]]):
+def set_log_callback(
+    callback: Optional[Callable[[str, str, Optional[Dict[str, Any]]], None]],
+):
     """
     设置并行获取器日志回调（线程安全）。
 
@@ -176,7 +185,9 @@ def set_log_detail_options(
         return previous
 
 
-def _emit_log(level: str, message: str, detail: Optional[Dict[str, Any]] = None) -> None:
+def _emit_log(
+    level: str, message: str, detail: Optional[Dict[str, Any]] = None
+) -> None:
     """
     统一输出并行获取日志：控制台 print + 可选回调。
 
@@ -588,7 +599,9 @@ def _restore_chunk_socket_read_timeout(client_context: Any) -> None:
                 pass
 
 
-def _recover_worker_pools_current_thread(reason: str = "", target: str = "both") -> Dict[str, Any]:
+def _recover_worker_pools_current_thread(
+    reason: str = "", target: str = "both"
+) -> Dict[str, Any]:
     """
     在当前 worker 线程按路由选择性重建 std/ex 连接（C2 优化：按 chunk 路由单边重置）。
 
@@ -624,7 +637,11 @@ def _recover_worker_pools_current_thread(reason: str = "", target: str = "both")
                     ex_detail["ok"] = bool(resetter(reconnect=True))
                 else:
                     ensure_connected = getattr(ex_pool, "ensure_connected", None)
-                    ex_detail["ok"] = bool(ensure_connected()) if callable(ensure_connected) else False
+                    ex_detail["ok"] = (
+                        bool(ensure_connected())
+                        if callable(ensure_connected)
+                        else False
+                    )
         except Exception as exc:
             ex_detail["error"] = str(exc)[:200]
     else:
@@ -683,8 +700,12 @@ def _probe_worker_std_ex_pool_state() -> Dict[str, Any]:
 
     std_ok = bool(std_pool.ensure_connected()) if std_pool is not None else False
     ex_ok = bool(ex_pool.ensure_connected()) if ex_pool is not None else False
-    std_host = str(std_pool.get_active_host() or "").strip() if std_pool is not None else ""
-    ex_host = str(ex_pool.get_active_host() or "").strip() if ex_pool is not None else ""
+    std_host = (
+        str(std_pool.get_active_host() or "").strip() if std_pool is not None else ""
+    )
+    ex_host = (
+        str(ex_pool.get_active_host() or "").strip() if ex_pool is not None else ""
+    )
     return {
         "std_ok": bool(std_ok),
         "ex_ok": bool(ex_ok),
@@ -709,7 +730,9 @@ def _worker_chunk_connection_probe() -> Dict[str, Any]:
     return _probe_worker_std_ex_pool_state()
 
 
-async def _prewarm_worker_chunk_coroutine_connections_async(inproc_workers: int) -> Dict[str, Any]:
+async def _prewarm_worker_chunk_coroutine_connections_async(
+    inproc_workers: int,
+) -> Dict[str, Any]:
     """
     预热 worker 进程内 chunk 协程并发槽位连接。
 
@@ -787,9 +810,11 @@ def _prewarm_worker_chunk_coroutine_connections(inproc_workers: int) -> Dict[str
     1. 在已有事件循环时复用，否则 asyncio.run。
     """
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(_prewarm_worker_chunk_coroutine_connections_async(inproc_workers))
+        return asyncio.run(
+            _prewarm_worker_chunk_coroutine_connections_async(inproc_workers)
+        )
     raise RuntimeError("无法在运行中的事件循环内同步预热 chunk 协程连接")
 
 
@@ -892,7 +917,9 @@ def _is_connection_unavailable_error(error_text: str) -> bool:
     return False
 
 
-def _recover_worker_standard_connection_current_thread(reason: str = "") -> Dict[str, Any]:
+def _recover_worker_standard_connection_current_thread(
+    reason: str = "",
+) -> Dict[str, Any]:
     """
     在当前 worker 线程尝试重建标准行情连接。
 
@@ -918,7 +945,9 @@ def _recover_worker_standard_connection_current_thread(reason: str = "") -> Dict
             }
 
         get_active_host = getattr(pool, "get_active_host", None)
-        active_before = str(get_active_host() or "").strip() if callable(get_active_host) else ""
+        active_before = (
+            str(get_active_host() or "").strip() if callable(get_active_host) else ""
+        )
 
         resetter = getattr(pool, "reset_thread_connection", None)
         if callable(resetter):
@@ -927,7 +956,9 @@ def _recover_worker_standard_connection_current_thread(reason: str = "") -> Dict
             ensure_connected = getattr(pool, "ensure_connected", None)
             ok = bool(ensure_connected()) if callable(ensure_connected) else False
 
-        active_after = str(get_active_host() or "").strip() if callable(get_active_host) else ""
+        active_after = (
+            str(get_active_host() or "").strip() if callable(get_active_host) else ""
+        )
         return {
             "ok": bool(ok),
             "reason": str(reason),
@@ -944,7 +975,9 @@ def _recover_worker_standard_connection_current_thread(reason: str = "") -> Dict
         }
 
 
-def _summarize_worker_std_host_distribution(worker_std_host_map: Dict[int, str]) -> Dict[str, int]:
+def _summarize_worker_std_host_distribution(
+    worker_std_host_map: Dict[int, str],
+) -> Dict[str, int]:
     """
     汇总 worker 到标准行情 host 的分布统计。
 
@@ -1027,7 +1060,9 @@ def prewarm_parallel_fetcher(
     """
     target_workers = max(
         1,
-        int(target_workers) if target_workers is not None else int(get_fetcher().num_processes),
+        int(target_workers)
+        if target_workers is not None
+        else int(get_fetcher().num_processes),
     )
     inproc_workers = max(1, int(get_fetcher().task_chunk_inproc_coroutine_workers))
     timeout_budget = max(1.0, float(timeout_seconds))
@@ -1072,7 +1107,9 @@ def prewarm_parallel_fetcher(
                     pid = int(payload.get("pid", 0))
                     if pid > 0:
                         warmed_pids.add(pid)
-                        active_std_host = str(payload.get("active_std_host", "")).strip()
+                        active_std_host = str(
+                            payload.get("active_std_host", "")
+                        ).strip()
                         if active_std_host:
                             worker_std_host_map[pid] = active_std_host
                 except Exception as exc:
@@ -1098,7 +1135,9 @@ def prewarm_parallel_fetcher(
                 "target_workers": int(target_workers),
                 "warmed_workers": int(len(warmed_pids)),
                 "warmed_pids": sorted(warmed_pids),
-                "std_host_distribution": _summarize_worker_std_host_distribution(worker_std_host_map),
+                "std_host_distribution": _summarize_worker_std_host_distribution(
+                    worker_std_host_map
+                ),
             },
         )
         if len(warmed_pids) >= target_workers:
@@ -1112,7 +1151,9 @@ def prewarm_parallel_fetcher(
         "elapsed_seconds": float(elapsed_total),
         "rounds_used": int(rounds_used),
         "require_all_workers": bool(require_all_workers),
-        "std_worker_host_distribution": _summarize_worker_std_host_distribution(worker_std_host_map),
+        "std_worker_host_distribution": _summarize_worker_std_host_distribution(
+            worker_std_host_map
+        ),
     }
     if round_errors:
         summary["errors"] = round_errors[:10]
@@ -1134,11 +1175,78 @@ def prewarm_parallel_fetcher(
 # =============================================================================
 
 FUTURE_PATTERNS = {
-    'CU', 'AL', 'ZN', 'PB', 'NI', 'SN', 'AU', 'AG', 'RB', 'HC', 'FU', 'BU', 'RU', 'WR', 'SS', 'SP',
-    'C', 'CS', 'A', 'B', 'M', 'Y', 'P', 'FB', 'BB', 'JD', 'L', 'V', 'PP', 'J', 'JM', 'I', 'EG', 'EB', 'PG', 'LH', 'RR',
-    'SR', 'CF', 'RI', 'OI', 'WH', 'PM', 'FG', 'RS', 'RM', 'JR', 'LR', 'SF', 'SM', 'TA', 'MA', 'ZC', 'CY', 'AP', 'CJ', 'UR', 'SA', 'PF', 'PK',
-    'SC', 'NR', 'LU', 'BC', 'EC',
-    'IF', 'IC', 'IH', 'TF', 'T', 'TS', 'IM'
+    "CU",
+    "AL",
+    "ZN",
+    "PB",
+    "NI",
+    "SN",
+    "AU",
+    "AG",
+    "RB",
+    "HC",
+    "FU",
+    "BU",
+    "RU",
+    "WR",
+    "SS",
+    "SP",
+    "C",
+    "CS",
+    "A",
+    "B",
+    "M",
+    "Y",
+    "P",
+    "FB",
+    "BB",
+    "JD",
+    "L",
+    "V",
+    "PP",
+    "J",
+    "JM",
+    "I",
+    "EG",
+    "EB",
+    "PG",
+    "LH",
+    "RR",
+    "SR",
+    "CF",
+    "RI",
+    "OI",
+    "WH",
+    "PM",
+    "FG",
+    "RS",
+    "RM",
+    "JR",
+    "LR",
+    "SF",
+    "SM",
+    "TA",
+    "MA",
+    "ZC",
+    "CY",
+    "AP",
+    "CJ",
+    "UR",
+    "SA",
+    "PF",
+    "PK",
+    "SC",
+    "NR",
+    "LU",
+    "BC",
+    "EC",
+    "IF",
+    "IC",
+    "IH",
+    "TF",
+    "T",
+    "TS",
+    "IM",
 }
 
 
@@ -1211,7 +1319,7 @@ def is_future_code(code: str) -> bool:
     """
     if not code:
         return False
-    base_code = ''.join(c for c in code.upper() if c.isalpha())
+    base_code = "".join(c for c in code.upper() if c.isalpha())
     return base_code in FUTURE_PATTERNS
 
 
@@ -1243,30 +1351,9 @@ def get_optimal_process_count(core_multiplier: float = 1.5) -> int:
     else:
         # 没有 psutil 时，使用 os.cpu_count()
         physical_cores = os.cpu_count() or 4
-    
+
     optimal = int(physical_cores * multiplier)
     return max(2, optimal)  # 至少2个进程
-
-
-@dataclass
-class FetchTask:
-    """
-    旧版 DataFrame 接口任务定义。
-
-    输入：
-    1. idx: 任务序号。
-    2. code: 标的代码。
-    3. freq: 周期。
-    输出：
-    1. FetchTask 数据对象。
-    用途：
-    1. 兼容旧接口 `_fetch_parallel/_fetch_serial` 的任务编排。
-    边界条件：
-    1. 仅承载轻量字段，不包含时间窗口。
-    """
-    idx: int
-    code: str
-    freq: str
 
 
 @dataclass
@@ -1513,7 +1600,7 @@ def _build_task_payload(
     边界条件：
     1. rows 为空时输出空列表，不返回 None。
     """
-    return {
+    payload = {
         "event": "data",
         "task": {
             "code": str(task.get("code", "")),
@@ -1525,6 +1612,7 @@ def _build_task_payload(
         "error": None if error is None else str(error),
         "worker_pid": int(worker_pid or 0),
     }
+    return payload
 
 
 def _build_task_payload_for_kind(
@@ -1670,8 +1758,14 @@ def _prepare_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
                 "end_time": str(raw.get("end_time", "")),
             }
             error_text = str(exc)[:200]
-            payloads.append(build_payload(task=fallback_task, rows=[], error=error_text, worker_pid=worker_pid))
-            failures.append((fallback_task[symbol_field], fallback_task["freq"], error_text))
+            payloads.append(
+                build_payload(
+                    task=fallback_task, rows=[], error=error_text, worker_pid=worker_pid
+                )
+            )
+            failures.append(
+                (fallback_task[symbol_field], fallback_task["freq"], error_text)
+            )
 
     if not normalized_tasks:
         return {
@@ -1701,9 +1795,15 @@ def _prepare_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
         "normalized_tasks": normalized_tasks,
         "payloads": payloads,
         "failures": failures,
-        "reconnect_on_unavailable": bool(chunk_payload.get("reconnect_on_unavailable", True)),
-        "chunk_timeout": max(1.0, float(chunk_payload.get("chunk_timeout_seconds", 30.0) or 30.0)),
-        "chunk_retry_max": max(0, int(chunk_payload.get("chunk_retry_max_attempts", 2) or 0)),
+        "reconnect_on_unavailable": bool(
+            chunk_payload.get("reconnect_on_unavailable", True)
+        ),
+        "chunk_timeout": max(
+            1.0, float(chunk_payload.get("chunk_timeout_seconds", 30.0) or 30.0)
+        ),
+        "chunk_retry_max": max(
+            0, int(chunk_payload.get("chunk_retry_max_attempts", 2) or 0)
+        ),
     }
 
 
@@ -1741,7 +1841,9 @@ def _fetch_one_chunk_fetch_attempt(prep: Dict[str, Any]) -> Dict[str, Any]:
         _restore_chunk_socket_read_timeout(client_context)
 
 
-def _assemble_chunk_success_report(prep: Dict[str, Any], chunk_result: Dict[str, Any]) -> Dict[str, Any]:
+def _assemble_chunk_success_report(
+    prep: Dict[str, Any], chunk_result: Dict[str, Any]
+) -> Dict[str, Any]:
     """
     将单次成功的 chunk 抓取结果组装为分片报告字典。
 
@@ -1765,10 +1867,16 @@ def _assemble_chunk_success_report(prep: Dict[str, Any], chunk_result: Dict[str,
 
     result_items = list((chunk_result or {}).get("results") or [])
     chunk_hit_tasks = int((chunk_result or {}).get("chunk_hit_tasks", 0) or 0)
-    chunk_network_page_calls = int((chunk_result or {}).get("chunk_network_page_calls", 0) or 0)
+    chunk_network_page_calls = int(
+        (chunk_result or {}).get("chunk_network_page_calls", 0) or 0
+    )
 
     for index, task in enumerate(normalized_tasks):
-        item = result_items[index] if index < len(result_items) and isinstance(result_items[index], dict) else {}
+        item = (
+            result_items[index]
+            if index < len(result_items) and isinstance(result_items[index], dict)
+            else {}
+        )
         result_task = item.get("task", task)
         rows = item.get("rows", [])
         item_error_text = item.get("error")
@@ -1781,7 +1889,13 @@ def _assemble_chunk_success_report(prep: Dict[str, Any], chunk_result: Dict[str,
             )
         )
         if str(item_error_text or "").strip():
-            failures.append((str(task.get(symbol_field, "")), str(task.get("freq", "")), str(item_error_text)[:200]))
+            failures.append(
+                (
+                    str(task.get(symbol_field, "")),
+                    str(task.get("freq", "")),
+                    str(item_error_text)[:200],
+                )
+            )
 
     return {
         "chunk_id": chunk_id,
@@ -1795,7 +1909,9 @@ def _assemble_chunk_success_report(prep: Dict[str, Any], chunk_result: Dict[str,
     }
 
 
-def _log_chunk_retry(prep: Dict[str, Any], *, retry_count: int, error_text: str) -> None:
+def _log_chunk_retry(
+    prep: Dict[str, Any], *, retry_count: int, error_text: str
+) -> None:
     """
     记录 chunk 重试日志。
 
@@ -1866,17 +1982,36 @@ def _fetch_one_task_chunk_timed_body(prep: Dict[str, Any]) -> Dict[str, Any]:
     error_text = ""
     chunk_result: Optional[Dict[str, Any]] = None
     try:
-        chunk_result = _fetch_one_chunk_fetch_attempt(prep)
+        chunk_result = _fetch_one_chunk_attempt_with_timeout(prep)
+    except TimeoutError:
+        error_text = "chunk attempt timeout"
+        try:
+            _recover_worker_pools_current_thread(
+                "chunk_attempt_timeout",
+                _infer_recover_target_from_chunk(prep),
+            )
+        except Exception:
+            pass
     except Exception as exc:
         error_text = str(exc)[:200] or type(exc).__name__
 
     retry_count = 0
     while error_text and retry_count < chunk_retry_max:
         retry_count += 1
+        _recover_chunk_connection_before_retry(prep, error_text)
         _log_chunk_retry(prep, retry_count=retry_count, error_text=error_text)
         try:
-            chunk_result = _fetch_one_chunk_fetch_attempt(prep)
+            chunk_result = _fetch_one_chunk_attempt_with_timeout(prep)
             error_text = ""
+        except TimeoutError:
+            error_text = "chunk attempt timeout"
+            try:
+                _recover_worker_pools_current_thread(
+                    "chunk_attempt_timeout",
+                    _infer_recover_target_from_chunk(prep),
+                )
+            except Exception:
+                pass
         except Exception as retry_exc:
             error_text = str(retry_exc)[:200] or type(retry_exc).__name__
 
@@ -1899,7 +2034,9 @@ def _fetch_one_task_chunk_timed_body(prep: Dict[str, Any]) -> Dict[str, Any]:
     return _assemble_chunk_success_report(prep, dict(chunk_result or {}))
 
 
-def _build_chunk_timeout_error_report(prep: Dict[str, Any], error_text: str) -> Dict[str, Any]:
+def _build_chunk_timeout_error_report(
+    prep: Dict[str, Any], error_text: str
+) -> Dict[str, Any]:
     """
     为 chunk 单次尝试超时或最终失败构造整 chunk 失败报告。
 
@@ -1922,8 +2059,12 @@ def _build_chunk_timeout_error_report(prep: Dict[str, Any], error_text: str) -> 
     err = str(error_text or "chunk timeout")[:200]
 
     for task in normalized_tasks:
-        payloads.append(build_payload(task=task, rows=[], error=err, worker_pid=worker_pid))
-        failures.append((str(task.get(symbol_field, "")), str(task.get("freq", "")), err))
+        payloads.append(
+            build_payload(task=task, rows=[], error=err, worker_pid=worker_pid)
+        )
+        failures.append(
+            (str(task.get(symbol_field, "")), str(task.get("freq", "")), err)
+        )
 
     return {
         "chunk_id": chunk_id,
@@ -1935,6 +2076,146 @@ def _build_chunk_timeout_error_report(prep: Dict[str, Any], error_text: str) -> 
         "failures": failures,
         "worker_pid": worker_pid,
     }
+
+
+def _get_worker_chunk_executor(thread_name_prefix: str) -> ThreadPoolExecutor:
+    """
+    创建 worker 内单 chunk attempt 使用的短生命周期线程池。
+
+    输入：
+    1. thread_name_prefix: 线程名前缀，便于诊断卡死 attempt。
+    输出：
+    1. `ThreadPoolExecutor(max_workers=1)`。
+    用途：
+    1. 集中封装线程池创建，便于测试以内联 executor 替换，并避免使用 asyncio 默认 executor。
+    边界条件：
+    1. 调用方负责 shutdown；超时路径使用 wait=False 放弃等待阻塞线程。
+    """
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix=str(thread_name_prefix))
+
+
+def _fetch_one_chunk_attempt_with_timeout(prep: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    在线程内执行单次 chunk attempt，并在超时时放弃等待阻塞线程。
+
+    输入：
+    1. prep: `_prepare_one_task_chunk` 返回的准备结果。
+    输出：
+    1. 单次 attempt 的 chunk 报告字典。
+    用途：
+    1. 让同步 chunk 路径也具备外层墙钟超时，避免阻塞调用方。
+    边界条件：
+    1. Python 线程不能被安全强杀；超时后关闭 executor 的等待语义并抛 TimeoutError，由 socket deadline
+       促使底层 I/O 尽快自然退出。
+    """
+    chunk_timeout = float(prep["chunk_timeout"])
+    executor = _get_worker_chunk_executor("zsdtdx_chunk_attempt")
+    future = executor.submit(_fetch_one_chunk_fetch_attempt, prep)
+    try:
+        return future.result(timeout=chunk_timeout)
+    except TimeoutError as exc:
+        try:
+            future.cancel()
+        except Exception:
+            pass
+        raise TimeoutError("chunk attempt timeout") from exc
+    finally:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=False)
+        except Exception:
+            pass
+
+
+def _recover_chunk_connection_before_retry(
+    prep: Dict[str, Any], error_text: str
+) -> None:
+    """
+    在连接不可用错误重试前执行一次连接恢复。
+
+    输入：
+    1. prep: chunk 准备结果。
+    2. error_text: 本次失败摘要。
+    输出：无。
+    用途：
+    1. 保持“连接不可用先恢复再重试”的目标态语义，同时让 `_log_chunk_retry` 只负责日志。
+    边界条件：
+    1. 非连接不可用错误不处理；恢复失败不覆盖原始失败原因。
+    """
+    if not _is_connection_unavailable_error(error_text):
+        return
+    try:
+        _recover_worker_pools_current_thread(
+            "chunk_connection_unavailable",
+            _infer_recover_target_from_chunk(prep),
+        )
+    except Exception:
+        pass
+
+
+async def _recover_chunk_connection_before_retry_async(
+    prep: Dict[str, Any], error_text: str
+) -> None:
+    """
+    协程路径在连接不可用错误重试前执行一次连接恢复。
+
+    输入：
+    1. prep: chunk 准备结果。
+    2. error_text: 本次失败摘要。
+    输出：无。
+    用途：
+    1. 避免在事件循环线程内直接执行可能阻塞的重连动作。
+    边界条件：
+    1. 非连接不可用错误不处理；恢复失败不覆盖原始失败原因。
+    """
+    if not _is_connection_unavailable_error(error_text):
+        return
+    try:
+        await asyncio.to_thread(
+            _recover_worker_pools_current_thread,
+            "chunk_connection_unavailable",
+            _infer_recover_target_from_chunk(prep),
+        )
+    except Exception:
+        pass
+
+
+async def _fetch_one_chunk_attempt_with_timeout_async(
+    prep: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    在线程内执行单次 chunk attempt，并让协程超时不等待默认 executor 收尾。
+
+    输入：
+    1. prep: `_prepare_one_task_chunk` 返回的准备结果。
+    输出：
+    1. 单次 attempt 的 chunk 报告字典。
+    用途：
+    1. 避免 `asyncio.to_thread` 使用默认 executor 后在 `asyncio.run()` 退出阶段等待卡死线程。
+    边界条件：
+    1. 超时后仅放弃等待该线程；底层 socket deadline 负责让阻塞 I/O 自然结束。
+    """
+    chunk_timeout = float(prep["chunk_timeout"])
+    loop = asyncio.get_running_loop()
+    executor = _get_worker_chunk_executor("zsdtdx_chunk_attempt_async")
+    future = executor.submit(_fetch_one_chunk_fetch_attempt, prep)
+    wrapped = asyncio.wrap_future(future, loop=loop)
+    try:
+        return await asyncio.wait_for(wrapped, timeout=chunk_timeout)
+    except asyncio.TimeoutError as exc:
+        try:
+            future.cancel()
+        except Exception:
+            pass
+        raise asyncio.TimeoutError("chunk attempt timeout") from exc
+    finally:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=False)
+        except Exception:
+            pass
 
 
 async def _fetch_one_task_chunk_async(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1965,10 +2246,7 @@ async def _fetch_one_task_chunk_async(chunk_payload: Dict[str, Any]) -> Dict[str
     error_text = ""
     chunk_result: Optional[Dict[str, Any]] = None
     try:
-        chunk_result = await asyncio.wait_for(
-            asyncio.to_thread(_fetch_one_chunk_fetch_attempt, prep),
-            timeout=chunk_timeout,
-        )
+        chunk_result = await _fetch_one_chunk_attempt_with_timeout_async(prep)
     except asyncio.TimeoutError:
         error_text = "chunk attempt timeout"
         await asyncio.to_thread(
@@ -1995,12 +2273,10 @@ async def _fetch_one_task_chunk_async(chunk_payload: Dict[str, Any]) -> Dict[str
     retry_count = 0
     while error_text and retry_count < chunk_retry_max:
         retry_count += 1
+        await _recover_chunk_connection_before_retry_async(prep, error_text)
         _log_chunk_retry(prep, retry_count=retry_count, error_text=error_text)
         try:
-            chunk_result = await asyncio.wait_for(
-                asyncio.to_thread(_fetch_one_chunk_fetch_attempt, prep),
-                timeout=chunk_timeout,
-            )
+            chunk_result = await _fetch_one_chunk_attempt_with_timeout_async(prep)
             error_text = ""
         except asyncio.TimeoutError:
             error_text = "chunk attempt timeout"
@@ -2044,27 +2320,6 @@ async def _fetch_one_task_chunk_async(chunk_payload: Dict[str, Any]) -> Dict[str
     return _assemble_chunk_success_report(prep, dict(chunk_result or {}))
 
 
-def _fetch_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    进程 worker：执行单个 chunk 并返回任务 payload 列表（stock/index 共用）。
-
-    输入：
-    1. chunk_payload: 分片字典，含 task_kind、chunk_id、tasks、enable_cache 等。
-    输出：
-    1. 分片执行结果字典，包含 payloads/failures/命中统计等字段。
-    用途：
-    1. 作为 worker 内 chunk 级并发的最小执行单元。
-    边界条件：
-    1. task_kind=index 时走指数归一化与 get_index_kline_rows_for_chunk_tasks。
-    2. 客户端建连失败或分片执行失败时，会为所有任务返回 error payload。
-    """
-    prep = _prepare_one_task_chunk(chunk_payload)
-    early = prep.get("early_report")
-    if early is not None:
-        return dict(early)
-    return _fetch_one_task_chunk_timed_body(prep)
-
-
 async def _fetch_chunk_bundle_async(bundle_payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     进程 worker：协程并发执行 chunk 批次。
@@ -2089,12 +2344,20 @@ async def _fetch_chunk_bundle_async(bundle_payload: Dict[str, Any]) -> Dict[str,
         ),
     )
     bundle_id = int(bundle_payload.get("bundle_id", 0) or 0)
-    reconnect_on_unavailable = bool(bundle_payload.get("reconnect_on_unavailable", True))
-    chunk_timeout_seconds = float(bundle_payload.get("chunk_timeout_seconds", 30.0) or 30.0)
-    chunk_retry_max_attempts = int(bundle_payload.get("chunk_retry_max_attempts", 2) or 0)
+    reconnect_on_unavailable = bool(
+        bundle_payload.get("reconnect_on_unavailable", True)
+    )
+    chunk_timeout_seconds = float(
+        bundle_payload.get("chunk_timeout_seconds", 30.0) or 30.0
+    )
+    chunk_retry_max_attempts = int(
+        bundle_payload.get("chunk_retry_max_attempts", 2) or 0
+    )
     prepared_chunk_payloads: List[Dict[str, Any]] = []
     for chunk_payload in chunk_payloads:
-        normalized_payload = dict(chunk_payload) if isinstance(chunk_payload, dict) else {}
+        normalized_payload = (
+            dict(chunk_payload) if isinstance(chunk_payload, dict) else {}
+        )
         normalized_payload["reconnect_on_unavailable"] = bool(reconnect_on_unavailable)
         normalized_payload["chunk_timeout_seconds"] = float(chunk_timeout_seconds)
         normalized_payload["chunk_retry_max_attempts"] = int(chunk_retry_max_attempts)
@@ -2114,7 +2377,9 @@ async def _fetch_chunk_bundle_async(bundle_payload: Dict[str, Any]) -> Dict[str,
 
     _ensure_worker_client_context()
 
-    sem = asyncio.Semaphore(max(1, min(int(inproc_workers), int(len(prepared_chunk_payloads)))))
+    sem = asyncio.Semaphore(
+        max(1, min(int(inproc_workers), int(len(prepared_chunk_payloads))))
+    )
 
     async def _run_one(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
         async with sem:
@@ -2123,7 +2388,9 @@ async def _fetch_chunk_bundle_async(bundle_payload: Dict[str, Any]) -> Dict[str,
             except Exception as exc:
                 error_text = str(exc)[:200]
                 raw_tasks = list(chunk_payload.get("tasks") or [])
-                chunk_kind = str(chunk_payload.get("task_kind", "stock")).strip().lower()
+                chunk_kind = (
+                    str(chunk_payload.get("task_kind", "stock")).strip().lower()
+                )
                 return {
                     "chunk_id": str(chunk_payload.get("chunk_id", "")),
                     "chunk_task_count": int(len(raw_tasks)),
@@ -2141,7 +2408,9 @@ async def _fetch_chunk_bundle_async(bundle_payload: Dict[str, Any]) -> Dict[str,
                     ],
                     "failures": [
                         (
-                            str((t or {}).get("index_name") or (t or {}).get("code", "")),
+                            str(
+                                (t or {}).get("index_name") or (t or {}).get("code", "")
+                            ),
                             str((t or {}).get("freq", "")),
                             error_text,
                         )
@@ -2151,7 +2420,9 @@ async def _fetch_chunk_bundle_async(bundle_payload: Dict[str, Any]) -> Dict[str,
                 }
 
     try:
-        reports = await asyncio.gather(*[_run_one(chunk) for chunk in prepared_chunk_payloads])
+        reports = await asyncio.gather(
+            *[_run_one(chunk) for chunk in prepared_chunk_payloads]
+        )
         chunk_reports.extend(reports)
     finally:
         _cleanup_worker_dead_thread_connections()
@@ -2219,7 +2490,9 @@ class StockKlineJob:
         return self._future.exception(timeout=timeout)
 
 
-def _serialize_task_list(task_list: List[Tuple[int, str, str, str, str]]) -> List[Dict[str, Any]]:
+def _serialize_task_list(
+    task_list: List[Tuple[int, str, str, str, str]],
+) -> List[Dict[str, Any]]:
     """
     将批次任务序列化为日志可读结构。
 
@@ -2248,7 +2521,7 @@ def _serialize_task_list(task_list: List[Tuple[int, str, str, str, str]]) -> Lis
 def _fetch_batch(task_list: List[Tuple[int, str, str, str, str]]) -> Dict[str, Any]:
     """
     进程worker：批量获取任务数据
-    
+
     输入: [(idx, code, freq, start_time, end_time), ...]
     输出: {"data": DataFrame, "failures": [(code, freq, error), ...]}
     """
@@ -2261,7 +2534,12 @@ def _fetch_batch(task_list: List[Tuple[int, str, str, str, str]]) -> Dict[str, A
         error_msg = str(exc)[:100]
         for _idx, code, freq, _start_time, _end_time in task_list:
             failures.append((code, freq, error_msg))
-        return {"data": pd.DataFrame(), "failures": failures, "worker_pid": worker_pid, "task_count": len(task_list)}
+        return {
+            "data": pd.DataFrame(),
+            "failures": failures,
+            "worker_pid": worker_pid,
+            "task_count": len(task_list),
+        }
 
     for task in task_list:
         idx, code, freq, start_time, end_time = task
@@ -2295,14 +2573,19 @@ def _fetch_batch(task_list: List[Tuple[int, str, str, str, str]]) -> Dict[str, A
             error_msg = str(e)[:100]  # 限制错误信息长度
             failures.append((code, freq, error_msg))
             continue
-    
+
     result_data = pd.concat(all_data, ignore_index=True) if all_data else pd.DataFrame()
-    return {"data": result_data, "failures": failures, "worker_pid": worker_pid, "task_count": len(task_list)}
+    return {
+        "data": result_data,
+        "failures": failures,
+        "worker_pid": worker_pid,
+        "task_count": len(task_list),
+    }
 
 
 class ParallelKlineFetcher:
     """并行K线获取器"""
-    
+
     def __init__(self, config_path: Optional[str] = None):
         """
         初始化并行抓取器配置。
@@ -2318,7 +2601,7 @@ class ParallelKlineFetcher:
         """
         self.config_path = config_path
         self.config = self._load_config()
-        
+
         parallel_cfg = self.config.get("parallel", {})
         self.parallel_total_timeout_seconds = self._safe_float_config(
             parallel_cfg.get("parallel_total_timeout_seconds"),
@@ -2330,8 +2613,12 @@ class ParallelKlineFetcher:
             default=600.0,
             minimum=1.0,
         )
-        self.force_recycle_on_timeout = bool(parallel_cfg.get("force_recycle_on_timeout", True))
-        self.timeout_fallback_to_serial = bool(parallel_cfg.get("timeout_fallback_to_serial", True))
+        self.force_recycle_on_timeout = bool(
+            parallel_cfg.get("force_recycle_on_timeout", True)
+        )
+        self.timeout_fallback_to_serial = bool(
+            parallel_cfg.get("timeout_fallback_to_serial", True)
+        )
         self.task_chunk_cache_min_tasks = self._safe_int_config(
             parallel_cfg.get("task_chunk_cache_min_tasks"),
             default=2,
@@ -2347,7 +2634,9 @@ class ParallelKlineFetcher:
             default=2,
             minimum=1,
         )
-        self.auto_prewarm_on_async = bool(parallel_cfg.get("auto_prewarm_on_async", True))
+        self.auto_prewarm_on_async = bool(
+            parallel_cfg.get("auto_prewarm_on_async", True)
+        )
         self.auto_prewarm_require_all_workers = bool(
             parallel_cfg.get("auto_prewarm_require_all_workers", True)
         )
@@ -2374,6 +2663,11 @@ class ParallelKlineFetcher:
             default=2,
             minimum=0,
         )
+        self.bundle_watchdog_grace_seconds = self._safe_float_config(
+            parallel_cfg.get("bundle_watchdog_grace_seconds"),
+            default=10.0,
+            minimum=0.0,
+        )
         self.process_count_core_multiplier = self._safe_float_config(
             parallel_cfg.get("process_count_core_multiplier"),
             default=1.5,
@@ -2399,7 +2693,9 @@ class ParallelKlineFetcher:
         except Exception as exc:
             _emit_log("error", f"[Parallel] Fetcher 初始化时 ensure 缓存失败: {exc}")
 
-    def _build_chunk_task_detail(self, task_detail: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _build_chunk_task_detail(
+        self, task_detail: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
         """
         构建 chunk 日志中的任务细节字段。
 
@@ -2457,7 +2753,9 @@ class ParallelKlineFetcher:
         sample_size = int(options.get("sample_size", 8) or 8)
         sample_size = max(1, min(200, sample_size))
         include_full_tasks_debug = bool(options.get("include_full_tasks_debug", False))
-        max_failure_items = len(chunk_failures) if include_full_tasks_debug else max(200, sample_size)
+        max_failure_items = (
+            len(chunk_failures) if include_full_tasks_debug else max(200, sample_size)
+        )
 
         task_lookup: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for item in task_detail:
@@ -2501,7 +2799,9 @@ class ParallelKlineFetcher:
             payload["failure_tasks"] = failure_tasks
         return payload
 
-    def _safe_float_config(self, raw_value: Any, *, default: float, minimum: float = 0.0) -> float:
+    def _safe_float_config(
+        self, raw_value: Any, *, default: float, minimum: float = 0.0
+    ) -> float:
         """
         解析浮点配置并执行下限保护。
 
@@ -2522,7 +2822,9 @@ class ParallelKlineFetcher:
             parsed = float(default)
         return max(float(minimum), parsed)
 
-    def _safe_int_config(self, raw_value: Any, *, default: int, minimum: int = 0) -> int:
+    def _safe_int_config(
+        self, raw_value: Any, *, default: int, minimum: int = 0
+    ) -> int:
         """
         解析整数配置并执行下限保护。
 
@@ -2542,7 +2844,7 @@ class ParallelKlineFetcher:
         except Exception:
             parsed = int(default)
         return max(int(minimum), parsed)
-        
+
     def _resolve_fetcher_config_path(self) -> Path:
         """
         解析并行抓取器使用的配置文件绝对路径。
@@ -2574,7 +2876,9 @@ class ParallelKlineFetcher:
             with open(resolved, "r", encoding="utf-8") as f:
                 return yaml.safe_load(f) or {}
         except Exception as e:
-            _emit_log("warning", f"[ParallelKlineFetcher] 配置加载失败: {e}, 使用默认值")
+            _emit_log(
+                "warning", f"[ParallelKlineFetcher] 配置加载失败: {e}, 使用默认值"
+            )
             return {}
 
     def _validate_queue(self, queue_obj: Optional[Any]) -> None:
@@ -2598,7 +2902,9 @@ class ParallelKlineFetcher:
     def _apply_preprocessor_operator(
         self,
         payload: Dict[str, Any],
-        preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]],
+        preprocessor_operator: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ],
     ) -> Optional[Dict[str, Any]]:
         """
         执行可选钩子并规范返回值。
@@ -2700,7 +3006,10 @@ class ParallelKlineFetcher:
         输出：chunk 列表。
         边界：tasks 为空时返回 []。
         """
-        grouped: Dict[Tuple[str, str], List[Tuple[int, Dict[str, str], pd.Timestamp, pd.Timestamp]]] = defaultdict(list)
+        grouped: Dict[
+            Tuple[str, str],
+            List[Tuple[int, Dict[str, str], pd.Timestamp, pd.Timestamp]],
+        ] = defaultdict(list)
         to_sortable_ts = _to_sortable_task_ts
         for index, raw_task in enumerate(tasks or []):
             if not isinstance(raw_task, dict):
@@ -2749,7 +3058,9 @@ class ParallelKlineFetcher:
         """构建指数任务 chunk（按 index_name+freq 分组）。"""
         return self._build_grouped_task_chunks(tasks, group_key="index_name")
 
-    def _build_chunk_bundles(self, chunks: List[TaskChunk], inproc_workers: int) -> List[ChunkBundle]:
+    def _build_chunk_bundles(
+        self, chunks: List[TaskChunk], inproc_workers: int
+    ) -> List[ChunkBundle]:
         """
         构建 chunk 批次：先按进程负载均衡，再按进程内并发切批。
 
@@ -2769,7 +3080,8 @@ class ParallelKlineFetcher:
         max_per_bundle = max(1, int(inproc_workers))
         process_count = max(1, int(self.num_processes))
         process_buckets: List[Dict[str, Any]] = [
-            {"process_index": idx, "chunks": [], "load": 0} for idx in range(1, process_count + 1)
+            {"process_index": idx, "chunks": [], "load": 0}
+            for idx in range(1, process_count + 1)
         ]
 
         for chunk in chunks:
@@ -2815,7 +3127,9 @@ class ParallelKlineFetcher:
             for index, item in enumerate(raw_bundles, start=1)
         ]
 
-    def _iter_task_payloads_inproc_chunked(self, tasks: List[Dict[str, Any]], task_kind: str = "stock"):
+    def _iter_task_payloads_inproc_chunked(
+        self, tasks: List[Dict[str, Any]], task_kind: str = "stock"
+    ):
         """
         主进程内 chunk 并发迭代任务结果（不启用多进程）。
 
@@ -2829,7 +3143,11 @@ class ParallelKlineFetcher:
         1. 单次调用内仅执行一次 asyncio.run；chunk 墙钟预算由 _fetch_one_task_chunk_async 施加。
         """
         kind = str(task_kind or "stock").strip().lower()
-        build_chunks = self._build_index_task_chunks if kind == "index" else self._build_task_chunks
+        build_chunks = (
+            self._build_index_task_chunks
+            if kind == "index"
+            else self._build_task_chunks
+        )
         task_list = list(tasks or [])
         if not task_list:
             return
@@ -2840,7 +3158,9 @@ class ParallelKlineFetcher:
 
         total_tasks = int(len(task_list))
         total_chunks = int(len(chunks))
-        max_workers = max(1, min(int(self.task_chunk_inproc_coroutine_workers), int(len(chunks))))
+        max_workers = max(
+            1, min(int(self.task_chunk_inproc_coroutine_workers), int(len(chunks)))
+        )
         done_tasks = 0
 
         dispatch_items: List[Tuple[TaskChunk, Dict[str, Any]]] = []
@@ -2861,24 +3181,34 @@ class ParallelKlineFetcher:
                     "chunk_id": str(chunk.chunk_id),
                     "chunk_key": f"{chunk.code}|{chunk.freq}",
                     "chunk_task_count": int(chunk.task_count),
-                    "chunk_cache_enabled": bool(chunk.task_count >= int(self.task_chunk_cache_min_tasks)),
+                    "chunk_cache_enabled": bool(
+                        chunk.task_count >= int(self.task_chunk_cache_min_tasks)
+                    ),
                     "fetch_tasks_total": int(total_tasks),
                     **task_payload,
                 },
             )
             chunk_payload = chunk.to_payload(
-                enable_cache=bool(chunk.task_count >= int(self.task_chunk_cache_min_tasks))
+                enable_cache=bool(
+                    chunk.task_count >= int(self.task_chunk_cache_min_tasks)
+                )
             )
             chunk_payload["task_kind"] = str(kind)
-            chunk_payload["reconnect_on_unavailable"] = bool(self.chunk_reconnect_on_unavailable)
+            chunk_payload["reconnect_on_unavailable"] = bool(
+                self.chunk_reconnect_on_unavailable
+            )
             chunk_payload["chunk_timeout_seconds"] = float(self.chunk_timeout_seconds)
-            chunk_payload["chunk_retry_max_attempts"] = int(self.chunk_retry_max_attempts)
+            chunk_payload["chunk_retry_max_attempts"] = int(
+                self.chunk_retry_max_attempts
+            )
             dispatch_items.append((chunk, chunk_payload))
 
         async def _gather_inproc() -> List[Tuple[TaskChunk, Dict[str, Any]]]:
             sem = asyncio.Semaphore(max_workers)
 
-            async def _one(item: Tuple[TaskChunk, Dict[str, Any]]) -> Tuple[TaskChunk, Dict[str, Any]]:
+            async def _one(
+                item: Tuple[TaskChunk, Dict[str, Any]],
+            ) -> Tuple[TaskChunk, Dict[str, Any]]:
                 chunk_obj, payload = item
                 async with sem:
                     report = await _fetch_one_task_chunk_async(payload)
@@ -2895,7 +3225,7 @@ class ParallelKlineFetcher:
             try:
                 payloads = list(report.get("payloads") or [])
                 if len(payloads) < len(chunk.tasks):
-                    for task in chunk.tasks[len(payloads):]:
+                    for task in chunk.tasks[len(payloads) :]:
                         payloads.append(
                             _build_task_payload_for_kind(
                                 kind,
@@ -2913,8 +3243,14 @@ class ParallelKlineFetcher:
                     if not error_text:
                         continue
                     chunk_failure_count += 1
-                    task_obj = payload.get("task") if isinstance(payload.get("task"), dict) else {}
-                    task_symbol = str(task_obj.get("code") or task_obj.get("index_name") or "")
+                    task_obj = (
+                        payload.get("task")
+                        if isinstance(payload.get("task"), dict)
+                        else {}
+                    )
+                    task_symbol = str(
+                        task_obj.get("code") or task_obj.get("index_name") or ""
+                    )
                     failure_tasks.append(
                         {
                             "code": task_symbol,
@@ -2927,7 +3263,9 @@ class ParallelKlineFetcher:
 
                 done_tasks += chunk_task_count
                 chunk_hit_tasks = int(report.get("chunk_hit_tasks", 0) or 0)
-                chunk_network_page_calls = int(report.get("chunk_network_page_calls", 0) or 0)
+                chunk_network_page_calls = int(
+                    report.get("chunk_network_page_calls", 0) or 0
+                )
                 _emit_log(
                     "info",
                     "[Task Inproc] chunk 任务完成",
@@ -2943,7 +3281,9 @@ class ParallelKlineFetcher:
                         "chunk_network_page_calls": int(chunk_network_page_calls),
                         "fetch_tasks_done": int(done_tasks),
                         "fetch_tasks_total": int(total_tasks),
-                        "failure_codes": [str(chunk.code)] if chunk_failure_count > 0 else [],
+                        "failure_codes": [str(chunk.code)]
+                        if chunk_failure_count > 0
+                        else [],
                         "failure_tasks": failure_tasks,
                     },
                 )
@@ -2976,7 +3316,9 @@ class ParallelKlineFetcher:
                         worker_pid=os.getpid(),
                     )
 
-    def _iter_task_payloads_parallel_chunked(self, tasks: List[Dict[str, Any]], task_kind: str = "stock"):
+    def _iter_task_payloads_parallel_chunked(
+        self, tasks: List[Dict[str, Any]], task_kind: str = "stock"
+    ):
         """
         chunk 化并行迭代任务结果（完成顺序回收）。
 
@@ -2987,10 +3329,14 @@ class ParallelKlineFetcher:
         用途：
         1. 实现“按 code+freq 分片 + 分片内顺序 + 分片缓存 + 两层并发”。
         边界条件：
-        1. chunk 级超时与重试由 _fetch_one_task_chunk 内部处理。
+        1. chunk 级超时与重试由 _fetch_one_task_chunk_async 内部处理。
         """
         kind = str(task_kind or "stock").strip().lower()
-        build_chunks = self._build_index_task_chunks if kind == "index" else self._build_task_chunks
+        build_chunks = (
+            self._build_index_task_chunks
+            if kind == "index"
+            else self._build_task_chunks
+        )
         task_list = list(tasks or [])
         if not task_list:
             return
@@ -2998,20 +3344,80 @@ class ParallelKlineFetcher:
         chunks = build_chunks(task_list)
         if not chunks:
             return
-        bundles = self._build_chunk_bundles(chunks, self.task_chunk_inproc_coroutine_workers)
+        bundles = self._build_chunk_bundles(
+            chunks, self.task_chunk_inproc_coroutine_workers
+        )
         if not bundles:
             return
 
         total_tasks = int(len(task_list))
         total_chunks = int(len(chunks))
         total_bundles = int(len(bundles))
-        max_inflight = max(1, int(self.num_processes) * int(self.task_chunk_max_inflight_multiplier))
+        max_inflight = max(
+            1, int(self.num_processes) * int(self.task_chunk_max_inflight_multiplier)
+        )
 
         executor = _get_global_process_pool(self.num_processes)
         pending_futures: Dict[Any, Dict[str, Any]] = {}
         bundle_cursor = 0
         done_tasks = 0
         dispatch_cursor = 0
+        bundle_watchdog_budget = max(
+            1.0,
+            float(self.chunk_timeout_seconds)
+            * float(1 + int(self.chunk_retry_max_attempts))
+            + float(self.bundle_watchdog_grace_seconds),
+        )
+        bundle_watchdog_poll = max(
+            0.1, min(1.0, float(self.chunk_timeout_seconds) / 5.0)
+        )
+
+        def _iter_bundle_failure_payloads(
+            bundle: ChunkBundle,
+            *,
+            error_text: str,
+            stage: str,
+        ):
+            """
+            为整个 bundle 生成失败 payload 并写入统一日志。
+
+            输入：
+            1. bundle: 需要标记失败的批次。
+            2. error_text/stage: 失败原因与日志阶段。
+            输出：
+            1. 逐条 yield 该 bundle 内所有任务的失败 payload。
+            用途：
+            1. 父级 watchdog 或进程池异常时补齐 payload，确保 async 队列最终能收到 done。
+            边界条件：
+            1. 不依赖 worker 返回值；按父进程保存的 chunk.tasks 构造失败结果。
+            """
+            nonlocal done_tasks
+            for chunk in bundle.chunks:
+                chunk_task_count = int(chunk.task_count)
+                done_tasks += chunk_task_count
+                _emit_log(
+                    "error",
+                    f"[Task Parallel] chunk 批次执行失败: {error_text}",
+                    {
+                        "stage": str(stage),
+                        "bundle_index": int(bundle.bundle_id),
+                        "bundle_total": int(total_bundles),
+                        "chunk_id": str(chunk.chunk_id),
+                        "chunk_key": f"{chunk.code}|{chunk.freq}",
+                        "chunk_task_count": int(chunk_task_count),
+                        "chunk_failure_count": int(chunk_task_count),
+                        "fetch_tasks_done": int(done_tasks),
+                        "fetch_tasks_total": int(total_tasks),
+                    },
+                )
+                for task in chunk.tasks:
+                    yield _build_task_payload_for_kind(
+                        kind,
+                        task=task,
+                        rows=[],
+                        error=error_text,
+                        worker_pid=os.getpid(),
+                    )
 
         def _submit_one_bundle() -> bool:
             """
@@ -3032,17 +3438,32 @@ class ParallelKlineFetcher:
             bundle = bundles[bundle_cursor]
             bundle_cursor += 1
 
-            bundle_payload = bundle.to_payload(cache_min_tasks=self.task_chunk_cache_min_tasks)
+            bundle_payload = bundle.to_payload(
+                cache_min_tasks=self.task_chunk_cache_min_tasks
+            )
             for chunk_payload in list(bundle_payload.get("chunks") or []):
                 if isinstance(chunk_payload, dict):
                     chunk_payload["task_kind"] = str(kind)
-            bundle_payload["inproc_coroutine_workers"] = int(self.task_chunk_inproc_coroutine_workers)
-            bundle_payload["inproc_workers"] = int(self.task_chunk_inproc_coroutine_workers)
-            bundle_payload["reconnect_on_unavailable"] = bool(self.chunk_reconnect_on_unavailable)
+            bundle_payload["inproc_coroutine_workers"] = int(
+                self.task_chunk_inproc_coroutine_workers
+            )
+            bundle_payload["inproc_workers"] = int(
+                self.task_chunk_inproc_coroutine_workers
+            )
+            bundle_payload["reconnect_on_unavailable"] = bool(
+                self.chunk_reconnect_on_unavailable
+            )
             bundle_payload["chunk_timeout_seconds"] = float(self.chunk_timeout_seconds)
-            bundle_payload["chunk_retry_max_attempts"] = int(self.chunk_retry_max_attempts)
+            bundle_payload["chunk_retry_max_attempts"] = int(
+                self.chunk_retry_max_attempts
+            )
+            submitted_at = time.monotonic()
             future = executor.submit(_fetch_chunk_bundle, bundle_payload)
-            pending_futures[future] = {"bundle": bundle}
+            pending_futures[future] = {
+                "bundle": bundle,
+                "submitted_at": float(submitted_at),
+                "deadline_at": float(submitted_at + bundle_watchdog_budget),
+            }
 
             for chunk in bundle.chunks:
                 dispatch_cursor += 1
@@ -3060,7 +3481,9 @@ class ParallelKlineFetcher:
                         "chunk_id": str(chunk.chunk_id),
                         "chunk_key": f"{chunk.code}|{chunk.freq}",
                         "chunk_task_count": int(chunk.task_count),
-                        "chunk_cache_enabled": bool(chunk.task_count >= int(self.task_chunk_cache_min_tasks)),
+                        "chunk_cache_enabled": bool(
+                            chunk.task_count >= int(self.task_chunk_cache_min_tasks)
+                        ),
                         "fetch_tasks_total": int(total_tasks),
                         **task_payload,
                     },
@@ -3076,7 +3499,83 @@ class ParallelKlineFetcher:
             if not pending_futures:
                 break
 
-            done_future = next(as_completed(list(pending_futures.keys())))
+            done_future = None
+            try:
+                for item in as_completed(
+                    list(pending_futures.keys()), timeout=bundle_watchdog_poll
+                ):
+                    done_future = item
+                    break
+            except TimeoutError:
+                done_future = None
+
+            if done_future is None:
+                now = time.monotonic()
+                overdue_items = [
+                    (future, meta)
+                    for future, meta in list(pending_futures.items())
+                    if float(meta.get("deadline_at", 0.0) or 0.0) <= now
+                ]
+                if not overdue_items:
+                    continue
+
+                if bool(self.force_recycle_on_timeout):
+                    affected_items = list(pending_futures.items())
+                    for future, _meta in affected_items:
+                        try:
+                            future.cancel()
+                        except Exception:
+                            pass
+                    overdue_bundle_ids = [
+                        int(item[1]["bundle"].bundle_id)
+                        for item in overdue_items
+                        if isinstance(item[1].get("bundle"), ChunkBundle)
+                    ]
+                    _emit_log(
+                        "error",
+                        "[Task Parallel] bundle watchdog 超时，开始回收并行进程池",
+                        {
+                            "stage": "bundle_watchdog_recycle",
+                            "overdue_bundle_ids": overdue_bundle_ids,
+                            "pending_bundle_count": int(len(affected_items)),
+                            "watchdog_budget_seconds": float(bundle_watchdog_budget),
+                        },
+                    )
+                    for future, meta in affected_items:
+                        pending_futures.pop(future, None)
+                        bundle = meta["bundle"]
+                        error_text = "bundle watchdog timeout"
+                        for payload in _iter_bundle_failure_payloads(
+                            bundle,
+                            error_text=error_text,
+                            stage="bundle_watchdog_timeout",
+                        ):
+                            yield payload
+                    try:
+                        force_restart_parallel_fetcher(prewarm=False)
+                    except Exception as exc:
+                        _emit_log(
+                            "error",
+                            f"[Task Parallel] bundle watchdog 回收进程池失败: {exc}",
+                            {"stage": "bundle_watchdog_recycle_failed"},
+                        )
+                    executor = _get_global_process_pool(self.num_processes)
+                    continue
+
+                for future, meta in overdue_items:
+                    pending_futures.pop(future, None)
+                    try:
+                        future.cancel()
+                    except Exception:
+                        pass
+                    bundle = meta["bundle"]
+                    for payload in _iter_bundle_failure_payloads(
+                        bundle,
+                        error_text="bundle watchdog timeout",
+                        stage="bundle_watchdog_timeout",
+                    ):
+                        yield payload
+                continue
 
             meta = pending_futures.pop(done_future)
             bundle = meta["bundle"]
@@ -3084,32 +3583,12 @@ class ParallelKlineFetcher:
                 bundle_result = done_future.result()
             except Exception as exc:
                 error_text = str(exc)[:200]
-                for chunk in bundle.chunks:
-                    chunk_task_count = int(chunk.task_count)
-                    done_tasks += chunk_task_count
-                    _emit_log(
-                        "error",
-                        f"[Task Parallel] chunk 批次执行失败: {error_text}",
-                        {
-                            "stage": "chunk_failed",
-                            "bundle_index": int(bundle.bundle_id),
-                            "bundle_total": int(total_bundles),
-                            "chunk_id": str(chunk.chunk_id),
-                            "chunk_key": f"{chunk.code}|{chunk.freq}",
-                            "chunk_task_count": int(chunk_task_count),
-                            "chunk_failure_count": int(chunk_task_count),
-                            "fetch_tasks_done": int(done_tasks),
-                            "fetch_tasks_total": int(total_tasks),
-                        },
-                    )
-                    for task in chunk.tasks:
-                        yield _build_task_payload_for_kind(
-                            kind,
-                            task=task,
-                            rows=[],
-                            error=error_text,
-                            worker_pid=os.getpid(),
-                        )
+                for payload in _iter_bundle_failure_payloads(
+                    bundle,
+                    error_text=error_text,
+                    stage="chunk_failed",
+                ):
+                    yield payload
                 continue
 
             report_map: Dict[str, Dict[str, Any]] = {}
@@ -3121,7 +3600,7 @@ class ParallelKlineFetcher:
                 report = report_map.get(str(chunk.chunk_id), {})
                 payloads = list(report.get("payloads") or [])
                 if len(payloads) < len(chunk.tasks):
-                    for task in chunk.tasks[len(payloads):]:
+                    for task in chunk.tasks[len(payloads) :]:
                         payloads.append(
                             _build_task_payload_for_kind(
                                 kind,
@@ -3140,8 +3619,14 @@ class ParallelKlineFetcher:
                     if not error_text:
                         continue
                     chunk_failure_count += 1
-                    task_obj = payload.get("task") if isinstance(payload.get("task"), dict) else {}
-                    task_symbol = str(task_obj.get("code") or task_obj.get("index_name") or "")
+                    task_obj = (
+                        payload.get("task")
+                        if isinstance(payload.get("task"), dict)
+                        else {}
+                    )
+                    task_symbol = str(
+                        task_obj.get("code") or task_obj.get("index_name") or ""
+                    )
                     failure_tasks.append(
                         {
                             "code": task_symbol,
@@ -3154,7 +3639,9 @@ class ParallelKlineFetcher:
 
                 done_tasks += chunk_task_count
                 chunk_hit_tasks = int(report.get("chunk_hit_tasks", 0) or 0)
-                chunk_network_page_calls = int(report.get("chunk_network_page_calls", 0) or 0)
+                chunk_network_page_calls = int(
+                    report.get("chunk_network_page_calls", 0) or 0
+                )
                 _emit_log(
                     "info",
                     "[Task Parallel] chunk 任务完成",
@@ -3170,7 +3657,9 @@ class ParallelKlineFetcher:
                         "chunk_network_page_calls": int(chunk_network_page_calls),
                         "fetch_tasks_done": int(done_tasks),
                         "fetch_tasks_total": int(total_tasks),
-                        "failure_codes": [str(chunk.code)] if chunk_failure_count > 0 else [],
+                        "failure_codes": [str(chunk.code)]
+                        if chunk_failure_count > 0
+                        else [],
                         "failure_tasks": failure_tasks,
                     },
                 )
@@ -3184,7 +3673,9 @@ class ParallelKlineFetcher:
         task_kind: str,
         tasks: List[Dict[str, Any]],
         queue: Optional[Any] = None,
-        preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+        preprocessor_operator: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
     ) -> List[Dict[str, Any]]:
         """
         同步执行 task 列表（stock/index 共用），并实时写入队列。
@@ -3196,9 +3687,7 @@ class ParallelKlineFetcher:
         kind = str(task_kind or "stock").strip().lower()
         normalize_item = _chunk_task_kind_profile(kind)["normalize_item"]
         sync_log_label = (
-            "主进程指数 chunk 执行模式"
-            if kind == "index"
-            else "主进程 chunk 执行模式"
+            "主进程指数 chunk 执行模式" if kind == "index" else "主进程 chunk 执行模式"
         )
 
         self._validate_queue(queue)
@@ -3228,7 +3717,9 @@ class ParallelKlineFetcher:
                 f"任务数={total_tasks})"
             ),
         )
-        iterator = self._iter_task_payloads_inproc_chunked(normalized_tasks, task_kind=kind)
+        iterator = self._iter_task_payloads_inproc_chunked(
+            normalized_tasks, task_kind=kind
+        )
 
         for raw_payload in iterator:
             error_text = str(raw_payload.get("error") or "").strip()
@@ -3236,7 +3727,9 @@ class ParallelKlineFetcher:
                 failed_tasks += 1
             else:
                 success_tasks += 1
-            processed_payload = self._apply_preprocessor_operator(raw_payload, preprocessor_operator)
+            processed_payload = self._apply_preprocessor_operator(
+                raw_payload, preprocessor_operator
+            )
             if processed_payload is None:
                 continue
             outputs.append(processed_payload)
@@ -3258,7 +3751,9 @@ class ParallelKlineFetcher:
         *,
         tasks: List[Dict[str, Any]],
         queue: Optional[Any] = None,
-        preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+        preprocessor_operator: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
     ) -> List[Dict[str, Any]]:
         """同步执行股票 task 列表，并实时写入队列。"""
         return self._fetch_tasks_sync(
@@ -3273,7 +3768,9 @@ class ParallelKlineFetcher:
         *,
         tasks: List[Dict[str, Any]],
         queue: Optional[Any] = None,
-        preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+        preprocessor_operator: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
     ) -> List[Dict[str, Any]]:
         """同步执行指数 task 列表，并实时写入队列。"""
         return self._fetch_tasks_sync(
@@ -3289,7 +3786,9 @@ class ParallelKlineFetcher:
         task_kind: str,
         tasks: List[Dict[str, Any]],
         queue: Optional[Any] = None,
-        preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+        preprocessor_operator: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
     ) -> StockKlineJob:
         """
         异步启动 task 执行（stock/index 共用）并立即返回句柄。
@@ -3301,9 +3800,7 @@ class ParallelKlineFetcher:
         kind = str(task_kind or "stock").strip().lower()
         normalize_item = _chunk_task_kind_profile(kind)["normalize_item"]
         async_log_label = (
-            "进程池指数 chunk 执行模式"
-            if kind == "index"
-            else "进程池 chunk 执行模式"
+            "进程池指数 chunk 执行模式" if kind == "index" else "进程池 chunk 执行模式"
         )
         thread_prefix = (
             "zsdtdx_index_kline_async"
@@ -3341,7 +3838,9 @@ class ParallelKlineFetcher:
                     f"任务数={total_tasks})"
                 ),
             )
-            iterator = self._iter_task_payloads_parallel_chunked(normalized_tasks, task_kind=kind)
+            iterator = self._iter_task_payloads_parallel_chunked(
+                normalized_tasks, task_kind=kind
+            )
 
             for raw_payload in iterator:
                 error_text = str(raw_payload.get("error") or "").strip()
@@ -3349,7 +3848,9 @@ class ParallelKlineFetcher:
                     failed_tasks += 1
                 else:
                     success_tasks += 1
-                processed_payload = self._apply_preprocessor_operator(raw_payload, preprocessor_operator)
+                processed_payload = self._apply_preprocessor_operator(
+                    raw_payload, preprocessor_operator
+                )
                 if processed_payload is None:
                     continue
                 outputs.append(processed_payload)
@@ -3383,7 +3884,9 @@ class ParallelKlineFetcher:
         *,
         tasks: List[Dict[str, Any]],
         queue: Optional[Any] = None,
-        preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+        preprocessor_operator: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
     ) -> StockKlineJob:
         """异步启动股票 task 执行并立即返回句柄。"""
         return self._fetch_tasks_async(
@@ -3398,7 +3901,9 @@ class ParallelKlineFetcher:
         *,
         tasks: List[Dict[str, Any]],
         queue: Optional[Any] = None,
-        preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+        preprocessor_operator: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
     ) -> StockKlineJob:
         """异步启动指数 task 执行并立即返回句柄。"""
         return self._fetch_tasks_async(
@@ -3408,14 +3913,16 @@ class ParallelKlineFetcher:
             preprocessor_operator=preprocessor_operator,
         )
 
-    def fetch_stock(self, 
-                   codes: List[str],
-                   freqs: List[str],
-                   start_time: Optional[str],
-                   end_time: Optional[str]) -> pd.DataFrame:
+    def fetch_stock(
+        self,
+        codes: List[str],
+        freqs: List[str],
+        start_time: Optional[str],
+        end_time: Optional[str],
+    ) -> pd.DataFrame:
         """
         获取股票/期货K线数据
-        
+
         输入: 代码列表、频率列表、时间范围
         输出: 合并后的单个 DataFrame
         """
@@ -3426,19 +3933,28 @@ class ParallelKlineFetcher:
             return pd.DataFrame()
 
         if self.num_processes <= 1:
-            _emit_log("info", f"[Info] 进程数不足，使用串行模式 (进程数: {self.num_processes}, 任务数: {len(tasks)})")
+            _emit_log(
+                "info",
+                f"[Info] 进程数不足，使用串行模式 (进程数: {self.num_processes}, 任务数: {len(tasks)})",
+            )
             return self._fetch_serial(tasks, start_time, end_time)
 
-        _emit_log("info", f"[Info] 默认并行模式 (进程数: {self.num_processes}, 任务数: {len(tasks)})")
+        _emit_log(
+            "info",
+            f"[Info] 默认并行模式 (进程数: {self.num_processes}, 任务数: {len(tasks)})",
+        )
         return self._fetch_parallel(tasks, start_time, end_time)
-    
-    def _fetch_serial(self, tasks: List[Tuple[str, str]], 
-                     start_time: Optional[str], 
-                     end_time: Optional[str]) -> pd.DataFrame:
+
+    def _fetch_serial(
+        self,
+        tasks: List[Tuple[str, str]],
+        start_time: Optional[str],
+        end_time: Optional[str],
+    ) -> pd.DataFrame:
         """串行模式获取，返回合并后的DataFrame"""
         all_data = []
         failures = []
-        
+
         # 优先使用上下文客户端
         context_client = UnifiedTdxClient.get_active_context_client()
         if context_client is not None:
@@ -3447,55 +3963,72 @@ class ParallelKlineFetcher:
         else:
             client = UnifiedTdxClient(config_path=_active_config_path)
             should_close = True
-        
+
         try:
             for code, freq in tasks:
                 try:
                     is_future = is_future_code(code)
-                    iterator = client.get_future_kline if is_future else client.get_stock_kline
-                    
+                    iterator = (
+                        client.get_future_kline if is_future else client.get_stock_kline
+                    )
+
                     batch_count = 0
-                    for df in iterator(codes=code, freq=freq, start_time=start_time, end_time=end_time):
+                    for df in iterator(
+                        codes=code, freq=freq, start_time=start_time, end_time=end_time
+                    ):
                         if isinstance(df, pd.DataFrame) and not df.empty:
                             all_data.append(df)
                             batch_count += 1
-                    
+
                     # 如果没有获取到任何数据，记录为失败
                     if batch_count == 0:
                         failures.append((code, freq, "no_data"))
-                        
+
                 except Exception as e:
                     error_msg = str(e)[:100]
                     failures.append((code, freq, error_msg))
                     _emit_log("warning", f"[Serial Fetch Error] {code}/{freq}: {e}")
                     continue
-            
+
             # 记录失败信息到上下文客户端（如果存在）
-            if failures and context_client and hasattr(context_client, '_record_failure'):
+            if (
+                failures
+                and context_client
+                and hasattr(context_client, "_record_failure")
+            ):
                 for code, freq, error in failures:
-                    task_type = "future_kline" if is_future_code(code) else "stock_kline"
-                    context_client._record_failure(task_type, code, "fetch_error", error, freq)
+                    task_type = (
+                        "future_kline" if is_future_code(code) else "stock_kline"
+                    )
+                    context_client._record_failure(
+                        task_type, code, "fetch_error", error, freq
+                    )
         finally:
             if should_close:
                 try:
                     client.close()
                 except Exception as exc:
                     _emit_log("warning", f"[Serial Fetch] 关闭客户端失败: {exc}")
-        
+
         if all_data:
             return pd.concat(all_data, ignore_index=True)
         return pd.DataFrame()
-    
-    def _fetch_parallel(self, tasks: List[Tuple[str, str]],
-                       start_time: Optional[str],
-                       end_time: Optional[str]) -> pd.DataFrame:
+
+    def _fetch_parallel(
+        self,
+        tasks: List[Tuple[str, str]],
+        start_time: Optional[str],
+        end_time: Optional[str],
+    ) -> pd.DataFrame:
         """
         并行模式获取，返回合并后的单个 DataFrame
         """
         # 准备任务参数
-        task_args = [(i, code, freq, start_time, end_time) 
-                     for i, (code, freq) in enumerate(tasks)]
-        
+        task_args = [
+            (i, code, freq, start_time, end_time)
+            for i, (code, freq) in enumerate(tasks)
+        ]
+
         # 按进程数分片
         num_processes = self.num_processes
         chunks = [[] for _ in range(num_processes)]
@@ -3504,17 +4037,17 @@ class ParallelKlineFetcher:
         non_empty_chunks = [chunk for chunk in chunks if chunk]
         total_chunks = len(non_empty_chunks)
         total_tasks = len(task_args)
-        
+
         all_data = []
         all_failures = []
         done_tasks = 0
         total_timeout = max(1.0, float(self.parallel_total_timeout_seconds))
         per_future_timeout = max(1.0, float(self.parallel_result_timeout_seconds))
-        
+
         try:
             # 获取全局进程池
             executor = _get_global_process_pool(num_processes)
-            
+
             # 提交所有任务
             futures: Dict[Any, Dict[str, Any]] = {}
             for dispatch_idx, chunk in enumerate(non_empty_chunks, start=1):
@@ -3539,7 +4072,7 @@ class ParallelKlineFetcher:
                     "task_detail": task_detail,
                     "task_payload": task_payload,
                 }
-            
+
             # 收集结果
             pending_futures = set(futures.keys())
             timeout_started = time.monotonic()
@@ -3558,7 +4091,7 @@ class ParallelKlineFetcher:
                             chunk_failures=chunk_failures,
                             task_detail=meta["task_detail"],
                         )
-                        
+
                         if not chunk_df.empty:
                             all_data.append(chunk_df)
                         if chunk_failures:
@@ -3600,7 +4133,9 @@ class ParallelKlineFetcher:
             except TimeoutError:
                 unfinished = [future for future in pending_futures if not future.done()]
                 unfinished_meta = [futures[item] for item in unfinished]
-                unfinished_count = int(sum(len(meta.get("chunk", [])) for meta in unfinished_meta))
+                unfinished_count = int(
+                    sum(len(meta.get("chunk", [])) for meta in unfinished_meta)
+                )
                 elapsed = round(time.monotonic() - timeout_started, 3)
                 _emit_log(
                     "error",
@@ -3627,7 +4162,10 @@ class ParallelKlineFetcher:
                         _emit_log(
                             "warning",
                             "[Parallel Timeout] 已触发并行进程强制回收",
-                            {"stage": "chunk_timeout_recycled", "summary": recycle_summary},
+                            {
+                                "stage": "chunk_timeout_recycled",
+                                "summary": recycle_summary,
+                            },
                         )
                     except Exception as exc:
                         _emit_log(
@@ -3651,26 +4189,34 @@ class ParallelKlineFetcher:
                             "fallback_task_count": int(len(timeout_tasks)),
                         },
                     )
-                    fallback_df = self._fetch_serial(timeout_tasks, start_time, end_time)
+                    fallback_df = self._fetch_serial(
+                        timeout_tasks, start_time, end_time
+                    )
                     if isinstance(fallback_df, pd.DataFrame) and not fallback_df.empty:
                         all_data.append(fallback_df)
-            
+
             # 记录失败信息到上下文客户端（如果存在）
             if all_failures:
                 try:
                     context_client = UnifiedTdxClient.get_active_context_client()
-                    if context_client and hasattr(context_client, '_record_failure'):
+                    if context_client and hasattr(context_client, "_record_failure"):
                         for code, freq, error in all_failures:
-                            task_type = "future_kline" if is_future_code(code) else "stock_kline"
-                            context_client._record_failure(task_type, code, "fetch_error", error, freq)
+                            task_type = (
+                                "future_kline"
+                                if is_future_code(code)
+                                else "stock_kline"
+                            )
+                            context_client._record_failure(
+                                task_type, code, "fetch_error", error, freq
+                            )
                 except Exception as e:
                     _emit_log("warning", f"[Parallel] 记录失败信息时出错: {e}")
-                    
+
         except Exception as e:
             _emit_log("error", f"[Parallel Error] 执行失败: {e}")
             # 出错时回退到串行
             return self._fetch_serial(tasks, start_time, end_time)
-        
+
         # 合并所有结果
         if all_data:
             return pd.concat(all_data, ignore_index=True)
@@ -3708,4 +4254,3 @@ def get_fetcher() -> ParallelKlineFetcher:
     if _fetcher is None:
         _fetcher = ParallelKlineFetcher(config_path=_active_config_path)
     return _fetcher
-

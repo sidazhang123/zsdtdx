@@ -6,7 +6,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SRC = _ROOT / "src"
@@ -204,6 +204,8 @@ class TestUnifiedClientKlineWrapper(unittest.TestCase):
 
 class TestChunkBehaviorUnchangedOnNone(unittest.TestCase):
     def test_persistent_none_does_not_trigger_chunk_recover(self):
+        import asyncio
+
         import zsdtdx.parallel_fetcher as pf
 
         chunk_payload = {
@@ -242,12 +244,13 @@ class TestChunkBehaviorUnchangedOnNone(unittest.TestCase):
 
         with patch.object(
             pf,
-            "_fetch_one_task_chunk",
+            "_fetch_one_task_chunk_async",
+            new_callable=AsyncMock,
             return_value=stub_report,
         ) as fetch_mock, patch(
             "zsdtdx.parallel_fetcher._recover_worker_standard_connection_current_thread"
         ) as recover_mock:
-            result = pf._fetch_one_task_chunk(chunk_payload)
+            result = asyncio.run(pf._fetch_one_task_chunk_async(chunk_payload))
 
         fetch_mock.assert_called_once()
         recover_mock.assert_not_called()

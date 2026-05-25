@@ -20,7 +20,6 @@ from zsdtdx.parser.base import BaseParser
 
 
 class GetInstrumentInfo(BaseParser):
-
     """
     01 08 04 0b 00 01 0b 00 0b 00
 
@@ -37,6 +36,7 @@ class GetInstrumentInfo(BaseParser):
     Out[9]: 2
 
     """
+
     def setParams(self, start, count=100):
         """
         输入：
@@ -50,7 +50,7 @@ class GetInstrumentInfo(BaseParser):
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
         pkg = bytearray.fromhex("01 04 48 67 00 01 08 00 08 00 f5 23")
-        pkg.extend(struct.pack('<IH', start, count))
+        pkg.extend(struct.pack("<IH", start, count))
         self.send_pkg = pkg
 
     def parseResponse(self, body_buf):
@@ -69,12 +69,13 @@ class GetInstrumentInfo(BaseParser):
         pos += 6
         result = []
         for i in range(count):
-            (category, market, unused_bytes, code_raw, name_raw, desc_raw) = \
-                struct.unpack("<BB3s9s17s9s", body_buf[pos: pos+40])
+            (category, market, unused_bytes, code_raw, name_raw, desc_raw) = (
+                struct.unpack("<BB3s9s17s9s", body_buf[pos : pos + 40])
+            )
 
-            code = code_raw.decode("gbk", 'ignore')
-            name = name_raw.decode("gbk", 'ignore')
-            desc = desc_raw.decode("gbk", 'ignore')
+            code = code_raw.decode("gbk", "ignore")
+            name = name_raw.decode("gbk", "ignore")
+            desc = desc_raw.decode("gbk", "ignore")
 
             one = OrderedDict(
                 [

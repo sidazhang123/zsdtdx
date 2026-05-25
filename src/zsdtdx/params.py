@@ -13,13 +13,12 @@
 
 
 class TDXParams:
-
-    #市场
+    # 市场
 
     MARKET_SZ = 0  # 深圳
     MARKET_SH = 1  # 上海
 
-    #K线种类
+    # K线种类
     # K 线种类
     # 0 -   5 分钟K 线
     # 1 -   15 分钟K 线
@@ -47,13 +46,11 @@ class TDXParams:
     KLINE_TYPE_3MONTH = 10
     KLINE_TYPE_YEARLY = 11
 
-
     # ref : https://github.com/rainx/zsdtdx/issues/7
     # 分笔行情最多2000条
     MAX_TRANSACTION_COUNT = 2000
     # k先数据最多800条
     MAX_KLINE_COUNT = 800
-
 
     # 板块相关参数
     BLOCK_SZ = "block_zs.dat"

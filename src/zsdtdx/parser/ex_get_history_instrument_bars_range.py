@@ -14,7 +14,6 @@
 
 # coding=utf-8
 
-
 import datetime as _dt
 import struct
 from collections import OrderedDict
@@ -41,11 +40,8 @@ class GetHistoryInstrumentBarsRange(BaseParser):
         """
         self.seqid = 1
         BaseParser.__init__(self, *args, **kvargs)
-        
-        
-    def setParams(self, market, code, date,date2):
-        
-        
+
+    def setParams(self, market, code, date, date2):
         """
         输入：
         1. market: 输入参数，约束以协议定义与函数实现为准。
@@ -59,28 +55,29 @@ class GetHistoryInstrumentBarsRange(BaseParser):
         边界条件：
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
-        pkg = bytearray.fromhex('01')
+        pkg = bytearray.fromhex("01")
         pkg.extend(struct.pack("<B", self.seqid))
-        self.seqid = self.seqid+1
-        pkg.extend(bytearray.fromhex('38 92 00 01 16 00 16 00 0D 24'))
+        self.seqid = self.seqid + 1
+        pkg.extend(bytearray.fromhex("38 92 00 01 16 00 16 00 0D 24"))
         code = code.encode("utf-8")
-        #x =struct.pack("<B9s",  market, code)
-        pkg.extend(struct.pack("<B9s",  market, code))
-        pkg.extend(bytearray.fromhex('07 00'))
-        pkg.extend(struct.pack("<LL", date,date2))
-        #print(hexdump.hexdump(pkg))
+        # x =struct.pack("<B9s",  market, code)
+        pkg.extend(struct.pack("<B9s", market, code))
+        pkg.extend(bytearray.fromhex("07 00"))
+        pkg.extend(struct.pack("<LL", date, date2))
+        # print(hexdump.hexdump(pkg))
         self.send_pkg = pkg
-#      
+
+    #
 
     def parseResponse(self, body_buf):
-#        print('测试', body_buf)
-#        fileobj = open("a.bin", 'wb')  # make partfile
-#        fileobj.write(body_buf)  # write data into partfile
-#        fileobj.close()
-        #print(hexdump.hexdump(body_buf[0:1024]))
-#        import zlib
-#        d=zlib.decompress(body_buf[16:])        
-#        print(hexdump.hexdump(d))
+        #        print('测试', body_buf)
+        #        fileobj = open("a.bin", 'wb')  # make partfile
+        #        fileobj.write(body_buf)  # write data into partfile
+        #        fileobj.close()
+        # print(hexdump.hexdump(body_buf[0:1024]))
+        #        import zlib
+        #        d=zlib.decompress(body_buf[16:])
+        #        print(hexdump.hexdump(d))
         """
         输入：
         1. body_buf: 输入参数，约束以协议定义与函数实现为准。
@@ -92,7 +89,7 @@ class GetHistoryInstrumentBarsRange(BaseParser):
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
         pos = 12
-        (ret_count,) = struct.unpack("H", body_buf[pos: pos + 2])
+        (ret_count,) = struct.unpack("H", body_buf[pos : pos + 2])
         pos += 2
         if ret_count <= 0:
             return []
@@ -108,8 +105,8 @@ class GetHistoryInstrumentBarsRange(BaseParser):
         d2_arr = np.empty(ret_count, dtype=np.uint16)
 
         for i in range(ret_count):
-            d1, d2, open_price, high, low, close, position, trade, settlementprice = struct.unpack(
-                "<HHffffIIf", body_buf[pos:pos + 32]
+            d1, d2, open_price, high, low, close, position, trade, settlementprice = (
+                struct.unpack("<HHffffIIf", body_buf[pos : pos + 32])
             )
             pos += 32
             d1_arr[i] = d1
@@ -142,13 +139,19 @@ class GetHistoryInstrumentBarsRange(BaseParser):
         hours = d2 // 60
         minutes = d2 % 60
         datetimes: List[str] = [
-            f"{int(y):04d}-{int(m):02d}-{int(d):02d} {int(h):02d}:{int(mi):02d}"
+            f"{int(y):04d}-{int(m):02d}-{int(d):02d} {int(h):02d}:{int(mi):02d}:00"
             for y, m, d, h, mi in zip(years, months, days, hours, minutes)
         ]
         timestamps = np.empty(ret_count, dtype=np.int64)
         for i in range(ret_count):
             timestamps[i] = int(
-                _dt.datetime(int(years[i]), int(months[i]), int(days[i]), int(hours[i]), int(minutes[i])).timestamp()
+                _dt.datetime(
+                    int(years[i]),
+                    int(months[i]),
+                    int(days[i]),
+                    int(hours[i]),
+                    int(minutes[i]),
+                ).timestamp()
             )
 
         klines: List[Dict[str, Any]] = [None] * ret_count  # type: ignore[list-item]
@@ -167,13 +170,13 @@ class GetHistoryInstrumentBarsRange(BaseParser):
                 ]
             )
         return klines
-        
-    
-#00000000  01 01 08 6A 01 01 16 00  16 00 FF 23 2F 49 46 4C   ...j.... ...#/IFL 
-#00000010  30 00 F0 F4 94 13 07 00  01 00 00 00 00 00 F0 00   0....... ........ 
-    
-#00000000: 01 01 08 6A 01 01 16 00  16 00 FF 23 4A 4E 56 44  ...j.......#JNVD
-#00000010: 41 00 C0 EC A3 13 07 00  01 00 00 00 00 00 C0 03  A...............    
 
-#00000000  01 01 08 6A 01 01 16 00  16 00 FF 23 2F 49 46 31   ...j.... ...#/IF1
-#00000010  37 30 39 00 94 13 07 00  01 00 00 00 00 00 F0 00   709..... ........
+
+# 00000000  01 01 08 6A 01 01 16 00  16 00 FF 23 2F 49 46 4C   ...j.... ...#/IFL
+# 00000010  30 00 F0 F4 94 13 07 00  01 00 00 00 00 00 F0 00   0....... ........
+
+# 00000000: 01 01 08 6A 01 01 16 00  16 00 FF 23 4A 4E 56 44  ...j.......#JNVD
+# 00000010: 41 00 C0 EC A3 13 07 00  01 00 00 00 00 00 C0 03  A...............
+
+# 00000000  01 01 08 6A 01 01 16 00  16 00 FF 23 2F 49 46 31   ...j.... ...#/IF1
+# 00000010  37 30 39 00 94 13 07 00  01 00 00 00 00 00 F0 00   709..... ........

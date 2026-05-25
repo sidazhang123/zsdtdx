@@ -64,7 +64,7 @@ def _cleanup_all_clients():
         clients = list(_all_clients)
     for client in clients:
         try:
-            if hasattr(client, 'close'):
+            if hasattr(client, "close"):
                 client.close()
         except Exception:
             pass
@@ -115,18 +115,19 @@ def update_last_ack_time(func):
                 message = f"TDX 协议调用失败: {method_name}{endpoint}: {e}"
                 raise TdxFunctionCallError(message, original_exception=e) from e
         return ret
+
     return wrapper
 
 
 class TrafficStatSocket(socket.socket):
     """
     流量统计Socket
-    
+
     职责：
     1. 继承socket.socket，增加流量统计功能。
     2. 记录发送/接收的包数和字节数。
     3. 记录第一个包发送时间，用于计算平均速率。
-    
+
     边界：
     1. 所有统计字段在socket操作后由外部更新。
     """
@@ -152,12 +153,12 @@ class TrafficStatSocket(socket.socket):
 class BaseSocketClient(object):
     """
     基础Socket客户端
-    
+
     职责：
     1. 管理TCP连接的生命周期（建立、断开、心跳）。
     2. 提供异常处理机制。
     3. 通过atexit注册确保程序退出时清理连接。
-    
+
     边界：
     1. 子类需实现setup()方法完成协议初始化。
     2. 连接异常时根据raise_exception配置决定行为。
@@ -186,11 +187,18 @@ class BaseSocketClient(object):
         self.ip = None
         self.port = None
         self.raise_exception = raise_exception
-        
+
         # 注册到全局清理列表
         _register_client(self)
 
-    def connect(self, ip='101.227.73.20', port=7709, time_out=CONNECT_TIMEOUT, bindport=None, bindip='0.0.0.0'):
+    def connect(
+        self,
+        ip="101.227.73.20",
+        port=7709,
+        time_out=CONNECT_TIMEOUT,
+        bindport=None,
+        bindip="0.0.0.0",
+    ):
         """
         输入：服务器IP、端口、超时时间、绑定端口、绑定IP
         输出：是否连接成功（bool）或self（链式调用）
@@ -251,7 +259,8 @@ class BaseSocketClient(object):
         if self.heartbeat:
             self.stop_event = threading.Event()
             self.heartbeat_thread = HqHeartBeatThread(
-                self, self.stop_event, self.heartbeat_interval)
+                self, self.stop_event, self.heartbeat_interval
+            )
             self.heartbeat_thread.start()
         return self
 
@@ -325,8 +334,9 @@ class BaseSocketClient(object):
                 "last_api_recv_bytes": 0,
             }
         if self.client.first_pkg_send_time is not None:
-            total_seconds = (datetime.datetime.now() -
-                             self.client.first_pkg_send_time).total_seconds()
+            total_seconds = (
+                datetime.datetime.now() - self.client.first_pkg_send_time
+            ).total_seconds()
             if total_seconds != 0:
                 send_bytes_per_second = self.client.send_pkg_bytes // total_seconds
                 recv_bytes_per_second = self.client.recv_pkg_bytes // total_seconds
@@ -409,6 +419,10 @@ class BaseSocketClient(object):
         if isinstance(v, list):
             return pd.DataFrame(data=v)
         elif isinstance(v, dict):
-            return pd.DataFrame(data=[v, ])
+            return pd.DataFrame(
+                data=[
+                    v,
+                ]
+            )
         else:
-            return pd.DataFrame(data=[{'value': v}])
+            return pd.DataFrame(data=[{"value": v}])

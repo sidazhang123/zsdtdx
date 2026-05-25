@@ -22,7 +22,9 @@ from zsdtdx.log import DEBUG, log
 
 try:
     import cython
+
     if cython.compiled:
+
         def buffer(x):
             """
             输入：
@@ -37,6 +39,7 @@ try:
             return x
 except ImportError:
     pass
+
 
 class SocketClientNotReady(Exception):
     pass
@@ -57,10 +60,11 @@ class ResponseHeaderRecvFails(Exception):
 class ResponseRecvFails(Exception):
     pass
 
+
 RSP_HEADER_LEN = 0x10
 
-class BaseParser(object):
 
+class BaseParser(object):
     def __init__(self, client, lock=None):
         """
         输入：
@@ -119,7 +123,6 @@ class BaseParser(object):
         """
         pass
 
-
     def call_api(self):
         """
         输入：
@@ -140,7 +143,6 @@ class BaseParser(object):
         return result
 
     def _call_api(self):
-
         """
         输入：
         1. 无显式输入参数。
@@ -153,10 +155,10 @@ class BaseParser(object):
         """
         self.setup()
 
-        if not(self.client):
+        if not (self.client):
             raise SocketClientNotReady("socket client not ready")
 
-        if not(self.send_pkg):
+        if not (self.send_pkg):
             raise SendPkgNotReady("send pkg not ready")
 
         nsended = self.client.send(self.send_pkg)
@@ -176,7 +178,9 @@ class BaseParser(object):
         else:
             head_buf = self.client.recv(self.rsp_header_len)
             if DEBUG:
-                log.debug("recv head_buf:" + str(head_buf)  + " |len is :" + str(len(head_buf)))
+                log.debug(
+                    "recv head_buf:" + str(head_buf) + " |len is :" + str(len(head_buf))
+                )
             if len(head_buf) == self.rsp_header_len:
                 self.client.recv_pkg_num += 1
                 self.client.recv_pkg_bytes += self.rsp_header_len
@@ -193,7 +197,7 @@ class BaseParser(object):
                     self.client.recv_pkg_bytes += len_buf
                     last_api_recv_bytes += len_buf
                     body_buf.extend(buf)
-                    if not(buf) or len_buf == 0 or len(body_buf) == zipsize:
+                    if not (buf) or len_buf == 0 or len(body_buf) == zipsize:
                         break
 
                 self.client.last_api_recv_bytes = last_api_recv_bytes
@@ -220,4 +224,3 @@ class BaseParser(object):
             else:
                 log.debug("head_buf is not 0x10")
                 raise ResponseHeaderRecvFails("head_buf is not 0x10 : " + str(head_buf))
-

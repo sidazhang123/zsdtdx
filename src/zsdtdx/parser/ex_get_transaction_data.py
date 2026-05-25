@@ -23,7 +23,6 @@ from zsdtdx.parser.base import BaseParser
 
 
 class GetTransactionData(BaseParser):
-
     def setParams(self, market, code, start, count):
         """
         输入：
@@ -40,12 +39,11 @@ class GetTransactionData(BaseParser):
         """
         if type(code) is six.text_type:
             code = code.encode("utf-8")
-        pkg = bytearray.fromhex('01 01 08 00 03 01 12 00 12 00 fc 23')
+        pkg = bytearray.fromhex("01 01 08 00 03 01 12 00 12 00 fc 23")
         pkg.extend(struct.pack("<B9siH", market, code, start, count))
         self.send_pkg = pkg
 
     def parseResponse(self, body_buf):
-
         """
         输入：
         1. body_buf: 输入参数，约束以协议定义与函数实现为准。
@@ -57,12 +55,13 @@ class GetTransactionData(BaseParser):
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
         pos = 0
-        market, code, _, num = struct.unpack('<B9s4sH', body_buf[pos: pos + 16])
+        market, code, _, num = struct.unpack("<B9s4sH", body_buf[pos : pos + 16])
         pos += 16
         result = []
         for i in range(num):
-
-            (raw_time, price, volume, zengcang, direction) = struct.unpack("<HIIiH", body_buf[pos: pos + 16])
+            (raw_time, price, volume, zengcang, direction) = struct.unpack(
+                "<HIIiH", body_buf[pos : pos + 16]
+            )
 
             pos += 16
             hour = raw_time // 60
@@ -74,7 +73,9 @@ class GetTransactionData(BaseParser):
             if second > 59:
                 second = 0
 
-            date = datetime.datetime.combine(datetime.date.today(), datetime.time(hour,minute,second))
+            date = datetime.datetime.combine(
+                datetime.date.today(), datetime.time(hour, minute, second)
+            )
 
             value = direction // 10000
 
@@ -121,31 +122,34 @@ class GetTransactionData(BaseParser):
                 else:
                     nature_name = "换手"
 
-            if market in [31,48]:
+            if market in [31, 48]:
                 if nature == 0:
                     direction = 1
-                    nature_name = 'B'
+                    nature_name = "B"
                 elif nature == 256:
                     direction = -1
-                    nature_name = 'S'
-                else: #512
+                    nature_name = "S"
+                else:  # 512
                     direction = 0
-                    nature_name = ''
+                    nature_name = ""
 
-
-            result.append(OrderedDict([
-                ("date", date),
-                ("hour", hour),
-                ("minute", minute),
-                ("second", second),
-                ("price", price),
-                ("volume", volume),
-                ("zengcang", zengcang),
-                ("nature", nature),
-                ("nature_mark", nature // 10000),
-                ("nature_value", nature % 10000),
-                ("nature_name", nature_name),
-                ("direction", direction),
-            ]))
+            result.append(
+                OrderedDict(
+                    [
+                        ("date", date),
+                        ("hour", hour),
+                        ("minute", minute),
+                        ("second", second),
+                        ("price", price),
+                        ("volume", volume),
+                        ("zengcang", zengcang),
+                        ("nature", nature),
+                        ("nature_mark", nature // 10000),
+                        ("nature_value", nature % 10000),
+                        ("nature_name", nature_name),
+                        ("direction", direction),
+                    ]
+                )
+            )
 
         return result

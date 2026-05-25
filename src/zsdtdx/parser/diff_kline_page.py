@@ -7,7 +7,7 @@
 
 边界：
 1. 仅处理 get_security_bars / get_index_bars 同构回包，不承担分页。
-2. 时间：本层从二进制解析年月日时分，仅用于填充 datetime 与 _ts；不向 dict 返回分列字段。
+2. 时间：本层从二进制解析年月日时分，写入 datetime 为 `YYYY-MM-DD HH:MM:SS`（秒位固定 `:00`）与 `_ts`；不向 dict 返回分列字段。
 3. socket 层以上（unified_client 等）只消费 datetime/_ts，不再解析 year/month/day/hour/minute。
 """
 
@@ -65,7 +65,12 @@ def parse_diff_encoded_kline_page(
             hour = int(tminutes / 60)
             minute = tminutes % 60
         else:
-            zipday = buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16) | (buf[pos + 3] << 24)
+            zipday = (
+                buf[pos]
+                | (buf[pos + 1] << 8)
+                | (buf[pos + 2] << 16)
+                | (buf[pos + 3] << 24)
+            )
             year = int(zipday / 10000)
             month = int((zipday % 10000) / 100)
             day = zipday % 100
@@ -78,10 +83,14 @@ def parse_diff_encoded_kline_page(
         price_high_diff, pos = get_price(buf, pos)
         price_low_diff, pos = get_price(buf, pos)
 
-        vol_raw = buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16) | (buf[pos + 3] << 24)
+        vol_raw = (
+            buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16) | (buf[pos + 3] << 24)
+        )
         vol = get_volume(vol_raw)
         pos += 4
-        dbvol_raw = buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16) | (buf[pos + 3] << 24)
+        dbvol_raw = (
+            buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16) | (buf[pos + 3] << 24)
+        )
         dbvol = get_volume(dbvol_raw)
         pos += 4
 
@@ -103,10 +112,12 @@ def parse_diff_encoded_kline_page(
         lows[i] = low_v
         volumes[i] = vol
         amounts[i] = dbvol
-        datetimes[i] = f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}"
+        datetimes[i] = f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:00"
         timestamps[i] = int(_dt.datetime(year, month, day, hour, minute).timestamp())
 
-    format_socket_kline_page_inplace(opens, closes, highs, lows, volumes, amounts, ret_count)
+    format_socket_kline_page_inplace(
+        opens, closes, highs, lows, volumes, amounts, ret_count
+    )
 
     klines: List[Dict[str, Any]] = [None] * ret_count  # type: ignore[list-item]
     for i in range(ret_count):

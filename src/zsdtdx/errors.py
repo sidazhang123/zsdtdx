@@ -16,7 +16,9 @@ class TdxConnectionError(Exception):
     """
     当连接服务器出错的时候，会抛出的异常
     """
+
     pass
+
 
 class TdxFunctionCallError(Exception):
     """
@@ -32,10 +34,8 @@ class TdxFunctionCallError(Exception):
     1. `original_exception` 可能为 None（仅消息、无包装原因时）。
     """
 
-    def __init__(self, message: str = "", *, original_exception: BaseException | None = None):
+    def __init__(
+        self, message: str = "", *, original_exception: BaseException | None = None
+    ):
         super().__init__(message)
         self.original_exception = original_exception
-
-
-
-

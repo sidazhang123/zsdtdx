@@ -39,7 +39,7 @@ def get_price(data, pos):
     """
     pos_byte = 6
     bdata = indexbytes(data, pos)
-    intdata = bdata & 0x3f
+    intdata = bdata & 0x3F
     if bdata & 0x40:
         sign = True
     else:
@@ -49,7 +49,7 @@ def get_price(data, pos):
         while True:
             pos += 1
             bdata = indexbytes(data, pos)
-            intdata += (bdata & 0x7f) << pos_byte
+            intdata += (bdata & 0x7F) << pos_byte
             pos_byte += 7
 
             if not (bdata & 0x80):
@@ -90,13 +90,13 @@ def get_volume(ivol):
     2. `if hleax > 0x80` 是严格大于；`hleax == 0x80` 必须走 else 分支。
     """
     logpoint = ivol >> 24
-    hleax = (ivol >> 16) & 0xff
-    lheax = (ivol >> 8) & 0xff
-    lleax = ivol & 0xff
+    hleax = (ivol >> 16) & 0xFF
+    lheax = (ivol >> 8) & 0xFF
+    lleax = ivol & 0xFF
 
-    ecx = (logpoint << 1) - 0x7f
+    ecx = (logpoint << 1) - 0x7F
     edx = (logpoint << 1) - 0x86
-    esi = (logpoint << 1) - 0x8e
+    esi = (logpoint << 1) - 0x8E
     eax = (logpoint << 1) - 0x96
 
     # dbl_xmm6 = pow(2.0, |ecx|)；ecx<0 时取倒数（与 pytdx 一致：abs(ecx) 后再倒）。
@@ -108,7 +108,7 @@ def get_volume(ivol):
     # hleax 分支：严格 > 0x80 走大分支（pytdx 行为，hleax == 0x80 走 else）。
     if hleax > 0x80:
         # pytdx: pow(2, edx) * 128 + (hleax&0x7f) * pow(2, edx+1)；edx 可正可负，缓存覆盖。
-        dbl_xmm0 = _POW2_CACHE[edx] * 128.0 + (hleax & 0x7f) * _POW2_CACHE[edx + 1]
+        dbl_xmm0 = _POW2_CACHE[edx] * 128.0 + (hleax & 0x7F) * _POW2_CACHE[edx + 1]
     else:
         if edx >= 0:
             dbl_xmm0 = _POW2_CACHE[edx] * hleax
@@ -174,54 +174,6 @@ def format_socket_kline_page_inplace(
         np.rint(positions[sl], out=positions[sl])
 
 
-def format_socket_bar_ohlc_2dp(value: Any) -> Any:
-    """
-    协议解析层标量格式：开/高/低/收保留两位小数。
-
-    输入：
-    1. value: 解析得到的原始数值或可转 float 的类型。
-    输出：
-    1. float，语义与 `format_socket_kline_page_inplace` 对 OHLC 一致。
-    用途：
-    1. 无法批量数组化的 parser 分支（如逐条 struct 解析）复用同一刻度。
-    边界条件：
-    1. None 返回 None；不可解析时原样返回。
-    """
-    if value is None:
-        return None
-    try:
-        import numpy as np
-
-        x = float(value)
-    except (TypeError, ValueError):
-        return value
-    return float(np.round(np.float64(x), 2))
-
-
-def format_socket_bar_amount_volume_int(value: Any) -> Any:
-    """
-    协议解析层标量格式：成交量、成交额为整数（四舍五入）。
-
-    输入：
-    1. value: 解析得到的原始数值或可转 float 的类型。
-    输出：
-    1. int；None 输入返回 None。
-    用途：
-    1. 与批量 `np.rint` 语义一致的标量出口。
-    边界条件：
-    1. 不可解析时原样返回。
-    """
-    if value is None:
-        return None
-    try:
-        import numpy as np
-
-        x = float(value)
-    except (TypeError, ValueError):
-        return value
-    return int(np.rint(np.float64(x)))
-
-
 def get_datetime(category, buffer, pos):
     """
     输入：
@@ -241,7 +193,7 @@ def get_datetime(category, buffer, pos):
     hour = 15
     minute = 0
     if category < 4 or category == 7 or category == 8:
-        (zipday, tminutes) = struct.unpack("<HH", buffer[pos: pos + 4])
+        (zipday, tminutes) = struct.unpack("<HH", buffer[pos : pos + 4])
         year = (zipday >> 11) + 2004
         month = int((zipday % 2048) / 100)
         day = (zipday % 2048) % 100
@@ -249,9 +201,9 @@ def get_datetime(category, buffer, pos):
         hour = int(tminutes / 60)
         minute = tminutes % 60
     else:
-        (zipday,) = struct.unpack("<I", buffer[pos: pos + 4])
+        (zipday,) = struct.unpack("<I", buffer[pos : pos + 4])
 
-        year = int(zipday / 10000);
+        year = int(zipday / 10000)
         month = int((zipday % 10000) / 100)
         day = zipday % 100
 
@@ -272,12 +224,13 @@ def get_time(buffer, pos):
     边界条件：
     1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
     """
-    (tminutes, ) = struct.unpack("<H", buffer[pos: pos + 2])
+    (tminutes,) = struct.unpack("<H", buffer[pos : pos + 2])
     hour = int(tminutes / 60)
     minute = tminutes % 60
     pos += 2
 
     return hour, minute, pos
+
 
 def indexbytes(data, pos):
     """
@@ -386,7 +339,9 @@ def normalize_task_time_window(start_time: Any, end_time: Any) -> tuple[str, str
         end_dt = end_dt.replace(hour=16, minute=0, second=0, microsecond=0)
         end_fmt = "ymd_hms_slash" if end_fmt == "ymd_slash" else "ymd_hms_dash"
 
-    return format_task_datetime(start_dt, start_fmt), format_task_datetime(end_dt, end_fmt)
+    return format_task_datetime(start_dt, start_fmt), format_task_datetime(
+        end_dt, end_fmt
+    )
 
 
 def normalize_future_time_window(start_time: Any, end_time: Any) -> tuple[str, str]:
@@ -410,10 +365,14 @@ def normalize_future_time_window(start_time: Any, end_time: Any) -> tuple[str, s
         end_dt = end_dt.replace(hour=15, minute=0, second=0, microsecond=0)
         end_fmt = "ymd_hms_slash" if end_fmt == "ymd_slash" else "ymd_hms_dash"
 
-    return format_task_datetime(start_dt, start_fmt), format_task_datetime(end_dt, end_fmt)
+    return format_task_datetime(start_dt, start_fmt), format_task_datetime(
+        end_dt, end_fmt
+    )
 
 
-def normalize_task_input(task: Sequence[Any], task_cls: Type[Any]) -> List[Dict[str, str]]:
+def normalize_task_input(
+    task: Sequence[Any], task_cls: Type[Any]
+) -> List[Dict[str, str]]:
     """
     标准化 task 列表输入。
 
@@ -436,29 +395,6 @@ def normalize_task_input(task: Sequence[Any], task_cls: Type[Any]) -> List[Dict[
     if not normalized:
         raise ValueError("task 列表不能为空")
     return normalized
-
-
-def resolve_active_config_path(
-    config_path: Optional[str],
-    active_config_path: Optional[str],
-    default_config_path: str,
-) -> str:
-    """
-    解析当前生效配置路径。
-
-    输入：
-    1. config_path: 可选显式路径。
-    2. active_config_path: 当前活动配置路径。
-    3. default_config_path: 默认配置路径。
-    输出：
-    1. 应使用的配置路径字符串。
-    """
-    requested = str(config_path or "").strip()
-    if requested:
-        return requested
-    if active_config_path:
-        return str(active_config_path)
-    return str(default_config_path)
 
 
 def borrow_client(
@@ -639,6 +575,7 @@ def _ensure_active_config_ready(caller_name: str) -> str:
     if _ACTIVE_CONFIG_PATH:
         # avoid circular import
         from zsdtdx.parallel_fetcher import set_active_config_path
+
         set_active_config_path(_ACTIVE_CONFIG_PATH)
         return str(_ACTIVE_CONFIG_PATH)
 

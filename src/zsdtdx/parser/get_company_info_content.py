@@ -21,7 +21,6 @@ from zsdtdx.parser.base import BaseParser
 
 
 class GetCompanyInfoContent(BaseParser):
-
     def setParams(self, market, code, filename, start, length):
         """
         输入：
@@ -44,11 +43,12 @@ class GetCompanyInfoContent(BaseParser):
             filename = filename.encode("utf-8")
 
         if len(filename) != 80:
-            filename = filename.ljust(80, b'\x00')
+            filename = filename.ljust(80, b"\x00")
 
-
-        pkg = bytearray.fromhex(u'0c 07 10 9c 00 01 68 00 68 00 d0 02')
-        pkg.extend(struct.pack(u"<H6sH80sIII", market, code, 0, filename, start, length, 0))
+        pkg = bytearray.fromhex("0c 07 10 9c 00 01 68 00 68 00 d0 02")
+        pkg.extend(
+            struct.pack("<H6sH80sIII", market, code, 0, filename, start, length, 0)
+        )
         self.send_pkg = pkg
 
     def parseResponse(self, body_buf):
@@ -65,7 +65,7 @@ class GetCompanyInfoContent(BaseParser):
             遇到非法字节时忽略该字节，不抛出异常中断流程。
         """
         pos = 0
-        _, length = struct.unpack(u'<10sH', body_buf[:12])
+        _, length = struct.unpack("<10sH", body_buf[:12])
         pos += 12
-        content = body_buf[pos: pos+length]
-        return content.decode('gbk', 'ignore')
+        content = body_buf[pos : pos + length]
+        return content.decode("gbk", "ignore")

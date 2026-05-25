@@ -6,6 +6,10 @@
 3. 提供同步/异步两种股票/指数 K 线任务获取模式。
 4. 暴露并行进程池生命周期管理入口（prewarm/restart/destroy）。
 
+数据契约：
+1. 股票/指数任务仅传日期时，start/end 分别补齐为 09:30:00 / 16:00:00。
+2. K 线 rows 的 datetime 统一为 YYYY-MM-DD HH:MM:SS，秒位固定 :00。
+
 调用约定：
 1. 程序启动阶段先调用 `set_config_path()` 设置配置路径；后续各接口无需重复传参。
 2. 若未调用 `set_config_path()`，首次调用相关接口会打印提醒并回退到包内默认配置。
@@ -21,7 +25,6 @@ from __future__ import annotations
 import datetime as dt
 import queue as std_queue
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import pandas as pd
@@ -29,7 +32,6 @@ import pandas as pd
 from zsdtdx.helper import (
     _apply_active_config_path,
     _ensure_active_config_ready,
-    _DEFAULT_CONFIG_PATH,
     call_with_client as _call_with_client,
     normalize_future_time_window as _normalize_future_time_window,
     normalize_task_input as _normalize_task_input,
@@ -42,7 +44,6 @@ from zsdtdx.parallel_fetcher import (
     force_restart_parallel_fetcher as _force_restart_parallel_fetcher,
     get_fetcher,
     prewarm_parallel_fetcher as _prewarm_parallel_fetcher,
-    set_active_config_path,
 )
 from zsdtdx.unified_client import UnifiedTdxClient
 
@@ -60,6 +61,7 @@ _TASK_FREQ_MAP: Dict[str, str] = {
     "5min": "5",
 }
 
+
 @dataclass
 class StockKlineTask:
     """
@@ -68,13 +70,14 @@ class StockKlineTask:
     输入：
     1. code: 股票代码。
     2. freq: 周期，支持 d/w/m/60/30/15/5 及同义写法。
-    3. start_time/end_time: 时间窗口。
+    3. start_time/end_time: 时间窗口（仅日期时在 to_dict 中补齐为 09:30:00 / 16:00:00）。
     输出：
     1. 通过 `to_dict()` 输出标准化 task 字典。
     用途：
     1. 为 get_stock_kline 提供显式、可校验的任务对象。
     边界条件：
     1. 四个核心字段任一为空均会校验失败。
+    2. 归一化后的任务时间字符串会进入并行链路；K 线 bar 的 datetime 见模块顶「数据契约」。
     """
 
     code: Any
@@ -126,7 +129,9 @@ class StockKlineTask:
         1. 会先执行 validate；失败时抛错。
         """
         self.validate()
-        normalized_start, normalized_end = _normalize_task_time_window(self.start_time, self.end_time)
+        normalized_start, normalized_end = _normalize_task_time_window(
+            self.start_time, self.end_time
+        )
         return {
             "code": str(self.code).strip(),
             "freq": _TASK_FREQ_MAP[str(self.freq).strip().lower()],
@@ -168,13 +173,14 @@ class IndexKlineTask:
     输入：
     1. index_name: 指数中文名称（会走配置映射/别名解析）。
     2. freq: 周期，与 `_TASK_FREQ_MAP` 一致（含 d/w/m/60/30/15/5 及同义写法）。
-    3. start_time/end_time: 时间窗口。
+    3. start_time/end_time: 时间窗口（仅日期时在 to_dict 中补齐为 09:30:00 / 16:00:00）。
     输出：
     1. 通过 `to_dict()` 输出标准化 task 字典。
     用途：
     1. 为 get_index_kline 提供显式、可校验的任务对象。
     边界条件：
     1. 四个核心字段任一为空均会校验失败。
+    2. get_index_kline(mode="async") 且未传 task 时会自动生成默认任务，不经过本类构造。
     """
 
     index_name: Any
@@ -226,7 +232,9 @@ class IndexKlineTask:
         1. 会先执行 validate；失败时抛错。
         """
         self.validate()
-        normalized_start, normalized_end = _normalize_task_time_window(self.start_time, self.end_time)
+        normalized_start, normalized_end = _normalize_task_time_window(
+            self.start_time, self.end_time
+        )
         return {
             "index_name": str(self.index_name).strip(),
             "freq": _TASK_FREQ_MAP[str(self.freq).strip().lower()],
@@ -411,7 +419,9 @@ def get_all_future_list(return_df: Optional[bool] = None, use_cache: bool = True
     ```
     """
     return _call_with_client(
-        lambda client: client.get_all_future_list(return_df=return_df, use_cache=use_cache),
+        lambda client: client.get_all_future_list(
+            return_df=return_df, use_cache=use_cache
+        ),
         get_active_context_client=UnifiedTdxClient.get_active_context_client,
         build_client=lambda: get_client(),
     )
@@ -420,7 +430,9 @@ def get_all_future_list(return_df: Optional[bool] = None, use_cache: bool = True
 def get_stock_kline(
     task: List[Any],
     queue: Optional[Any] = None,
-    preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+    preprocessor_operator: Optional[
+        Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+    ] = None,
     mode: str = "async",
 ) -> Any:
     """获取股票 K 线任务结果（任务化输入，支持同步/异步与队列实时回传）。
@@ -429,6 +441,12 @@ def get_stock_kline(
     - `mode="sync"` / `mode="async"`：均不要求前置 `with get_client()`；可选 with 以复用主进程连接并调用其它主进程 API。
     - `mode="async"`：数据抓取在 worker 进程内执行，不依赖 with 上下文。
     - `preprocessor_operator`：可选钩子，签名 `f(payload)->dict|None`，返回 None 时丢弃该条 data；OHLC/成交额/成交量默认刻度由协议解析层统一完成。
+
+    时间窗口:
+    - start_time/end_time 支持 str/date/datetime；仅日期时补齐 start=09:30:00、end=16:00:00。
+
+    K 线 datetime 输出:
+    - rows 中 `datetime` 为 `YYYY-MM-DD HH:MM:SS`，秒位固定 `:00`。
 
     调用示例（写法一：with 主进程上下文 + sync + 其它接口）:
     ```python
@@ -440,7 +458,7 @@ def get_stock_kline(
         get_stock_latest_price,
         get_supported_markets,
     )
-    
+
     with get_client():
         markets = get_supported_markets(return_df=True)
         prices = get_stock_latest_price(["600000", "000001"])
@@ -508,6 +526,7 @@ def get_stock_kline(
       - 传了 queue：可从传入的 queue（即 `job.queue`）消费事件。
     - task_payload 结构:
       `{"event":"data","task":{...},"rows":[...],"error":str|None,"worker_pid":int}`。
+      示例 rows 元素: `{"code":"sh.600000","freq":"d","open":10.07,"close":10.06,"high":10.25,"low":10.03,"volume":105771232,"amount":1072786048,"datetime":"2026-02-02 15:00:00"}`。
     - 队列最终会额外推送 done 事件:
       `{"event":"done","total_tasks":...,"success_tasks":...,"failed_tasks":...}`。
     """
@@ -540,7 +559,9 @@ def get_stock_kline(
 def get_index_kline(
     task: Optional[List[Any]] = None,
     queue: Optional[Any] = None,
-    preprocessor_operator: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+    preprocessor_operator: Optional[
+        Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+    ] = None,
     mode: str = "async",
 ) -> Any:
     """
@@ -556,6 +577,12 @@ def get_index_kline(
     - queue: 可选事件队列，需实现 `put()`。
     - preprocessor_operator: 可选钩子 `f(payload)->dict|None`，返回 None 时丢弃该条；默认数值刻度见协议解析层。
     - mode: `"sync"` 或 `"async"`。
+
+    时间窗口:
+    - 与 get_stock_kline 相同：仅日期时补齐 start=09:30:00、end=16:00:00。
+
+    K 线 datetime 输出:
+    - rows 中 `datetime` 为 `YYYY-MM-DD HH:MM:SS`，秒位固定 `:00`。
 
     返回:
     - mode="sync": `list[task_payload]`。
@@ -578,7 +605,9 @@ def get_index_kline(
             start_text = start_dt.strftime("%Y-%m-%d")
             end_text = end_dt.strftime("%Y-%m-%d")
 
-            def _build_default_index_tasks(client: UnifiedTdxClient) -> List[Dict[str, str]]:
+            def _build_default_index_tasks(
+                client: UnifiedTdxClient,
+            ) -> List[Dict[str, str]]:
                 """
                 基于运行时指数目录构建默认指数任务列表。
 
@@ -650,8 +679,12 @@ def get_index_kline(
             if pre_source in {"std", "ex"} and pre_code != "" and pre_market >= 0:
                 enriched_tasks.append(task_copy)
                 continue
-            route = client.resolve_index_name(index_name=task_item.get("index_name", ""), refresh=False)
-            task_copy["_index_route_source"] = str(route.get("source", "")).strip().lower()
+            route = client.resolve_index_name(
+                index_name=task_item.get("index_name", ""), refresh=False
+            )
+            task_copy["_index_route_source"] = (
+                str(route.get("source", "")).strip().lower()
+            )
             task_copy["_index_route_market"] = int(route.get("market", -1))
             task_copy["_index_route_code"] = str(route.get("code", "")).strip()
             task_copy["_index_route_name"] = str(route.get("name", "")).strip()
@@ -659,7 +692,9 @@ def get_index_kline(
         return enriched_tasks
 
     normalized_tasks = _call_with_client(
-        lambda client: _attach_index_routes(client=client, tasks_buffer=normalized_tasks),
+        lambda client: _attach_index_routes(
+            client=client, tasks_buffer=normalized_tasks
+        ),
         get_active_context_client=UnifiedTdxClient.get_active_context_client,
         build_client=lambda: get_client(),
     )
@@ -702,9 +737,9 @@ def prewarm_parallel_fetcher() -> Dict[str, Any]:
     _ensure_active_config_ready(caller_name="prewarm_parallel_fetcher")
     fetcher = get_fetcher()
     # 从 config 读取参数，兜底到内部默认值
-    require_all_workers = getattr(fetcher, 'auto_prewarm_require_all_workers', True)
-    timeout_seconds = getattr(fetcher, 'auto_prewarm_timeout_seconds', 60.0)
-    max_rounds = getattr(fetcher, 'auto_prewarm_max_rounds', 3)
+    require_all_workers = getattr(fetcher, "auto_prewarm_require_all_workers", True)
+    timeout_seconds = getattr(fetcher, "auto_prewarm_timeout_seconds", 60.0)
+    max_rounds = getattr(fetcher, "auto_prewarm_max_rounds", 3)
     # target_workers 没有对应的 config 参数，使用 None（让内部决定）
     target_workers = None
     return _prewarm_parallel_fetcher(
@@ -802,13 +837,13 @@ def get_future_kline(
     调用示例:
     ```python
     from zsdtdx import get_client, get_future_kline
-    
+
     with get_client():
         # 获取多个期货、多个周期的数据，返回一个合并 DataFrame
         df = get_future_kline(
-            codes=["CU", "AL"], 
+            codes=["CU", "AL"],
             freq=["d", "60"],
-            start_time="2026-02-01", 
+            start_time="2026-02-01",
             end_time="2026-02-13"
         )
         # df 已按统一字段规范输出，可直接过滤 code/freq 继续处理
@@ -840,7 +875,7 @@ def get_future_kline(
         raise ValueError("freq 必须是字符串或列表，如 'd' 或 ['d', '60']")
     elif len(freq) == 0:
         raise ValueError("freq 列表不能为空")
-    
+
     # 标准化 codes
     if codes is None:
         with get_client() as client:
@@ -849,27 +884,31 @@ def get_future_kline(
         codes = [codes]
     else:
         codes = list(codes)
-    
+
     if len(codes) == 0:
         return pd.DataFrame()
-    
+
     # 使用并行获取器
     fetcher = get_fetcher()
 
     normalized_start_time = str(start_time) if start_time is not None else None
     normalized_end_time = str(end_time) if end_time is not None else None
     if start_time is not None and end_time is not None:
-        normalized_start_time, normalized_end_time = _normalize_future_time_window(start_time, end_time)
+        normalized_start_time, normalized_end_time = _normalize_future_time_window(
+            start_time, end_time
+        )
 
     return fetcher.fetch_stock(
         codes=codes,
         freqs=list(freq),
         start_time=normalized_start_time,
-        end_time=normalized_end_time
+        end_time=normalized_end_time,
     )
 
 
-def get_company_info(code: str, category: Optional[List[str]] = None, return_df: Optional[bool] = None):
+def get_company_info(
+    code: str, category: Optional[List[str]] = None, return_df: Optional[bool] = None
+):
     """获取单只股票公司信息。
 
     调用前置约定:
@@ -892,7 +931,9 @@ def get_company_info(code: str, category: Optional[List[str]] = None, return_df:
     ```
     """
     return _call_with_client(
-        lambda client: client.get_company_info_content(code=code, category=category, return_df=return_df),
+        lambda client: client.get_company_info_content(
+            code=code, category=category, return_df=return_df
+        ),
         get_active_context_client=UnifiedTdxClient.get_active_context_client,
         build_client=lambda: get_client(),
     )
@@ -1049,4 +1090,3 @@ __all__ = [
     "get_runtime_failures",
     "get_runtime_metadata",
 ]
-

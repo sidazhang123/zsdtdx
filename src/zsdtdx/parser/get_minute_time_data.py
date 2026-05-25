@@ -23,7 +23,6 @@ from zsdtdx.parser.base import BaseParser
 
 
 class GetMinuteTimeData(BaseParser):
-
     def setParams(self, market, code):
         """
         输入：
@@ -38,7 +37,7 @@ class GetMinuteTimeData(BaseParser):
         """
         if type(code) is six.text_type:
             code = code.encode("utf-8")
-        pkg = bytearray.fromhex(u'0c 1b 08 00 01 01 0e 00 0e 00 1d 05')
+        pkg = bytearray.fromhex("0c 1b 08 00 01 01 0e 00 0e 00 1d 05")
         pkg.extend(struct.pack("<H6sI", market, code, 0))
         self.send_pkg = pkg
 
@@ -54,7 +53,7 @@ class GetMinuteTimeData(BaseParser):
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
         pos = 0
-        (num, ) = struct.unpack("<H", body_buf[:2])
+        (num,) = struct.unpack("<H", body_buf[:2])
         last_price = 0
         pos += 4
         prices = []
@@ -63,11 +62,6 @@ class GetMinuteTimeData(BaseParser):
             reversed1, pos = get_price(body_buf, pos)
             vol, pos = get_price(body_buf, pos)
             last_price = last_price + price_raw
-            price = OrderedDict(
-                [
-                    ("price", float(last_price)/100),
-                    ("vol", vol)
-                ]
-            )
+            price = OrderedDict([("price", float(last_price) / 100), ("vol", vol)])
             prices.append(price)
         return prices

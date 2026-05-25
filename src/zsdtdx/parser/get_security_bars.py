@@ -20,7 +20,6 @@ from zsdtdx.parser.diff_kline_page import parse_diff_encoded_kline_page
 
 
 class GetSecurityBarsCmd(BaseParser):
-
     def setParams(self, category, market, code, start, count):
         """
         输入：
@@ -42,18 +41,20 @@ class GetSecurityBarsCmd(BaseParser):
         self.category = category
 
         values = (
-            0x10c,
+            0x10C,
             0x01016408,
-            0x1c,
-            0x1c,
-            0x052d,
+            0x1C,
+            0x1C,
+            0x052D,
             market,
             code,
             category,
             1,
             start,
             count,
-            0, 0, 0  # I + I +  H total 10 zero
+            0,
+            0,
+            0,  # I + I +  H total 10 zero
         )
 
         pkg = struct.pack("<HIHHHH6sHHHHIIH", *values)
@@ -61,4 +62,6 @@ class GetSecurityBarsCmd(BaseParser):
 
     def parseResponse(self, body_buf):
         """输入 body_buf；输出已格式化的 K 线 dict 列表。"""
-        return parse_diff_encoded_kline_page(body_buf, self.category, with_index_counts=False)
+        return parse_diff_encoded_kline_page(
+            body_buf, self.category, with_index_counts=False
+        )

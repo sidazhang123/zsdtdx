@@ -23,7 +23,6 @@ from zsdtdx.parser.base import BaseParser
 
 
 class GetHistoryMinuteTimeData(BaseParser):
-
     def setParams(self, market, code, date):
         """
         :param market: 0/1
@@ -38,7 +37,7 @@ class GetHistoryMinuteTimeData(BaseParser):
         if type(code) is six.text_type:
             code = code.encode("utf-8")
 
-        pkg = bytearray.fromhex(u'0c 01 30 00 01 01 0d 00 0d 00 b4 0f')
+        pkg = bytearray.fromhex("0c 01 30 00 01 01 0d 00 0d 00 b4 0f")
         pkg.extend(struct.pack("<IB6s", date, market, code))
         self.send_pkg = pkg
 
@@ -54,7 +53,7 @@ class GetHistoryMinuteTimeData(BaseParser):
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
         pos = 0
-        (num, ) = struct.unpack("<H", body_buf[:2])
+        (num,) = struct.unpack("<H", body_buf[:2])
         last_price = 0
         # 跳过了4个字节，实在不知道是什么意思
         pos += 6
@@ -64,11 +63,6 @@ class GetHistoryMinuteTimeData(BaseParser):
             reversed1, pos = get_price(body_buf, pos)
             vol, pos = get_price(body_buf, pos)
             last_price = last_price + price_raw
-            price = OrderedDict(
-                [
-                    ("price", float(last_price)/100),
-                    ("vol", vol)
-                ]
-            )
+            price = OrderedDict([("price", float(last_price) / 100), ("vol", vol)])
             prices.append(price)
         return prices

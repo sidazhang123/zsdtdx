@@ -20,7 +20,6 @@ from zsdtdx.parser.base import BaseParser
 
 
 class GetMarkets(BaseParser):
-
     def setup(self):
         """
         输入：
@@ -35,7 +34,6 @@ class GetMarkets(BaseParser):
         self.send_pkg = bytearray.fromhex("01 02 48 69 00 01 02 00 02 00 f4 23")
 
     def parseResponse(self, body_buf):
-
         """
         输入：
         1. body_buf: 输入参数，约束以协议定义与函数实现为准。
@@ -47,13 +45,15 @@ class GetMarkets(BaseParser):
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
         pos = 0
-        (cnt, ) = struct.unpack("<H", body_buf[pos: pos + 2])
+        (cnt,) = struct.unpack("<H", body_buf[pos : pos + 2])
         pos += 2
 
         result = []
         for i in range(cnt):
             # 64byte for one
-            (category, raw_name, market, raw_short_name, _, unknown_bytes) = struct.unpack("<B32sB2s26s2s", body_buf[pos: pos+64])
+            (category, raw_name, market, raw_short_name, _, unknown_bytes) = (
+                struct.unpack("<B32sB2s26s2s", body_buf[pos : pos + 64])
+            )
             pos += 64
 
             if category == 0 and market == 0:
@@ -62,16 +62,16 @@ class GetMarkets(BaseParser):
             name = raw_name.decode("gbk")
             short_name = raw_short_name.decode("gbk")
 
-            result.append(OrderedDict(
-                [
-                    ("market", market),
-                    ("category", category),
-                    ("name", name.rstrip("\x00")),
-                    ("short_name", short_name.rstrip("\x00")),
-                    #('unknown_bytes', unknown_bytes)
-                ]
-            ))
+            result.append(
+                OrderedDict(
+                    [
+                        ("market", market),
+                        ("category", category),
+                        ("name", name.rstrip("\x00")),
+                        ("short_name", short_name.rstrip("\x00")),
+                        # ('unknown_bytes', unknown_bytes)
+                    ]
+                )
+            )
 
         return result
-
-

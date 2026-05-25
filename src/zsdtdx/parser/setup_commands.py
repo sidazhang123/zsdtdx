@@ -13,7 +13,6 @@
 
 # coding=utf-8
 
-
 from zsdtdx.parser.base import BaseParser
 
 
@@ -29,7 +28,7 @@ class SetupCmd1(BaseParser):
         边界条件：
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
-        self.send_pkg = bytearray.fromhex(u'0c 02 18 93 00 01 03 00 03 00 0d 00 01')
+        self.send_pkg = bytearray.fromhex("0c 02 18 93 00 01 03 00 03 00 0d 00 01")
 
     def parseResponse(self, body_buf):
         """
@@ -57,7 +56,7 @@ class SetupCmd2(BaseParser):
         边界条件：
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
-        self.send_pkg = bytearray.fromhex(u'0c 02 18 94 00 01 03 00 03 00 0d 00 02')
+        self.send_pkg = bytearray.fromhex("0c 02 18 94 00 01 03 00 03 00 0d 00 02")
 
     def parseResponse(self, body_buf):
         """
@@ -74,7 +73,6 @@ class SetupCmd2(BaseParser):
 
 
 class SetupCmd3(BaseParser):
-
     def setup(self):
         """
         输入：
@@ -86,10 +84,12 @@ class SetupCmd3(BaseParser):
         边界条件：
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
-        self.send_pkg = bytearray.fromhex(u'0c 03 18 99 00 01 20 00 20 00 db 0f d5'
-                                      u'd0 c9 cc d6 a4 a8 af 00 00 00 8f c2 25'
-                                      u'40 13 00 00 d5 00 c9 cc bd f0 d7 ea 00'
-                                      u'00 00 02')
+        self.send_pkg = bytearray.fromhex(
+            "0c 03 18 99 00 01 20 00 20 00 db 0f d5"
+            "d0 c9 cc d6 a4 a8 af 00 00 00 8f c2 25"
+            "40 13 00 00 d5 00 c9 cc bd f0 d7 ea 00"
+            "00 00 02"
+        )
 
     def parseResponse(self, body_buf):
         """

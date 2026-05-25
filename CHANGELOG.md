@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.4.9 - 2026-05-25
+
+### Summary
+1. 文档：README 嵌入与包内一致的完整 `config.yaml` 可复制示例；补充股票/指数任务日期补齐（09:30/16:00）、K 线 `datetime` 契约（`YYYY-MM-DD HH:MM:SS`，秒位 `:00`）及 `get_index_kline` async 默认任务说明；`simple_api` docstring 同步。
+2. 测试：移除冗余 `tests/test_pytdx_alignment.py` 与 `tests/manual/test_chunk_timeout_retry.py`；保留 `tests/manual/` 基准与冒烟脚本。
+3. 代码质量：`src/` 执行 `ruff format` 与 lint 修复；parser/unified_client 注释与 datetime 说明对齐固定 `:00` 秒输出。
+4. 版本号：`pyproject.toml` 与 `__init__.__version__` 对齐为 `1.4.9`。
+
 ## v1.4.8 - 2026-05-22
 
 ### Summary
@@ -45,7 +53,7 @@
 ### Summary
 1. 指数名称路由增加进程内内存复用：`resolve_index_name(refresh=False)` 命中客户端内缓存时直接返回，避免同一客户端重复全市场目录扫描。
 2. `get_index_kline` 增加主进程预解析：在任务分发前统一解析 `index_name -> {source, market, code}`，并将路由写入任务负载，降低 worker 侧重复目录发现开销。
-3. worker 执行链路支持消费预解析路由：`get_index_kline_rows_for_task` 优先使用任务路由字段，缺失时再回退原有名称解析逻辑，保持兼容性。
+3. worker 执行链路支持消费预解析路由：`get_index_kline_rows_for_chunk_tasks` 优先使用任务路由字段，缺失时再回退原有名称解析逻辑，保持兼容性。
 4. 指数路由配置默认收敛：`prefer_ex_markets` 默认由 `[62,102,37,27]` 调整为 `[62]`，减少扩展市场索引候选扫描范围。
 
 ## v1.4.2 - 2026-04-16

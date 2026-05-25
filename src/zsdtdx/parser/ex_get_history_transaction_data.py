@@ -21,7 +21,6 @@ from zsdtdx.parser.base import BaseParser
 
 
 class GetHistoryTransactionData(BaseParser):
-
     def setParams(self, market, code, date, start, count):
         # if type(code) is six.text_type:
         """
@@ -44,13 +43,12 @@ class GetHistoryTransactionData(BaseParser):
         #     date = int(date)
 
         # pkg1 = bytearray.fromhex('01 01 30 00 02 01 16 00 16 00 06 24 3b c8 33 01 1f 30 30 30 32 30 00 00 00 01 00 00 00 00 f0 00')
-        pkg = bytearray.fromhex('01 01 30 00 02 01 16 00 16 00 06 24')
+        pkg = bytearray.fromhex("01 01 30 00 02 01 16 00 16 00 06 24")
         pkg.extend(struct.pack("<IB9siH", date, market, code, start, count))
         self.send_pkg = pkg
         self.date = date
 
     def parseResponse(self, body_buf):
-
         """
         输入：
         1. body_buf: 输入参数，约束以协议定义与函数实现为准。
@@ -62,12 +60,13 @@ class GetHistoryTransactionData(BaseParser):
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
         pos = 0
-        market, code, _, num = struct.unpack('<B9s4sH', body_buf[pos: pos + 16])
+        market, code, _, num = struct.unpack("<B9s4sH", body_buf[pos : pos + 16])
         pos += 16
         result = []
         for i in range(num):
-
-            (raw_time, price, volume, zengcang, direction) = struct.unpack("<HIIiH", body_buf[pos: pos + 16])
+            (raw_time, price, volume, zengcang, direction) = struct.unpack(
+                "<HIIiH", body_buf[pos : pos + 16]
+            )
 
             pos += 16
             year = self.date // 10000
@@ -127,30 +126,33 @@ class GetHistoryTransactionData(BaseParser):
                 else:
                     nature_name = "换手"
 
-            if market in [31,48]:
+            if market in [31, 48]:
                 if nature == 0:
                     direction = 1
-                    nature_name = 'B'
+                    nature_name = "B"
                 elif nature == 256:
                     direction = -1
-                    nature_name = 'S'
-                else: #512
+                    nature_name = "S"
+                else:  # 512
                     direction = 0
-                    nature_name = ''
+                    nature_name = ""
 
-            result.append(OrderedDict([
-                ("date", date),
-                ("hour", hour),
-                ("minute", minute),
-                ("price", price),
-                ("volume", volume),
-                ("zengcang", zengcang),
-                ("natrue_name", nature_name),
-                # 同时输出两个键名，便于不同调用方按需读取。
-                ("nature_name", nature_name),
-                ("direction", direction),
-                ("nature", nature),
-
-            ]))
+            result.append(
+                OrderedDict(
+                    [
+                        ("date", date),
+                        ("hour", hour),
+                        ("minute", minute),
+                        ("price", price),
+                        ("volume", volume),
+                        ("zengcang", zengcang),
+                        ("natrue_name", nature_name),
+                        # 同时输出两个键名，便于不同调用方按需读取。
+                        ("nature_name", nature_name),
+                        ("direction", direction),
+                        ("nature", nature),
+                    ]
+                )
+            )
 
         return result

@@ -17,10 +17,9 @@ import struct
 
 from zsdtdx.parser.base import BaseParser
 
+
 class GetSecurityCountCmd(BaseParser):
-
     def setParams(self, market):
-
         """
         输入：
         1. market: 输入参数，约束以协议定义与函数实现为准。
@@ -31,10 +30,10 @@ class GetSecurityCountCmd(BaseParser):
         边界条件：
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
-        pkg = bytearray.fromhex(u"0c 0c 18 6c 00 01 08 00 08 00 4e 04")
+        pkg = bytearray.fromhex("0c 0c 18 6c 00 01 08 00 08 00 4e 04")
         market_pkg = struct.pack("<H", market)
         pkg.extend(market_pkg)
-        pkg.extend(b'\x75\xc7\x33\x01')
+        pkg.extend(b"\x75\xc7\x33\x01")
         self.send_pkg = pkg
 
     def parseResponse(self, body_buf):
@@ -48,5 +47,5 @@ class GetSecurityCountCmd(BaseParser):
         边界条件：
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
-        (num, ) = struct.unpack("<H", body_buf[:2])
+        (num,) = struct.unpack("<H", body_buf[:2])
         return num

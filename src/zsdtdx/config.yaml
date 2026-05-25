@@ -1,5 +1,6 @@
 # ---------------------------------------------------------------------------
 # zsdtdx 封装配置（YAML 支持注释，注释使用 "#"）
+# 完整 API 与可复制配置示例见项目 README.md
 # ---------------------------------------------------------------------------
 # 基本书写格式
 # 1) 缩进必须用空格（建议 2 空格），不要用 Tab。
@@ -106,6 +107,11 @@ parallel:
   # 取值: 非负整数
   # 影响: 每个 chunk 最多重试 N 次（超时、连接不可用、其他异常均触发），避免无限重试拖慢整体吞吐。
   chunk_retry_max_attempts: 2
+  # bundle watchdog 额外宽限时间（秒）：父进程按 chunk_timeout_seconds × (1 + chunk_retry_max_attempts)
+  # 推导单个 bundle 理论上限，再额外增加该宽限；超出后视为 worker 内线程/协程超时失效。
+  # 取值: 非负浮点数
+  # 影响: 值越小越快回收卡死 worker，但弱网下误判概率增加。
+  bundle_watchdog_grace_seconds: 10
   # async 调用时是否自动预热进程池与 worker 常驻连接（适用于 stock/index）。
   # 取值: true/false
   # 影响: true 时 async 首次调用会自动触发 prewarm，降低冷启动抖动。

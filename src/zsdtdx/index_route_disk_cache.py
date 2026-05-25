@@ -49,7 +49,9 @@ def default_zsdtdx_user_cache_dir() -> Path:
 
 def _is_valid_cache_date(cache_date: Any) -> bool:
     """校验缓存日期戳格式是否为 YYYY-MM-DD。"""
-    return isinstance(cache_date, str) and bool(re.match(r"^\d{4}-\d{2}-\d{2}$", cache_date))
+    return isinstance(cache_date, str) and bool(
+        re.match(r"^\d{4}-\d{2}-\d{2}$", cache_date)
+    )
 
 
 def _ensure_directory_writable(target_dir: Path) -> bool:
@@ -72,7 +74,9 @@ def _ensure_directory_writable(target_dir: Path) -> bool:
     fd: Optional[int] = None
     probe_path: Optional[Path] = None
     try:
-        fd, probe_name = tempfile.mkstemp(dir=str(target_dir), prefix=".zsdtdx_probe_", suffix=".tmp")
+        fd, probe_name = tempfile.mkstemp(
+            dir=str(target_dir), prefix=".zsdtdx_probe_", suffix=".tmp"
+        )
         probe_path = Path(probe_name)
         os.close(fd)
         fd = None
@@ -113,8 +117,12 @@ def resolve_index_route_cache_file_path(config_path: Any = None) -> Optional[Pat
             candidates.append(user_path.resolve())
         else:
             candidates.append((user_path / "index_route_cache.pkl").resolve())
-    candidates.append((default_zsdtdx_user_cache_dir() / "index_route_cache.pkl").resolve())
-    candidates.append((Path(tempfile.gettempdir()) / "zsdtdx" / "index_route_cache.pkl").resolve())
+    candidates.append(
+        (default_zsdtdx_user_cache_dir() / "index_route_cache.pkl").resolve()
+    )
+    candidates.append(
+        (Path(tempfile.gettempdir()) / "zsdtdx" / "index_route_cache.pkl").resolve()
+    )
     for path in candidates:
         if _ensure_directory_writable(path.parent):
             return path
@@ -138,7 +146,9 @@ def fingerprint_index_kline_config(index_kline_cfg: Any) -> str:
         payload: Dict[str, Any] = {}
     else:
         payload = index_kline_cfg
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode(
+        "utf-8"
+    )
     return hashlib.sha256(raw).hexdigest()
 
 
@@ -161,7 +171,9 @@ def _is_valid_route_record(obj: Any) -> bool:
     return True
 
 
-def validate_cache_payload(obj: Any) -> Optional[Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]], str]]:
+def validate_cache_payload(
+    obj: Any,
+) -> Optional[Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]], str]]:
     """
     校验反序列化后的缓存根对象。
 

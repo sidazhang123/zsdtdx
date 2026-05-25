@@ -33,7 +33,7 @@
 4. worker 进程内通过 `asyncio` 协程 + `to_thread` 并发执行 chunk（`Semaphore` 上限由 `task_chunk_inproc_coroutine_workers` 控制）。
 5. chunk 内通过 `unified_client.get_stock_kline_rows_for_chunk_tasks(...)` 拉取并复用缓存。
 6. 主进程按 bundle 完成顺序归集结果并写入队列，最终追加 `event=done`。
-7. 指数入口 `simple_api.get_index_kline(task, mode=...)` 现已接入 `ParallelFetcher`：sync 走主进程 inproc chunk，async 走进程池 bundle + worker chunk；chunk 内按 `(index_name, freq)` 分组后顺序调用 `unified_client.get_index_kline_rows_for_task(...)`。
+7. 指数入口 `simple_api.get_index_kline(task, mode=...)` 现已接入 `ParallelFetcher`：sync 走主进程 inproc chunk，async 走进程池 bundle + worker chunk；chunk 内按 `(index_name, freq)` 分组后顺序调用 `unified_client.get_index_kline_rows_for_chunk_tasks(...)`。
 
 ## 5. sync/async 当前语义
 

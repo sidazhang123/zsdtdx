@@ -31,7 +31,6 @@ from zsdtdx.parser.ex_setup_commands import ExSetupCmd1
 
 
 class TdxExHq_API(BaseSocketClient):
-
     def setup(self):
         """
         输入：

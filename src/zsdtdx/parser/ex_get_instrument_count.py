@@ -20,7 +20,6 @@ from zsdtdx.parser.base import BaseParser
 
 # bytearray(b'TDX_DS\x00\x00\x00\x00\x00\x1f\xdc\x00\x00\x01\x00\x00\x00=\x9c\x00\x00t\x00\x00\x00\x00\x00\x00\x00')
 class GetInstrumentCount(BaseParser):
-
     def setup(self):
         """
         输入：
@@ -45,6 +44,5 @@ class GetInstrumentCount(BaseParser):
         边界条件：
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
-        (num,) = struct.unpack("<I", body_buf[19: 19+4])
+        (num,) = struct.unpack("<I", body_buf[19 : 19 + 4])
         return num
-

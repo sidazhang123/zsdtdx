@@ -20,7 +20,6 @@ from zsdtdx.parser.diff_kline_page import parse_diff_encoded_kline_page
 
 
 class GetIndexBarsCmd(BaseParser):
-
     def setParams(self, category, market, code, start, count):
         """
         输入：category/market/code/start/count。
@@ -34,18 +33,20 @@ class GetIndexBarsCmd(BaseParser):
         self.category = category
 
         values = (
-            0x10c,
+            0x10C,
             0x01016408,
-            0x1c,
-            0x1c,
-            0x052d,
+            0x1C,
+            0x1C,
+            0x052D,
             market,
             code,
             category,
             1,
             start,
             count,
-            0, 0, 0,
+            0,
+            0,
+            0,
         )
 
         pkg = struct.pack("<HIHHHH6sHHHHIIH", *values)
@@ -58,4 +59,6 @@ class GetIndexBarsCmd(BaseParser):
         用途：差分编码页解析，刻度由 helper 批量完成。
         边界条件：空页返回 []。
         """
-        return parse_diff_encoded_kline_page(body_buf, self.category, with_index_counts=True)
+        return parse_diff_encoded_kline_page(
+            body_buf, self.category, with_index_counts=True
+        )

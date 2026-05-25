@@ -22,7 +22,6 @@ from zsdtdx.parser.base import BaseParser
 
 
 class GetCompanyInfoCategory(BaseParser):
-
     def setParams(self, market, code):
         """
         输入：
@@ -38,9 +37,10 @@ class GetCompanyInfoCategory(BaseParser):
         if type(code) is six.text_type:
             code = code.encode("utf-8")
 
-        pkg = bytearray.fromhex(u'0c 0f 10 9b 00 01 0e 00 0e 00 cf 02')
-        pkg.extend(struct.pack(u"<H6sI", market, code, 0))
+        pkg = bytearray.fromhex("0c 0f 10 9b 00 01 0e 00 0e 00 cf 02")
+        pkg.extend(struct.pack("<H6sI", market, code, 0))
         self.send_pkg = pkg
+
     """
 
     10 00 d7 ee d0 c2 cc e1 ca be 00 00 ..... 36 30 30 33 30 30 2e 74 78 74 .... e8 e3 07 00 92 1f 00 00 .....
@@ -52,6 +52,7 @@ class GetCompanyInfoCategory(BaseParser):
     92 1f 00 00 --- length
 
     """
+
     def parseResponse(self, body_buf):
         """
         输入：
@@ -64,12 +65,10 @@ class GetCompanyInfoCategory(BaseParser):
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
         pos = 0
-        (num, ) = struct.unpack("<H", body_buf[:2])
+        (num,) = struct.unpack("<H", body_buf[:2])
         pos += 2
 
         category = []
-
-
 
         def get_str(b):
             """
@@ -82,9 +81,9 @@ class GetCompanyInfoCategory(BaseParser):
             边界条件：
             1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
             """
-            p = b.find(b'\x00')
+            p = b.find(b"\x00")
             if p != -1:
-                b = b[0: p]
+                b = b[0:p]
             try:
                 n = b.decode("gbk")
             except Exception:
@@ -92,14 +91,16 @@ class GetCompanyInfoCategory(BaseParser):
             return n
 
         for i in range(num):
-            (name, filename, start, length) = struct.unpack(u"<64s80sII", body_buf[pos: pos+ 152])
+            (name, filename, start, length) = struct.unpack(
+                "<64s80sII", body_buf[pos : pos + 152]
+            )
             pos += 152
             entry = OrderedDict(
                 [
-                    ('name', get_str(name)),
-                    ('filename', get_str(filename)),
-                    ('start', start),
-                    ('length', length),
+                    ("name", get_str(name)),
+                    ("filename", get_str(filename)),
+                    ("start", start),
+                    ("length", length),
                 ]
             )
             category.append(entry)

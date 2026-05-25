@@ -15,7 +15,6 @@ from zsdtdx.parser.base import BaseParser
 
 
 class RawParser(BaseParser):
-
     def setParams(self, pkg):
         """
         输入：

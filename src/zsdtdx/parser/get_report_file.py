@@ -31,14 +31,18 @@ class GetReportFile(BaseParser):
         边界条件：
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
-        pkg = bytearray.fromhex(u'0C 12 34 00 00 00')
+        pkg = bytearray.fromhex("0C 12 34 00 00 00")
         # Fom DTGear request.py file
         node_size = 0x7530
-        raw_data = struct.pack(r"<H2I100s", 0x06B9,
-                               offset, node_size, filename.encode("utf-8"))
+        raw_data = struct.pack(
+            r"<H2I100s", 0x06B9, offset, node_size, filename.encode("utf-8")
+        )
         raw_data_len = struct.calcsize(r"<H2I100s")
-        pkg.extend(struct.pack(u"<HH{}s".format(raw_data_len),
-                               raw_data_len, raw_data_len, raw_data))
+        pkg.extend(
+            struct.pack(
+                "<HH{}s".format(raw_data_len), raw_data_len, raw_data_len, raw_data
+            )
+        )
         self.send_pkg = pkg
 
     def parseResponse(self, body_buf):
@@ -52,14 +56,9 @@ class GetReportFile(BaseParser):
         边界条件：
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
-        (chunksize, ) = struct.unpack("<I", body_buf[:4])
+        (chunksize,) = struct.unpack("<I", body_buf[:4])
 
         if chunksize > 0:
-            return {
-                "chunksize": chunksize,
-                "chunkdata":  body_buf[4:]
-            }
+            return {"chunksize": chunksize, "chunkdata": body_buf[4:]}
         else:
-            return {
-                "chunksize": 0
-            }
+            return {"chunksize": 0}

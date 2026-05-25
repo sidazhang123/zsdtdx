@@ -38,7 +38,6 @@ from zsdtdx.parser.setup_commands import SetupCmd1, SetupCmd2, SetupCmd3
 
 
 class TdxHq_API(BaseSocketClient):
-
     def setup(self):
         """
         输入：
@@ -143,8 +142,11 @@ class TdxHq_API(BaseSocketClient):
 
         if code is not None:
             all_stock = [(all_stock, code)]
-        elif (isinstance(all_stock, list) or isinstance(all_stock, tuple))\
-                and len(all_stock) == 2 and type(all_stock[0]) is int:
+        elif (
+            (isinstance(all_stock, list) or isinstance(all_stock, tuple))
+            and len(all_stock) == 2
+            and type(all_stock[0]) is int
+        ):
             all_stock = [all_stock]
 
         cmd = GetSecurityQuotesCmd(self.client, lock=self.lock)
@@ -361,11 +363,12 @@ class TdxHq_API(BaseSocketClient):
             if not response or not isinstance(response, dict):
                 break
             if response["chunksize"] > 0:
-                current_downloaded_size = current_downloaded_size + \
-                    response["chunksize"]
+                current_downloaded_size = (
+                    current_downloaded_size + response["chunksize"]
+                )
                 filecontent.extend(response["chunkdata"])
                 if reporthook is not None:
-                    reporthook(current_downloaded_size,filesize)
+                    reporthook(current_downloaded_size, filesize)
             else:
                 get_zero_length_package_times = get_zero_length_package_times + 1
                 if filesize == 0:
@@ -403,6 +406,7 @@ class TdxHq_API(BaseSocketClient):
         边界条件：
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
+
         def __select_market_code(code):
             """
             输入：
@@ -415,16 +419,37 @@ class TdxHq_API(BaseSocketClient):
             1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
             """
             code = str(code)
-            if code[0] in ['5', '6', '9'] or code[:3] in ["009", "126", "110", "201", "202", "203", "204"]:
+            if code[0] in ["5", "6", "9"] or code[:3] in [
+                "009",
+                "126",
+                "110",
+                "201",
+                "202",
+                "203",
+                "204",
+            ]:
                 return 1
             return 0
+
         # https://github.com/rainx/zsdtdx/issues/33
         # 0 - 深圳， 1 - 上海
 
-        data = pd.concat([self.to_df(self.get_security_bars(9, __select_market_code(
-            code), code, (9 - i) * 800, 800)) for i in range(10)], axis=0)
+        data = pd.concat(
+            [
+                self.to_df(
+                    self.get_security_bars(
+                        9, __select_market_code(code), code, (9 - i) * 800, 800
+                    )
+                )
+                for i in range(10)
+            ],
+            axis=0,
+        )
 
-        data = data.assign(date=data['datetime'].apply(lambda x: str(x)[0:10])).assign(code=str(code))\
-            .set_index('date', drop=False, inplace=False)\
-            .drop(['datetime'], axis=1)[start_date:end_date]
-        return data.assign(date=data['date'].apply(lambda x: str(x)[0:10]))
+        data = (
+            data.assign(date=data["datetime"].apply(lambda x: str(x)[0:10]))
+            .assign(code=str(code))
+            .set_index("date", drop=False, inplace=False)
+            .drop(["datetime"], axis=1)[start_date:end_date]
+        )
+        return data.assign(date=data["date"].apply(lambda x: str(x)[0:10]))

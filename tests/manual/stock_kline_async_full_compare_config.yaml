@@ -1,0 +1,19 @@
+# get_stock_kline(mode=async) 全量对比测试参数（手工脚本读取，非 CLI 参数）
+bench:
+  # 对比目标：workspace=仓库 src；site_packages=已安装包
+  expected_stock_count: 5207
+  freqs:
+    - "15"
+    - "30"
+    - "60"
+    - "d"
+    - "w"
+  start_time: "2026-05-18"
+  end_time: "2026-05-22"
+  mode: "async"
+  config_path: "../../src/zsdtdx/config.yaml"
+  artifacts_root: "artifacts/stock_kline_async_full_compare"
+  # 队列阻塞超时（秒）；async 无自动关池，靠 done+destroy 结束
+  queue_timeout_seconds: 7200
+  # 每 N 条 data 事件刷新 lifecycle.json 进度
+  lifecycle_flush_every: 200

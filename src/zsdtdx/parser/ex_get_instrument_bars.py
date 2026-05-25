@@ -8,7 +8,7 @@
 
 边界：
 1. 仅负责单页解析；指数 ex 路由与期货共用本解析器。
-2. 时间：本层解析年月日时分仅填充 datetime/_ts，不返回分列字段；上层只读 datetime/_ts。
+2. 时间：本层解析年月日时分，写入 datetime 为 `YYYY-MM-DD HH:MM:SS`（秒位固定 `:00`）与 `_ts`；上层只读 datetime/_ts。
 """
 
 # coding=utf-8
@@ -23,7 +23,6 @@ from zsdtdx.parser.base import BaseParser
 
 
 class GetInstrumentBars(BaseParser):
-
     def setup(self):
         """输入无；输出无；扩展行情 K 线无需额外 setup。"""
         pass
@@ -37,12 +36,12 @@ class GetInstrumentBars(BaseParser):
         """
         if type(code) is six.text_type:
             code = code.encode("utf-8")
-        pkg = bytearray.fromhex('01 01 08 6a 01 01 16 00 16 00')
+        pkg = bytearray.fromhex("01 01 08 6a 01 01 16 00 16 00")
         pkg.extend(bytearray.fromhex("ff 23"))
 
         self.category = category
 
-        pkg.extend(struct.pack('<B9sHHIH', market, code, category, 1, start, count))
+        pkg.extend(struct.pack("<B9sHHIH", market, code, category, 1, start, count))
         self.send_pkg = pkg
 
     def parseResponse(self, body_buf):
@@ -82,17 +81,27 @@ class GetInstrumentBars(BaseParser):
             lows[i] = struct.unpack_from("<f", buf, pos + 8)[0]
             closes[i] = struct.unpack_from("<f", buf, pos + 12)[0]
             positions[i] = float(
-                buf[pos + 16] | (buf[pos + 17] << 8) | (buf[pos + 18] << 16) | (buf[pos + 19] << 24)
+                buf[pos + 16]
+                | (buf[pos + 17] << 8)
+                | (buf[pos + 18] << 16)
+                | (buf[pos + 19] << 24)
             )
             amounts[i] = struct.unpack_from("<f", buf, pos + 16)[0]
             trades[i] = float(
-                buf[pos + 20] | (buf[pos + 21] << 8) | (buf[pos + 22] << 16) | (buf[pos + 23] << 24)
+                buf[pos + 20]
+                | (buf[pos + 21] << 8)
+                | (buf[pos + 22] << 16)
+                | (buf[pos + 23] << 24)
             )
             settlements[i] = struct.unpack_from("<f", buf, pos + 24)[0]
             pos += 28
 
-            datetimes[i] = f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}"
-            timestamps[i] = int(_dt.datetime(year, month, day, hour, minute).timestamp())
+            datetimes[i] = (
+                f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:00"
+            )
+            timestamps[i] = int(
+                _dt.datetime(year, month, day, hour, minute).timestamp()
+            )
 
         format_socket_kline_page_inplace(
             opens,
