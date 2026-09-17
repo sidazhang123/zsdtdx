@@ -1354,6 +1354,16 @@ class UnifiedTdxClient:
             raise ValueError(f"不支持的频率: {freq}")
         return self.PERIOD_MAP[p]
 
+    def _standard_kline_page_size(self) -> int:
+        """输入无，输出标准行情 K 线单页条数；配置缺省时用官方 420。"""
+        pagination = getattr(self, "pagination", None) or {}
+        return int(pagination.get("standard_kline_page_size", 420))
+
+    def _standard_kline_qfq(self) -> bool:
+        """输入无，输出是否请求服务器前复权；配置缺省时为 True。"""
+        pagination = getattr(self, "pagination", None) or {}
+        return bool(pagination.get("standard_kline_qfq", True))
+
     def _pool_call_allow_none(
         self,
         pool: PersistentFailoverPool,
@@ -1560,7 +1570,7 @@ class UnifiedTdxClient:
                     "standard_kline_page_size"
                     if source == "std"
                     else "extended_kline_page_size",
-                    800 if source == "std" else 700,
+                    420 if source == "std" else 700,
                 )
             )
 
@@ -1574,6 +1584,7 @@ class UnifiedTdxClient:
                         str(code),
                         int(start),
                         int(page_size),
+                        qfq=self._standard_kline_qfq(),
                     )
                 return self._pool_call_allow_none(
                     self.ex_pool,
@@ -2168,7 +2179,7 @@ class UnifiedTdxClient:
         end_dt: dt.datetime,
     ) -> List[Dict[str, Any]]:
         """输入标准行情参数，输出标准化K线列表；用于无 DataFrame 路径；空页即结束。"""
-        page_size = int(self.pagination.get("standard_kline_page_size", 800))
+        page_size = self._standard_kline_page_size()
 
         def _fetch_page(start: int) -> Any:
             return self._pool_call_allow_none(
@@ -2179,6 +2190,7 @@ class UnifiedTdxClient:
                 str(code),
                 int(start),
                 int(page_size),
+                qfq=self._standard_kline_qfq(),
             )
 
         rows = self._paginate_kline_pages(
@@ -2273,6 +2285,7 @@ class UnifiedTdxClient:
                 str(code),
                 int(start),
                 int(page_size),
+                qfq=self._standard_kline_qfq(),
             )
             return list(rows or [])
         if source_key == "ex":
@@ -2323,6 +2336,7 @@ class UnifiedTdxClient:
                 str(code),
                 int(start),
                 int(page_size),
+                qfq=self._standard_kline_qfq(),
             )
             return list(rows or [])
         if source_key == "ex":
@@ -2498,7 +2512,7 @@ class UnifiedTdxClient:
                 "standard_kline_page_size"
                 if source == "std"
                 else "extended_kline_page_size",
-                800 if source == "std" else 700,
+                420 if source == "std" else 700,
             )
         )
         max_pages = int(
@@ -2755,7 +2769,7 @@ class UnifiedTdxClient:
                 "standard_kline_page_size"
                 if source == "std"
                 else "extended_kline_page_size",
-                800 if source == "std" else 700,
+                420 if source == "std" else 700,
             )
         )
         max_pages = int(
@@ -4059,7 +4073,7 @@ class UnifiedTdxClient:
         end_ts: pd.Timestamp,
     ) -> pd.DataFrame:
         """输入标准股票参数，输出区间 K 线；用于自动分页；None/空页即结束。"""
-        page_size = int(self.pagination.get("standard_kline_page_size", 800))
+        page_size = self._standard_kline_page_size()
 
         def _fetch_page(start: int) -> Any:
             return self._pool_call_allow_none(
@@ -4070,6 +4084,7 @@ class UnifiedTdxClient:
                 str(code),
                 int(start),
                 int(page_size),
+                qfq=self._standard_kline_qfq(),
             )
 
         rows = self._paginate_kline_pages(

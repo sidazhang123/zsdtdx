@@ -200,6 +200,7 @@ class TestUnifiedClientKlineWrapper(unittest.TestCase):
         mock_pool.call.assert_called_once()
         _args, kwargs = mock_pool.call.call_args
         self.assertIs(kwargs.get("allow_none"), True)
+        self.assertIs(kwargs.get("qfq"), True)
 
 
 class TestChunkBehaviorUnchangedOnNone(unittest.TestCase):

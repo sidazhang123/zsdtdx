@@ -193,6 +193,10 @@ with get_client():
 **K 线 `datetime` 输出契约:**
 - `rows` 中每条 K 线的 `datetime` 为 `YYYY-MM-DD HH:MM:SS`，秒位固定 `:00`（例如 `"2026-02-02 15:00:00"`）。
 
+**复权:**
+- 标准行情股票/指数 K 线默认请求服务器前复权（`pagination.standard_kline_qfq: true`）。
+- 需要不复权时将该配置改为 `false`。
+
 **调用示例（写法一：with 主进程上下文 + sync + 其它接口）:**
 ```python
 import queue as py_queue
@@ -696,9 +700,12 @@ pagination:
   # 扩展行情 get_instrument_info 单页数量。
   # 取值: 正整数
   extended_instrument_info_page_size: 800
-  # 标准行情 K线单页数量（get_security_bars）。
-  # 取值: 正整数，常用 800
-  standard_kline_page_size: 800
+  # 标准行情 K线单页数量（get_security_bars / get_index_bars）。
+  # 取值: 正整数，官方客户端为 420
+  standard_kline_page_size: 420
+  # 标准行情 K 线是否请求服务器前复权。
+  # 取值: true=前复权（reserved0=1），false=不复权（reserved0=0）
+  standard_kline_qfq: true
   # 扩展行情 K线单页数量（get_instrument_bars）。
   # 取值: 正整数，常用 700
   extended_kline_page_size: 700

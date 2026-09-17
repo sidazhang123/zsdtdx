@@ -136,9 +136,12 @@ pagination:
   # 扩展行情 get_instrument_info 单页数量。
   # 取值: 正整数
   extended_instrument_info_page_size: 800
-  # 标准行情 K线单页数量（get_security_bars）。
-  # 取值: 正整数，常用 800
-  standard_kline_page_size: 800
+  # 标准行情 K线单页数量（get_security_bars / get_index_bars）。
+  # 取值: 正整数，官方客户端为 420
+  standard_kline_page_size: 420
+  # 标准行情 K 线是否请求服务器前复权。
+  # 取值: true=前复权（reserved0=1），false=不复权（reserved0=0）
+  standard_kline_qfq: true
   # 扩展行情 K线单页数量（get_instrument_bars）。
   # 取值: 正整数，常用 700
   extended_kline_page_size: 700

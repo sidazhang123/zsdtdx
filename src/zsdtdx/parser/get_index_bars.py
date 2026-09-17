@@ -7,50 +7,28 @@
 
 边界：
 1. 仅负责指数 K 线单页解析，不承担分页与路由。
+2. 请求包与个股 K 线相同（官方 0x052D，54 字节）。
 """
 
 # coding=utf-8
 
-import struct
-
-import six
-
 from zsdtdx.parser.base import BaseParser
 from zsdtdx.parser.diff_kline_page import parse_diff_encoded_kline_page
+from zsdtdx.parser.get_security_bars import pack_standard_kline_request
 
 
 class GetIndexBarsCmd(BaseParser):
-    def setParams(self, category, market, code, start, count):
+    def setParams(self, category, market, code, start, count, qfq=True):
         """
-        输入：category/market/code/start/count。
-        输出：无；构造 send_pkg。
-        用途：组装指数 K 线请求包。
-        边界条件：code 为 str 时转 bytes。
+        输入：category/market/code/start/count，以及 qfq 前复权开关。
+        输出：无；构造 54 字节 send_pkg。
+        用途：组装指数 K 线请求包（与个股 0x052D 同布局）。
+        边界条件：code 为 str 时由组包函数转 bytes。
         """
-        if type(code) is six.text_type:
-            code = code.encode("utf-8")
-
         self.category = category
-
-        values = (
-            0x10C,
-            0x01016408,
-            0x1C,
-            0x1C,
-            0x052D,
-            market,
-            code,
-            category,
-            1,
-            start,
-            count,
-            0,
-            0,
-            0,
+        self.send_pkg = pack_standard_kline_request(
+            category, market, code, start, count, qfq=qfq
         )
-
-        pkg = struct.pack("<HIHHHH6sHHHHIIH", *values)
-        self.send_pkg = pkg
 
     def parseResponse(self, body_buf):
         """

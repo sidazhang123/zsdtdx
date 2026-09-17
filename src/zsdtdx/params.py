@@ -40,8 +40,10 @@ class TDXParams:
     KLINE_TYPE_DAILY = 4
     KLINE_TYPE_WEEKLY = 5
     KLINE_TYPE_MONTHLY = 6
+    # 官方 TdxW 1 分钟用 7；8 为历史别名，服务器通常仍接受。
     KLINE_TYPE_EXHQ_1MIN = 7
     KLINE_TYPE_1MIN = 8
+    # 官方 TdxW 日线用 4；9 为历史别名，服务器通常仍接受。
     KLINE_TYPE_RI_K = 9
     KLINE_TYPE_3MONTH = 10
     KLINE_TYPE_YEARLY = 11
@@ -49,8 +51,8 @@ class TDXParams:
     # ref : https://github.com/rainx/zsdtdx/issues/7
     # 分笔行情最多2000条
     MAX_TRANSACTION_COUNT = 2000
-    # k先数据最多800条
-    MAX_KLINE_COUNT = 800
+    # 官方客户端标准行情 K 线单页 420 条
+    MAX_KLINE_COUNT = 420
 
     # 板块相关参数
     BLOCK_SZ = "block_zs.dat"

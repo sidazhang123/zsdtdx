@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Summary
+1. 标准行情握手对齐通达信官方客户端（TdxW）：292 字节首包 + 13 字节第二包 + `tdxlevel` 身份包，替换旧 pytdx 申银/招商身份握手。
+2. 个股/指数 K 线请求对齐官方 0x052D：54 字节组包，单页 420 条；`start=0` 与翻页使用不同 inner 字段。
+3. 标准行情 K 线默认请求服务器前复权（`pagination.standard_kline_qfq: true`，对应 reserved0=1）；可改为 `false` 取不复权。
+4. 官方周期号：1 分钟 category=7，日线 category=4（高层 `d` 本已映射为 4）。
+
 ## v1.4.9 - 2026-05-25
 
 ### Summary

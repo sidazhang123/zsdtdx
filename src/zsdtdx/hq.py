@@ -40,15 +40,12 @@ from zsdtdx.parser.setup_commands import SetupCmd1, SetupCmd2, SetupCmd3
 class TdxHq_API(BaseSocketClient):
     def setup(self):
         """
-        输入：
-        1. 无显式输入参数。
-        输出：
-        1. 返回值语义由函数实现定义；无返回时为 `None`。
-        用途：
-        1. 执行 `setup` 对应的协议处理、数据解析或调用适配逻辑。
-        边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        输入：无。
+        输出：无。
+        用途：连接成功后发送 TdxW 对齐的三条标准行情握手。
+        边界：任一条握手失败时由 `connect()` 断开连接并抛错，不会继续发行情请求。
         """
+        # 对齐 TdxW：292 字节首包 → 合并后的 13 字节第二包 → tdxlevel 身份包。
         SetupCmd1(self.client).call_api()
         SetupCmd2(self.client).call_api()
         SetupCmd3(self.client).call_api()
@@ -89,43 +86,45 @@ class TdxHq_API(BaseSocketClient):
 
     # Notice：，如果一个股票当天停牌，那天的K线还是能取到，成交量为0
     @update_last_ack_time
-    def get_security_bars(self, category, market, code, start, count):
+    def get_security_bars(self, category, market, code, start, count, qfq=True):
         """
         输入：
-        1. category: 输入参数，约束以协议定义与函数实现为准。
-        2. market: 输入参数，约束以协议定义与函数实现为准。
-        3. code: 输入参数，约束以协议定义与函数实现为准。
-        4. start: 输入参数，约束以协议定义与函数实现为准。
-        5. count: 输入参数，约束以协议定义与函数实现为准。
+        1. category: K 线周期；官方 1 分钟=7，日线=4。
+        2. market: 市场号（0 深圳 / 1 上海）。
+        3. code: 证券代码。
+        4. start: 分页偏移，0 表示从最新一段起取。
+        5. count: 本页条数，官方常用 420。
+        6. qfq: True 请求前复权，False 请求不复权。
         输出：
-        1. 返回值语义由函数实现定义；无返回时为 `None`。
+        1. 已解析的 K 线 dict 列表；失败时为 `None`。
         用途：
-        1. 执行 `get_security_bars` 对应的协议处理、数据解析或调用适配逻辑。
+        1. 发送官方 54 字节 0x052D 个股 K 线请求并解析回包。
         边界条件：
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
         cmd = GetSecurityBarsCmd(self.client, lock=self.lock)
-        cmd.setParams(category, market, code, start, count)
+        cmd.setParams(category, market, code, start, count, qfq=qfq)
         return cmd.call_api()
 
     @update_last_ack_time
-    def get_index_bars(self, category, market, code, start, count):
+    def get_index_bars(self, category, market, code, start, count, qfq=True):
         """
         输入：
-        1. category: 输入参数，约束以协议定义与函数实现为准。
-        2. market: 输入参数，约束以协议定义与函数实现为准。
-        3. code: 输入参数，约束以协议定义与函数实现为准。
-        4. start: 输入参数，约束以协议定义与函数实现为准。
-        5. count: 输入参数，约束以协议定义与函数实现为准。
+        1. category: K 线周期；官方 1 分钟=7，日线=4。
+        2. market: 市场号（0 深圳 / 1 上海）。
+        3. code: 指数代码。
+        4. start: 分页偏移，0 表示从最新一段起取。
+        5. count: 本页条数，官方常用 420。
+        6. qfq: True 请求前复权，False 请求不复权。
         输出：
-        1. 返回值语义由函数实现定义；无返回时为 `None`。
+        1. 已解析的指数 K 线 dict 列表；失败时为 `None`。
         用途：
-        1. 执行 `get_index_bars` 对应的协议处理、数据解析或调用适配逻辑。
+        1. 发送官方 54 字节 0x052D 指数 K 线请求并解析回包。
         边界条件：
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
         cmd = GetIndexBarsCmd(self.client, lock=self.lock)
-        cmd.setParams(category, market, code, start, count)
+        cmd.setParams(category, market, code, start, count, qfq=qfq)
         return cmd.call_api()
 
     @update_last_ack_time
@@ -438,7 +437,11 @@ class TdxHq_API(BaseSocketClient):
             [
                 self.to_df(
                     self.get_security_bars(
-                        9, __select_market_code(code), code, (9 - i) * 800, 800
+                        TDXParams.KLINE_TYPE_DAILY,
+                        __select_market_code(code),
+                        code,
+                        (9 - i) * TDXParams.MAX_KLINE_COUNT,
+                        TDXParams.MAX_KLINE_COUNT,
                     )
                 )
                 for i in range(10)
