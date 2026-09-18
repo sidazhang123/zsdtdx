@@ -423,26 +423,47 @@ with get_client():
 
 #### get_company_info
 
-获取单只股票公司信息。
+获取股票公司信息；默认并行，可选顺序。
 
 **调用前置约定:**
-- 请先进入 `with get_client():`；
-
+- `mode="sync"`：请先进入 `with get_client():`，主进程按 codes 顺序拉取。
+- `mode="async"`（默认）：走进程池并行，不依赖主进程 with 连接；退出前建议 `destroy_parallel_fetcher()`。
 
 **输入:**
-- code: 股票代码。
-- category: 中文分类名列表；为空时返回全部分类。
-- return_df: 可选，是否返回 pandas.DataFrame；默认 True。
+- codes: 股票代码列表（一只也须写成 `["600000"]`）。
+- category: 中文分类名列表；**sync/async 共用同一语义**——传入则只拉这些分类，为 None/空则拉全部分类。
+- mode: `async`（默认）或 `sync`（无论 codes 长短均顺序跑）。
+- queue: 可选事件队列（需 `put()`）。async 不传则自动创建。
+- return_df: **仅 sync 最终返回**时生效（None 跟随 `output.return_df_default`）；中间传递始终为 `list[dict]`，不用 DataFrame。
+
+**返回:**
+- `mode="sync"`: `list[dict]` 或 DataFrame。
+- `mode="async"`: `StockKlineJob`；从 `job.queue` 消费至 `event="done"`；`job.result()` 为全部行 list[dict]。
 
 **调用示例:**
 ```python
-from zsdtdx import get_client, get_company_info
+from zsdtdx import destroy_parallel_fetcher, get_client, get_company_info
+
+job = get_company_info(
+    codes=["600000", "000001"],
+    category=["最新提示", "公司概况"],
+)
+while True:
+    event = job.queue.get()
+    if event.get("event") == "done":
+        break
+destroy_parallel_fetcher()
 
 with get_client():
-    info_df = get_company_info(code="689009", category=["最新提示", "公司概况"], return_df=True)
+    info_df = get_company_info(
+        codes=["689009"],
+        category=["最新提示", "公司概况"],
+        mode="sync",
+        return_df=True,
+    )
 ```
 
-**返回示例:**
+**返回示例（sync list / 队列 data.rows 元素）:**
 ```json
 [{"code": "689009", "category": "公司概况", "content": "......"}]
 ```
@@ -744,6 +765,22 @@ parallel:
   # 取值: 正整数
   # 影响: 每轮会向进程池提交探针任务以拉齐 worker 预热状态。
   auto_prewarm_max_rounds: 3
+  # 公司信息并行：每个进程内同时处理的股票数。
+  # 取值: 正整数
+  # 影响: 进程内股票级 ThreadPool 并发度；过大易触发行情站限流。
+  company_info_stock_inproc_workers: 3
+  # 公司信息并行：单股内标签正文并发线程数。
+  # 取值: 正整数
+  # 影响: 目录拉完后并发抓各标签；过大时连接数≈进程数×股票并发×标签并发。
+  company_info_category_workers: 3
+  # 公司信息并行：提交到单个 worker future 的股票数。
+  # 取值: 正整数
+  # 影响: chunk 越大调度开销越低，但单 future 失败影响面越大。
+  company_info_codes_per_chunk: 40
+  # 公司信息并行：父进程在飞 chunk 窗口倍率。
+  # 取值: 正整数
+  # 影响: 在飞 future 上限 = 进程数 × 该倍率。
+  company_info_max_inflight_multiplier: 2
 
 pagination:
   # 标准行情 get_security_list 单页数量（命令 0x044D）。
@@ -888,3 +925,7 @@ index_kline:
   - `auto_prewarm_require_all_workers`
   - `auto_prewarm_timeout_seconds`
   - `auto_prewarm_max_rounds`
+  - `company_info_stock_inproc_workers`
+  - `company_info_category_workers`
+  - `company_info_codes_per_chunk`
+  - `company_info_max_inflight_multiplier`

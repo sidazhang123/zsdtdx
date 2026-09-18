@@ -105,7 +105,7 @@ def main() -> int:
                     str(code),
                     allow_none=True,
                 )
-                rows = get_company_info(code=code, return_df=False) or []
+                rows = get_company_info(codes=[code], return_df=False, mode="sync") or []
                 by_name = {
                     str(r.get("category") or "").strip(): str(r.get("content") or "")
                     for r in rows

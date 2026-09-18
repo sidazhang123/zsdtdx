@@ -394,7 +394,7 @@ class TestConfigYamlDrivesConnectionHosts:
             client2 = get_client(separate_instance=True)
             try:
                 with client2:
-                    get_company_info(code="600000")
+                    get_company_info(codes=["600000"], mode="sync")
                 pool_hosts_2 = set(client2.std_pool.hosts)
                 assert pool_hosts_2 == pool_hosts_default or pool_hosts_2.issubset(pkg_std_set)
             finally:

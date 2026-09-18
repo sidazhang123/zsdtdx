@@ -321,3 +321,113 @@ def test_get_company_info_content_beijing_queries_market_zero():
     content_calls = [c for c in calls if c[0] == "get_company_info_content"]
     assert content_calls
     assert all(c[1][0] == 0 for c in content_calls)
+
+
+def test_get_company_info_content_category_workers_preserves_order():
+    """输入：两分类 + category_workers=2；输出：记录顺序与目录一致。"""
+
+    def fake_call(method_name, *args, allow_none=False, **kwargs):
+        """
+        输入：连接池方法名与参数。
+        输出：目录两条或正文 bytes。
+        用途：验证标签并发仍按目录顺序回填。
+        边界：不访问网络。
+        """
+        if method_name == "get_company_info_category":
+            return [
+                {
+                    "index": 0,
+                    "name": "最新提示",
+                    "filename": "600000.V04",
+                    "start": 0,
+                    "length": 2,
+                },
+                {
+                    "index": 1,
+                    "name": "公司概况",
+                    "filename": "600000.V04",
+                    "start": 2,
+                    "length": 2,
+                },
+            ]
+        # args: market, code, filename, start, length, category_index
+        start = int(args[3])
+        return b"A" if start == 0 else b"B"
+
+    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+    client.pagination = {"company_info_chunk_size": 30720}
+    client.market_rules = {"include_beijing_prefixes": ["92"]}
+    client._stock_route = {
+        "600000": {
+            "code": "600000",
+            "name": "浦发银行",
+            "market": 1,
+            "market_name": "上海",
+            "source": "std",
+            "asset_type": "stock",
+        }
+    }
+    client._runtime_failures = []
+    client.output = {"return_df_default": False}
+    client.std_pool = MagicMock()
+    client.std_pool.call.side_effect = fake_call
+
+    rows = UnifiedTdxClient.get_company_info_content(
+        client,
+        code="600000",
+        return_df=False,
+        category_workers=2,
+    )
+    assert [r["category"] for r in rows] == ["最新提示", "公司概况"]
+    assert [r["content"] for r in rows] == ["A", "B"]
+
+
+def test_fetch_company_info_parallel_payload_forwards_category(monkeypatch):
+    """输入：带 category 的并行请求；输出：worker payload 含同一 category，非整表默认全分类。"""
+    from zsdtdx import parallel_fetcher as pf
+
+    captured: list[dict] = []
+
+    class _FakeFuture:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def result(self):
+            return {
+                "rows": [
+                    {"code": "600000", "category": "公司概况", "content": "x"},
+                    {"code": "000001", "category": "公司概况", "content": "y"},
+                ],
+                "errors": [],
+            }
+
+    class _FakeExecutor:
+        def submit(self, fn, payload):
+            captured.append(dict(payload))
+            return _FakeFuture(payload)
+
+    class _FakeFetcher:
+        auto_prewarm_on_async = False
+        company_info_codes_per_chunk = 40
+        company_info_stock_inproc_workers = 3
+        company_info_category_workers = 3
+        company_info_max_inflight_multiplier = 2
+        num_processes = 2
+        config = {"output": {"return_df_default": False}}
+
+    monkeypatch.setattr(pf, "get_fetcher", lambda: _FakeFetcher())
+    monkeypatch.setattr(pf, "_get_global_process_pool", lambda n: _FakeExecutor())
+    monkeypatch.setattr(
+        pf,
+        "wait",
+        lambda futs, return_when=None: (set(futs), set()),
+    )
+
+    rows = pf.fetch_company_info_parallel(
+        codes=["600000", "000001"],
+        category=["公司概况"],
+        auto_prewarm=False,
+    )
+    assert captured
+    assert all(p.get("category") == ["公司概况"] for p in captured)
+    assert {r["category"] for r in rows} == {"公司概况"}

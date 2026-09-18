@@ -279,7 +279,7 @@ def case_company_info() -> Dict[str, Any]:
     from zsdtdx import get_client, get_company_info
 
     with get_client():
-        rows = get_company_info(code="600000", category=["公司概况"], return_df=False)
+        rows = get_company_info(codes=["600000"], category=["公司概况"], return_df=False, mode="sync")
     _require(isinstance(rows, list) and rows, "公司信息为空")
     contents = [str(r.get("content", "")).strip() for r in rows]
     _require(any(contents), "公司信息正文全空")

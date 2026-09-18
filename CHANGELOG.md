@@ -20,6 +20,8 @@
 15. 港股市场识别默认改为扩展行情「香港主板」（港股通股票均在主板，不含创业板）。
 16. `get_future_kline` 并行分流按合约形态识别期货：`CUL8` 等 `L+数字` 连续合约不再因字母 `L` 被误判为股票。
 17. `get_stock_latest_price`：未上市占位码（五档全 0）解析不再抛错，一只票不会把整批打成 None；现价非正回退昨收，占位票记 None 且不拆单重试。
+18. F10 正文改为各页原始 bytes 拼接后整包 GBK 解码，避免页界拆字；严格解码失败时 ignore 兜底并记 `gbk_ignore_fallback`。
+19. `get_company_info(codes, category=..., mode="async"|"sync", queue=...)`：仅接受 `codes` 列表；默认 `async` 返回 `StockKlineJob`+队列流式推送；`sync` 无论只数均顺序跑，`return_df` 仅作最终可选 DataFrame。中间传递全程 `list[dict]`，不用 DataFrame。配置项见 `parallel.company_info_*`。
 
 ## v1.4.9 - 2026-05-25
 

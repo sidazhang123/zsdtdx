@@ -41,6 +41,7 @@ from zsdtdx.helper import (
 from zsdtdx.parallel_fetcher import (
     StockKlineJob,
     destroy_parallel_fetcher as _destroy_parallel_fetcher,
+    fetch_company_info_async as _fetch_company_info_async,
     force_restart_parallel_fetcher as _force_restart_parallel_fetcher,
     get_fetcher,
     prewarm_parallel_fetcher as _prewarm_parallel_fetcher,
@@ -914,36 +915,139 @@ def get_future_kline(
 
 
 def get_company_info(
-    code: str, category: Optional[List[str]] = None, return_df: Optional[bool] = None
+    codes: List[str],
+    category: Optional[List[str]] = None,
+    mode: str = "async",
+    queue: Optional[Any] = None,
+    return_df: Optional[bool] = None,
 ):
-    """获取单只股票公司信息。
+    """获取股票公司信息（默认并行；可选顺序）。
 
     调用前置约定:
-    - 请先进入 `with get_client():`；
-      一个 with 块内可连续调用多个 `get_*` 函数。
+    - `mode="sync"`：请先进入 `with get_client():`，主进程顺序拉取。
+    - `mode="async"`（默认）：走进程池并行，不依赖主进程 with 连接；
+      退出前建议 `destroy_parallel_fetcher()`。
 
     输入:
-    - code: 股票代码。
-    - category: 中文分类名列表；为空时返回全部分类。
+    - codes: 股票代码列表（一只也须包在 list 里，如 `["600000"]`）。
+    - category: 中文分类名列表；两种 mode 共用同一过滤语义——
+      传入则只拉这些分类；为 None/空则拉全部分类。
+    - mode: `async`（默认）或 `sync`（无论 codes 长短均顺序跑）。
+    - queue: 可选事件队列（需 `put()`）。sync 可边拉边 put；async 不传则自动创建。
+    - return_df: 仅对 `mode="sync"` 生效；True 转 DataFrame，False 返回 list[dict]；
+      None 跟随 `output.return_df_default`。中间传递始终为 list[dict]，不用 DataFrame。
+
+    返回:
+    - mode="sync": `list[dict]` 或 DataFrame（由 return_df 决定）。
+    - mode="async": `StockKlineJob`；从 `job.queue` 消费直到 `event="done"`；
+      `job.result()` 为全部行的 list[dict]。
+
+    队列事件:
+    - data: `{"event":"data","code":"...","rows":[...],"error":str|None}`
+    - done: `{"event":"done","total_codes":N,"success_codes":N,"failed_codes":N}`
 
     调用示例:
     ```python
-    with get_client():
-        info_df = get_company_info(code="689009", category=["最新提示", "公司概况"], return_df=True)
-    ```
+    # 默认 async：消费队列
+    job = get_company_info(
+        codes=["600000", "000001"],
+        category=["最新提示", "公司概况"],
+    )
+    while True:
+        event = job.queue.get()
+        if event.get("event") == "done":
+            break
+    destroy_parallel_fetcher()
 
-    返回示例:
-    ```json
-    [{"code": "689009", "category": "公司概况", "content": "......"}]
+    # sync：最终可选 DataFrame
+    with get_client():
+        info_df = get_company_info(
+            codes=["689009"],
+            category=["最新提示", "公司概况"],
+            mode="sync",
+            return_df=True,
+        )
     ```
     """
+    if isinstance(codes, (str, bytes)):
+        raise TypeError('get_company_info 的 codes 须为 list，单票请传 ["600000"]')
+    if codes is None:
+        raise ValueError("get_company_info 需要提供非空 codes 列表")
+    code_list = [str(c).strip() for c in codes if str(c).strip()]
+    if not code_list:
+        raise ValueError("get_company_info 需要提供非空 codes 列表")
+    if queue is not None and not hasattr(queue, "put"):
+        raise ValueError("queue 必须提供 put() 方法")
+
+    mode_norm = str(mode or "async").strip().lower()
+    if mode_norm not in {"sync", "async"}:
+        raise ValueError(f"不支持的 mode: {mode}")
+
+    if mode_norm == "async":
+        _ensure_active_config_ready(caller_name="get_company_info")
+        async_queue = queue if queue is not None else std_queue.Queue()
+        return _fetch_company_info_async(
+            codes=code_list,
+            category=category,
+            queue=async_queue,
+        )
+
+    def _sync_many(client: UnifiedTdxClient):
+        """
+        输入客户端，按 codes 顺序拉取；中间仅用 list[dict]。
+
+        输出：list[dict] 或最终 DataFrame。
+        """
+        all_rows: List[Dict[str, Any]] = []
+        success_codes = 0
+        failed_codes = 0
+        for item in code_list:
+            try:
+                part = client.get_company_info_content(
+                    code=item, category=category, return_df=False
+                )
+                part_rows = list(part or [])
+                all_rows.extend(part_rows)
+                success_codes += 1
+                if queue is not None:
+                    queue.put(
+                        {
+                            "event": "data",
+                            "code": str(item),
+                            "rows": part_rows,
+                            "error": None,
+                        }
+                    )
+            except Exception as exc:
+                failed_codes += 1
+                if queue is not None:
+                    queue.put(
+                        {
+                            "event": "data",
+                            "code": str(item),
+                            "rows": [],
+                            "error": str(exc),
+                        }
+                    )
+        if queue is not None:
+            queue.put(
+                {
+                    "event": "done",
+                    "total_codes": len(code_list),
+                    "success_codes": int(success_codes),
+                    "failed_codes": int(failed_codes),
+                }
+            )
+        if client._default_return_df(return_df):  # noqa: SLF001
+            return pd.DataFrame(all_rows, columns=["code", "category", "content"])
+        return all_rows
+
     return _call_with_client(
-        lambda client: client.get_company_info_content(
-            code=code, category=category, return_df=return_df
-        ),
+        _sync_many,
         get_active_context_client=UnifiedTdxClient.get_active_context_client,
         build_client=lambda: get_client(),
     )
+
 
 
 def get_stock_latest_price(codes: Optional[Any] = None) -> Dict[str, Optional[float]]:

@@ -189,6 +189,22 @@ parallel:
   # 取值: 正整数
   # 影响: 每轮会向进程池提交探针任务以拉齐 worker 预热状态。
   auto_prewarm_max_rounds: 3
+  # 公司信息并行：每个进程内同时处理的股票数。
+  # 取值: 正整数
+  # 影响: 进程内股票级 ThreadPool 并发度；过大易触发行情站限流。
+  company_info_stock_inproc_workers: 3
+  # 公司信息并行：单股内标签正文并发线程数。
+  # 取值: 正整数
+  # 影响: 目录拉完后并发抓各标签；过大时连接数≈进程数×股票并发×标签并发。
+  company_info_category_workers: 3
+  # 公司信息并行：提交到单个 worker future 的股票数。
+  # 取值: 正整数
+  # 影响: chunk 越大调度开销越低，但单 future 失败影响面越大。
+  company_info_codes_per_chunk: 40
+  # 公司信息并行：父进程在飞 chunk 窗口倍率。
+  # 取值: 正整数
+  # 影响: 在飞 future 上限 = 进程数 × 该倍率。
+  company_info_max_inflight_multiplier: 2
 
 pagination:
   # 标准行情 get_security_list 单页数量（命令 0x044D）。

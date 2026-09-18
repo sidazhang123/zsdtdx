@@ -1338,6 +1338,7 @@ class UnifiedTdxClient:
         self._future_route = {}
         self._future_zhulian_by_variety: Dict[str, str] = {}
         self._runtime_failures: List[Dict[str, Any]] = []
+        self._runtime_failures_lock = threading.Lock()
         self._entered_client = None
         self._worker_client_flag = bool(worker_client)
         self._presorted_hosts_snapshot: Dict[str, List[Tuple[str, int]]] = {
@@ -2962,16 +2963,20 @@ class UnifiedTdxClient:
         self, task: str, code: str, reason: str, detail: str, freq: str = ""
     ):
         """输入失败信息，输出无；用于失败报告；detail 为空会转空串。"""
-        self._runtime_failures.append(
-            {
-                "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-                "task": task,
-                "code": str(code),
-                "freq": str(freq),
-                "reason": str(reason),
-                "detail": str(detail or ""),
-            }
-        )
+        entry = {
+            "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+            "task": task,
+            "code": str(code),
+            "freq": str(freq),
+            "reason": str(reason),
+            "detail": str(detail or ""),
+        }
+        lock = getattr(self, "_runtime_failures_lock", None)
+        if lock is None:
+            self._runtime_failures.append(entry)
+            return
+        with lock:
+            self._runtime_failures.append(entry)
 
     def _refresh_markets(self):
         """输入无，输出无；用于刷新市场缓存；网络波动时连接池自动兜底。"""
@@ -4920,8 +4925,22 @@ class UnifiedTdxClient:
         code: str,
         category: Optional[Any] = None,
         return_df: Optional[bool] = None,
+        category_workers: int = 1,
     ):
-        """输入股票代码与中文分类列表，输出分类正文；用于单股抓取；返回 code/category/content 三列。"""
+        """
+        输入股票代码与中文分类列表，输出分类正文；用于单股抓取。
+
+        输入：
+        1. code: 股票代码。
+        2. category: 中文分类名列表；为空时返回全部分类。
+        3. return_df: 是否返回 DataFrame。
+        4. category_workers: 单股内标签正文并发线程数；<=1 时顺序拉取。
+        输出：
+        1. code/category/content 三列（DataFrame 或 list[dict]）。
+        边界条件：
+        1. 非标准市场返回空表并记录失败。
+        2. 目录拉取后按 category_workers 并发抓正文；失败分类记入运行态失败。
+        """
         normalized_code = self._normalize_stock_query_code(code)
         route = self._lookup_stock_route(normalized_code)
         if route is None:
@@ -4935,10 +4954,9 @@ class UnifiedTdxClient:
             self._record_failure(
                 "company_info", str(code), "unsupported", "non_std_market"
             )
-            empty_df = pd.DataFrame(columns=["code", "category", "content"])
             if self._default_return_df(return_df):
-                return empty_df
-            return empty_df.to_dict(orient="records")
+                return pd.DataFrame(columns=["code", "category", "content"])
+            return []
 
         # 北交所行情路由为 market=2，但 F10 目录/正文需走 market=0。
         market = self._company_info_protocol_market(route)
@@ -4947,24 +4965,30 @@ class UnifiedTdxClient:
         )
 
         if not categories:
-            empty_df = pd.DataFrame(columns=["code", "category", "content"])
             if self._default_return_df(return_df):
-                return empty_df
-            return empty_df.to_dict(orient="records")
+                return pd.DataFrame(columns=["code", "category", "content"])
+            return []
 
         category_filter = self._normalize_category_filter(category)
         missing_category = set(category_filter) if category_filter else set()
 
-        records: List[Dict[str, Any]] = []
+        selected: List[Tuple[int, Dict[str, Any], str]] = []
         for seq, cat in enumerate(categories):
             cat_name = str(cat.get("name", "")).strip()
             cat_name_key = self._normalize_category_name(cat_name)
             if category_filter and cat_name_key not in category_filter:
                 continue
-
             if cat_name_key in missing_category:
                 missing_category.discard(cat_name_key)
+            selected.append((seq, cat, cat_name))
 
+        def _fetch_one(item: Tuple[int, Dict[str, Any], str]) -> Dict[str, Any]:
+            """
+            输入单条目录项，输出正文记录；用于单股内标签拉取。
+
+            边界：失败状态写入运行态失败后仍返回 content（可能为空串）。
+            """
+            seq, cat, cat_name = item
             content, status = self._fetch_company_content(
                 market=market,
                 code=str(normalized_code),
@@ -4983,9 +5007,17 @@ class UnifiedTdxClient:
                     status,
                     detail,
                 )
-            records.append(
-                {"code": str(code), "category": cat_name, "content": content}
-            )
+            return {"code": str(code), "category": cat_name, "content": content}
+
+        workers = max(1, int(category_workers or 1))
+        if workers <= 1 or len(selected) <= 1:
+            records = [_fetch_one(item) for item in selected]
+        else:
+            records = []
+            with _ThreadPoolExecutor(max_workers=min(workers, len(selected))) as pool:
+                futures = [pool.submit(_fetch_one, item) for item in selected]
+                for fut in futures:
+                    records.append(fut.result())
 
         for miss_name in sorted(missing_category):
             self._record_failure(
@@ -4995,10 +5027,9 @@ class UnifiedTdxClient:
                 miss_name,
             )
 
-        df = pd.DataFrame(records, columns=["code", "category", "content"])
         if self._default_return_df(return_df):
-            return df
-        return df.to_dict(orient="records")
+            return pd.DataFrame(records, columns=["code", "category", "content"])
+        return records
 
     def get_failures_df(self) -> pd.DataFrame:
         """输入无，输出失败明细表；用于报告；无失败时返回空表头。"""

@@ -16,17 +16,20 @@ import atexit
 import copy
 import json
 import os
+import queue as queue_mod
 import random
 import threading
 import time
 import warnings
 from collections import defaultdict
 from concurrent.futures import (
+    FIRST_COMPLETED,
     Future,
     ProcessPoolExecutor,
     ThreadPoolExecutor,
     TimeoutError,
     as_completed,
+    wait,
 )
 from dataclasses import dataclass
 from pathlib import Path
@@ -2694,6 +2697,26 @@ class ParallelKlineFetcher:
         self.num_processes = get_optimal_process_count(
             core_multiplier=self.process_count_core_multiplier
         )
+        self.company_info_stock_inproc_workers = self._safe_int_config(
+            parallel_cfg.get("company_info_stock_inproc_workers"),
+            default=3,
+            minimum=1,
+        )
+        self.company_info_category_workers = self._safe_int_config(
+            parallel_cfg.get("company_info_category_workers"),
+            default=3,
+            minimum=1,
+        )
+        self.company_info_codes_per_chunk = self._safe_int_config(
+            parallel_cfg.get("company_info_codes_per_chunk"),
+            default=40,
+            minimum=1,
+        )
+        self.company_info_max_inflight_multiplier = self._safe_int_config(
+            parallel_cfg.get("company_info_max_inflight_multiplier"),
+            default=2,
+            minimum=1,
+        )
         self._auto_prewarm_lock = threading.Lock()
         self._auto_prewarm_last_epoch: int = -1
         self._auto_prewarm_last_workers: int = 0
@@ -4284,3 +4307,302 @@ def get_fetcher() -> ParallelKlineFetcher:
     if _fetcher is None:
         _fetcher = ParallelKlineFetcher(config_path=_active_config_path)
     return _fetcher
+
+
+def _worker_fetch_company_info_chunk(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    worker 内处理一批股票公司信息。
+
+    输入：
+    1. payload.codes: 股票代码列表。
+    2. payload.category: 可选分类过滤。
+    3. payload.stock_workers: 进程内股票并发线程数。
+    4. payload.category_workers: 单股标签并发线程数。
+    输出：
+    1. {"rows": list[dict], "errors": list[dict], "pid": int}。
+    用途：
+    1. 作为 ProcessPool 的 chunk 执行体；进程内用线程池做有限股票并发。
+    边界条件：
+    1. 单股异常不中断同 chunk 其它股票；异常写入 errors。
+    2. 结束后清理已退出线程遗留连接。
+    """
+    codes = [str(c).strip() for c in (payload.get("codes") or []) if str(c).strip()]
+    category = payload.get("category")
+    stock_workers = max(1, int(payload.get("stock_workers") or 1))
+    category_workers = max(1, int(payload.get("category_workers") or 1))
+    client = _ensure_worker_client_context()
+    # 预热码表，避免每只股票首次查找都触发刷新。
+    try:
+        client.get_all_stock_list(return_df=True, refresh=False)
+    except Exception:
+        pass
+
+    rows: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    rows_lock = threading.Lock()
+
+    def _one_stock(code: str) -> None:
+        """
+        输入股票代码，拉取该公司信息并写入 rows/errors。
+
+        边界：异常时写入 errors，不抛到线程池外。
+        """
+        try:
+            part = client.get_company_info_content(
+                code=code,
+                category=category,
+                return_df=False,
+                category_workers=category_workers,
+            )
+            part_rows = list(part or [])
+            with rows_lock:
+                rows.extend(part_rows)
+        except Exception as exc:
+            with rows_lock:
+                errors.append({"code": str(code), "error": str(exc)})
+
+    if not codes:
+        return {"rows": [], "errors": [], "pid": int(os.getpid())}
+
+    workers = min(stock_workers, len(codes))
+    if workers <= 1:
+        for code in codes:
+            _one_stock(code)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(_one_stock, codes))
+
+    _cleanup_worker_dead_thread_connections()
+    return {
+        "rows": rows,
+        "errors": errors,
+        "pid": int(os.getpid()),
+    }
+
+
+def _iter_company_info_chunk_results(
+    *,
+    codes: List[str],
+    category: Optional[Any],
+    auto_prewarm: Optional[bool] = None,
+) -> Any:
+    """
+    按 chunk 提交公司信息并行抓取，产出每个 chunk 的原始结果字典。
+
+    输入：
+    1. codes/category: 股票列表与分类过滤。
+    2. auto_prewarm: 是否预热；None 跟随配置。
+    输出：
+    1. 迭代器，元素为 {"rows": list[dict], "errors": list[dict], ...}。
+    用途：
+    1. sync 聚合与 async 队列推送共用；全程不经过 DataFrame。
+    边界条件：
+    1. codes 为空时不产出任何元素。
+    """
+    normalized_codes = [str(c).strip() for c in (codes or []) if str(c).strip()]
+    if not normalized_codes:
+        return
+
+    fetcher = get_fetcher()
+    do_prewarm = (
+        bool(fetcher.auto_prewarm_on_async)
+        if auto_prewarm is None
+        else bool(auto_prewarm)
+    )
+    if do_prewarm:
+        try:
+            prewarm_parallel_fetcher(
+                require_all_workers=bool(fetcher.auto_prewarm_require_all_workers),
+                timeout_seconds=float(fetcher.auto_prewarm_timeout_seconds),
+                max_rounds=int(fetcher.auto_prewarm_max_rounds),
+                target_workers=int(fetcher.num_processes),
+            )
+        except Exception as exc:
+            _emit_log(
+                "warning",
+                "[CompanyInfo Parallel] 预热失败，继续尝试抓取",
+                {"error": str(exc)},
+            )
+
+    chunk_size = max(1, int(fetcher.company_info_codes_per_chunk))
+    chunks: List[List[str]] = [
+        normalized_codes[i : i + chunk_size]
+        for i in range(0, len(normalized_codes), chunk_size)
+    ]
+    stock_workers = max(1, int(fetcher.company_info_stock_inproc_workers))
+    category_workers = max(1, int(fetcher.company_info_category_workers))
+    max_inflight = max(
+        1,
+        int(fetcher.num_processes)
+        * int(fetcher.company_info_max_inflight_multiplier),
+    )
+
+    _emit_log(
+        "info",
+        "[CompanyInfo Parallel] 开始调度",
+        {
+            "codes": len(normalized_codes),
+            "chunks": len(chunks),
+            "num_processes": int(fetcher.num_processes),
+            "stock_workers": int(stock_workers),
+            "category_workers": int(category_workers),
+            "max_inflight": int(max_inflight),
+        },
+    )
+
+    executor = _get_global_process_pool(int(fetcher.num_processes))
+    pending: Dict[Future, int] = {}
+    next_idx = 0
+
+    def _submit(idx: int) -> None:
+        """输入 chunk 下标，提交到进程池。"""
+        payload = {
+            "codes": chunks[idx],
+            "category": category,
+            "stock_workers": stock_workers,
+            "category_workers": category_workers,
+        }
+        pending[executor.submit(_worker_fetch_company_info_chunk, payload)] = idx
+
+    while pending or next_idx < len(chunks):
+        while next_idx < len(chunks) and len(pending) < max_inflight:
+            _submit(next_idx)
+            next_idx += 1
+        if not pending:
+            break
+        done_set, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
+        for fut in done_set:
+            pending.pop(fut, None)
+            try:
+                yield fut.result()
+            except Exception as exc:
+                yield {"rows": [], "errors": [{"code": "", "error": str(exc)}]}
+
+
+def fetch_company_info_parallel(
+    codes: List[str],
+    category: Optional[Any] = None,
+    *,
+    auto_prewarm: Optional[bool] = None,
+    queue: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    """
+    多进程并行拉取公司信息，阻塞至完成；中间与返回均为 list[dict]。
+
+    输入：
+    1. codes/category: 股票列表与分类过滤。
+    2. auto_prewarm: 是否预热。
+    3. queue: 可选；若提供则边抓边 put data/done 事件（与 async 事件结构一致）。
+    输出：
+    1. [{"code","category","content"}, ...]；不含 DataFrame。
+    """
+    all_rows: List[Dict[str, Any]] = []
+    all_errors: List[Dict[str, Any]] = []
+    success_codes: set[str] = set()
+    failed_codes: set[str] = set()
+    total_codes = len([str(c).strip() for c in (codes or []) if str(c).strip()])
+
+    for result in _iter_company_info_chunk_results(
+        codes=codes, category=category, auto_prewarm=auto_prewarm
+    ):
+        rows = list(result.get("rows") or [])
+        errors = list(result.get("errors") or [])
+        all_rows.extend(rows)
+        all_errors.extend(errors)
+        for row in rows:
+            code = str(row.get("code", "")).strip()
+            if code:
+                success_codes.add(code)
+        for err in errors:
+            code = str(err.get("code", "")).strip()
+            if code:
+                failed_codes.add(code)
+            if queue is not None:
+                queue.put(
+                    {
+                        "event": "data",
+                        "code": code,
+                        "rows": [],
+                        "error": str(err.get("error") or ""),
+                    }
+                )
+        if queue is not None and rows:
+            # 按 code 拆条推送，便于消费方边写边释放。
+            by_code: Dict[str, List[Dict[str, Any]]] = {}
+            for row in rows:
+                code = str(row.get("code", "")).strip()
+                by_code.setdefault(code, []).append(row)
+            for code, part_rows in by_code.items():
+                queue.put(
+                    {
+                        "event": "data",
+                        "code": code,
+                        "rows": part_rows,
+                        "error": None,
+                    }
+                )
+
+    if all_errors:
+        _emit_log(
+            "warning",
+            "[CompanyInfo Parallel] 部分股票失败",
+            {"error_count": len(all_errors), "sample": all_errors[:5]},
+        )
+    if queue is not None:
+        queue.put(
+            {
+                "event": "done",
+                "total_codes": int(total_codes),
+                "success_codes": int(len(success_codes)),
+                "failed_codes": int(len(failed_codes)),
+            }
+        )
+    return all_rows
+
+
+def fetch_company_info_async(
+    codes: List[str],
+    category: Optional[Any] = None,
+    *,
+    queue: Optional[Any] = None,
+    auto_prewarm: Optional[bool] = None,
+) -> StockKlineJob:
+    """
+    异步并行拉取公司信息，立即返回 Job；结果经 queue 流式推送。
+
+    输入：
+    1. codes/category: 股票列表与分类过滤。
+    2. queue: 可选；不传则自动创建。
+    3. auto_prewarm: 是否预热。
+    输出：
+    1. StockKlineJob；`job.queue` 事件为 data/done；`job.result()` 为 list[dict] 全文行。
+    边界条件：
+    1. 中间传递与队列 payload 均不使用 DataFrame。
+    """
+    result_queue = queue if queue is not None else queue_mod.Queue()
+    if not hasattr(result_queue, "put"):
+        raise ValueError("queue 必须提供 put() 方法")
+
+    def _run() -> List[Dict[str, Any]]:
+        """后台线程执行并行抓取并写队列。"""
+        return fetch_company_info_parallel(
+            codes=codes,
+            category=category,
+            auto_prewarm=auto_prewarm,
+            queue=result_queue,
+        )
+
+    executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="zsdtdx_company_info_async"
+    )
+    future = executor.submit(_run)
+
+    def _shutdown_executor(_fut: Future) -> None:
+        """输入完成 future，关闭临时线程池；用于避免线程池泄漏。"""
+        try:
+            executor.shutdown(wait=False)
+        except Exception:
+            pass
+
+    future.add_done_callback(_shutdown_executor)
+    return StockKlineJob(future=future, queue_obj=result_queue)

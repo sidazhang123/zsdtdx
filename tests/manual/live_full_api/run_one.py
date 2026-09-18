@@ -314,14 +314,14 @@ def round_get_company_info() -> Dict[str, Any]:
     out = {}
     with get_client():
         for code in ("600000", "000001"):
-            rows = get_company_info(code=code, return_df=False)
+            rows = get_company_info(codes=[code], return_df=False, mode="sync")
             cats = sorted({str(r.get("category", "")) for r in (rows or [])})
             out[code] = {"n": len(rows or []), "categories": cats[:8]}
             if not rows:
                 raise RuntimeError(f"{code} 公司信息为空")
             if not any(str(r.get("content", "")).strip() for r in rows):
                 raise RuntimeError(f"{code} 公司信息正文全空")
-        bj_rows = get_company_info(code="920002", return_df=False)
+        bj_rows = get_company_info(codes=["920002"], return_df=False, mode="sync")
         out["920002"] = {
             "n": len(bj_rows or []),
             "note": "北交所 HQ F10 目录可为空（服务端无公司信息分类）",
