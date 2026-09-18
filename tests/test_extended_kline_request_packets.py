@@ -40,8 +40,8 @@ def _unpack_ext(pkg: bytes):
     }
 
 
-def test_ex_setup_matches_tdxw_92_bytes():
-    """输入：扩展握手；输出：92 字节、命令号 0x6548。"""
+def test_ex_setup_matches_yinhe_92_bytes():
+    """输入：扩展握手；输出：与银河 7720 抓包 92 字节一致。"""
     cmd = ExSetupCmd1(None)
     cmd.setup()
     raw = bytes(cmd.send_pkg)
@@ -53,7 +53,11 @@ def test_ex_setup_matches_tdxw_92_bytes():
     assert ln == 0x52
     assert ln2 == 0x52
     assert raw[10:12] == bytes.fromhex("5424")
-
+    assert raw == bytes.fromhex(
+        "010148650001520052005424c0630e3a8287fd4d05e7e7e75d50f95844aa94fe"
+        "41d587e66d4518e53f08a034e158c0abaff8069b6af7dccba67484f7a5027104"
+        "bb02ef4535a52eae2243d8e061ca5bfebce9ee9b118394211d4e3ab5"
+    )
 
 def test_pack_extended_kline_first_page_matches_tdxw():
     """输入：00700 15 分钟 start=0 count=420；输出：与 TdxW 首包逐字节一致。"""

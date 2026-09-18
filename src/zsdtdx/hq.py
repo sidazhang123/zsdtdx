@@ -44,7 +44,7 @@ class TdxHq_API(BaseSocketClient):
         用途：连接成功后发送三条标准行情握手。
         边界：任一条握手失败时由 `connect()` 断开连接并抛错，不会继续发行情请求。
         """
-        # 292 字节首包 → 13 字节第二包 → tdxlevel 身份包。
+        # 292 字节首包 → 13 字节第二包 →「银河证券」身份包。
         SetupCmd1(self.client).call_api()
         SetupCmd2(self.client).call_api()
         SetupCmd3(self.client).call_api()

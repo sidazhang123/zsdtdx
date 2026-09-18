@@ -3,22 +3,23 @@
 ## Unreleased
 
 ### Summary
-1. 标准行情握手对齐通达信官方客户端（TdxW）：292 字节首包 + 13 字节第二包 + `tdxlevel` 身份包，替换旧 pytdx 申银/招商身份握手。
-2. 个股/指数 K 线请求为 54 字节 0x052D；默认单页 800 条（服务端硬上限）；`start=0` 与翻页使用不同 inner 字段。
-3. 个股标准行情 K 线默认请求服务器前复权（`pagination.standard_kline_qfq: true`，reserved0=1）；指数 reserved0 固定为 0。
-4. 官方周期号：1 分钟 category=7，日线 category=4（高层 `d` 本已映射为 4）。
-5. 默认 host 池替换为当前通达信 `connect.cfg`：标准行情 `[HQHOST]` 48（7709），扩展行情 `[DSHOST]` 16（7727）。
-6. `get_stock_kline` 增加 `qfq`（默认 True）：A 股写 reserved0，港股写扩展行情 extra；`get_index_kline` / `get_future_kline` 不暴露该参数，reserved0/extra 固定 0。
-7. 扩展行情握手与 K 线：92 字节 0x6548 握手；K 线请求 64 字节 0xD808/0xD908；回包 42 字节前缀 + 32 字节记录。默认单页 700 条（服务端硬上限）。
-8. 移除空闲心跳：删除 `heartbeat.py`、`do_heartbeat`、`BaseSocketClient(heartbeat=...)` 与 `pool.heartbeat`。官方客户端只在选站时发 12 字节探测（标准 0x15 / 扩展 0x2455）；空闲断连由连接池重连处理。
-9. 北交所个股改走标准行情 market=2（reserved0 前复权）；扩展行情 market=44（股转系统）不再承担北交所 K 线。
-10. 标准行情码表使用 0x044D（单页 1600、记录 37 字节），`get_security_list` 覆盖深沪京；HQ 指数目录扫描 market=0/1/2（含北证50）；中证等扩展指数仍走 `get_instrument_info`。
-11. 扩展行情码表使用 0x2422 文本页（`市场#代码|名称`）；`get_instrument_info` 覆盖港股、期货与中证等扩展品种。
-12. 期货纯品种代码按码表名称含「主连」的合约补全（不再硬编码 `L8`）；`L9` 为加权连续，不当作主连。带 3~4 位合约月份的代码原样查询。
-13. 码表改为统一缓存聚合层 `ensure_code_catalog`：std/ex 分文件按自然日缓存未过滤原文，使用时再过滤。删除 `index_kline.route_cache` 与 `index_route_disk_cache.py`。
-14. 港股市场识别默认改为扩展行情「香港主板」（港股通股票均在主板，不含创业板）。
-15. `get_future_kline` 并行分流按合约形态识别期货：`CUL8` 等 `L+数字` 连续合约不再因字母 `L` 被误判为股票。
-16. `get_stock_latest_price`：未上市占位码（五档全 0）解析不再抛错，一只票不会把整批打成 None；现价非正回退昨收，占位票记 None 且不拆单重试。
+1. 标准行情握手对齐银河海王星客户端：292 字节首包 + 13 字节第二包（末字节 02）+ GBK「银河证券」身份包（float 11.63）；扩展行情 92 字节 0x6548 握手同步对齐银河 7720 抓包。
+2. 默认 hosts 切到银河 `connect.cfg`（标准 7709 / 扩展 7720·7730，去掉不可达 IPv6）；通达信官方地址注释保留备查。
+3. 公司信息 F10：目录带 `index`；正文请求写入 `category_index`，请求 length 为剩余总字节，单页上限 30720；北交所 F10 走 market=0。
+4. 个股/指数 K 线请求为 54 字节 0x052D；默认单页 800 条（服务端硬上限）；`start=0` 与翻页使用不同 inner 字段。
+5. 个股标准行情 K 线默认请求服务器前复权（`pagination.standard_kline_qfq: true`，reserved0=1）；指数 reserved0 固定为 0。
+6. 官方周期号：1 分钟 category=7，日线 category=4（高层 `d` 本已映射为 4）。
+7. `get_stock_kline` 增加 `qfq`（默认 True）：A 股写 reserved0，港股写扩展行情 extra；`get_index_kline` / `get_future_kline` 不暴露该参数，reserved0/extra 固定 0。
+8. 扩展行情握手与 K 线：92 字节 0x6548 握手对齐银河海王星（7720）；K 线请求 64 字节 0xD808/0xD908；回包 42 字节前缀 + 32 字节记录。默认单页 700 条（服务端硬上限）。
+9. 移除空闲心跳：删除 `heartbeat.py`、`do_heartbeat`、`BaseSocketClient(heartbeat=...)` 与 `pool.heartbeat`。官方客户端只在选站时发 12 字节探测（标准 0x15 / 扩展 0x2455）；空闲断连由连接池重连处理。
+10. 北交所个股改走标准行情 market=2（reserved0 前复权）；扩展行情 market=44（股转系统）不再承担北交所 K 线。
+11. 标准行情码表使用 0x044D（单页 1600、记录 37 字节），`get_security_list` 覆盖深沪京；HQ 指数目录扫描 market=0/1/2（含北证50）；中证等扩展指数仍走 `get_instrument_info`。
+12. 扩展行情码表使用 0x2422 文本页（`市场#代码|名称`）；`get_instrument_info` 覆盖港股、期货与中证等扩展品种。
+13. 期货纯品种代码按码表名称含「主连」的合约补全（不再硬编码 `L8`）；`L9` 为加权连续，不当作主连。带 3~4 位合约月份的代码原样查询。
+14. 码表改为统一缓存聚合层 `ensure_code_catalog`：std/ex 分文件按自然日缓存未过滤原文，使用时再过滤。删除 `index_kline.route_cache` 与 `index_route_disk_cache.py`。
+15. 港股市场识别默认改为扩展行情「香港主板」（港股通股票均在主板，不含创业板）。
+16. `get_future_kline` 并行分流按合约形态识别期货：`CUL8` 等 `L+数字` 连续合约不再因字母 `L` 被误判为股票。
+17. `get_stock_latest_price`：未上市占位码（五档全 0）解析不再抛错，一只票不会把整批打成 None；现价非正回退昨收，占位票记 None 且不拆单重试。
 
 ## v1.4.9 - 2026-05-25
 

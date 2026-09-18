@@ -3,22 +3,22 @@
 
 职责：
 1. 构造扩展行情连接后的握手请求。
-2. 握手为 92 字节，命令号 0x6548，inner=0x2454。
+2. 握手对齐银河海王星客户端：92 字节，命令号 0x6548，inner=0x2454。
 
 边界：
 1. 仅负责组包与丢弃握手回包，不解析业务字段。
-2. 正文为固定身份块；回包无业务字段。
+2. 正文为固定身份块（来源：银河 7720 抓包）；回包无业务字段。
 """
 
 # coding=utf-8
 
 from zsdtdx.parser.base import BaseParser
 
-# 扩展行情握手：92 字节，cmd=0x6548，inner=0x2454。
+# 扩展行情握手：92 字节，cmd=0x6548，inner=0x2454（银河海王星 7720 首连）。
 _EX_SETUP1 = bytes.fromhex(
-    "010148650001520052005424e5bb1c2fafe525941f32c6e5d53dfb415b734cc9"
-    "cdbf0ac92021bfdd1eb06d22e158c0abaff8069b6af7dccba67484f71f32c6e5"
-    "d53dfb411f32c6e5d53dfb41a9325ac935dc0837335a16e4ce17c1bb"
+    "010148650001520052005424c0630e3a8287fd4d05e7e7e75d50f95844aa94fe"
+    "41d587e66d4518e53f08a034e158c0abaff8069b6af7dccba67484f7a5027104"
+    "bb02ef4535a52eae2243d8e061ca5bfebce9ee9b118394211d4e3ab5"
 )
 
 
