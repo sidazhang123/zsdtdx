@@ -4,10 +4,11 @@
 职责：
 1. 组包并解析标准行情公司信息正文单页（命令 0x02D0）。
 2. 请求带分类下标、文件内 start 与剩余 length；服务端单页上限 30720 字节。
+3. 单页只截取原文 bytes，不做 GBK 解码（整包解码由统一客户端完成）。
 
 边界：
 1. 本解析器只处理单次请求/单页回包，翻页由统一客户端按剩余 length 继续发起。
-2. 回包正文为 10 字节前缀 + uint16 本页字节数 + GBK 文本。
+2. 回包正文为 10 字节前缀 + uint16 本页字节数 + GBK 原文。
 """
 
 # coding=utf-8
@@ -65,19 +66,19 @@ class GetCompanyInfoContent(BaseParser):
 
     def parseResponse(self, body_buf):
         """
-        解析公司信息内容并执行容错解码。
+        解析公司信息正文单页原始字节。
 
         输入:
             body_buf(bytes): 服务端返回的数据包正文。
         输出:
-            str: 使用 GBK 解码后的公司信息文本。
+            bytes: 本页 GBK 原文（未解码）；无正文时为空 bytes。
         用途:
-            让上层调用方直接获得可读文本，避免重复解码。
+            把解码留给上层：先拼接各页字节，再对整包做 GBK 解码，
+            避免页界切开双字节汉字后按页 ignore 丢字。
         边界条件:
-            遇到非法字节时忽略该字节，不抛出异常中断流程。
+            本页长度取回包 uint16；不越界读取 body_buf。
         """
         pos = 0
         _, length = struct.unpack("<10sH", body_buf[:12])
         pos += 12
-        content = body_buf[pos : pos + length]
-        return content.decode("gbk", "ignore")
+        return bytes(body_buf[pos : pos + length])

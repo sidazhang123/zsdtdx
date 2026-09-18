@@ -4791,6 +4791,27 @@ class UnifiedTdxClient:
 
         return _gen()
 
+    @staticmethod
+    def _decode_company_info_bytes(raw: bytes) -> Tuple[str, str]:
+        """
+        输入整包公司信息原文 bytes，输出 (文本, decode_status)。
+
+        输入：
+        1. raw: 各页拼接后的 GBK 原文。
+        输出：
+        1. (text, decode_status)；decode_status 为 success 或 gbk_ignore_fallback。
+        用途：
+        1. 优先严格 GBK 解码以完整对应源端字节；失败再 ignore 兜底。
+        边界条件：
+        1. 空 bytes 返回空串与 success；ignore 兜底时仍返回可读文本。
+        """
+        if not raw:
+            return "", "success"
+        try:
+            return raw.decode("gbk"), "success"
+        except UnicodeDecodeError:
+            return raw.decode("gbk", "ignore"), "gbk_ignore_fallback"
+
     def _fetch_company_content(
         self,
         market: int,
@@ -4807,18 +4828,20 @@ class UnifiedTdxClient:
         1. market/code/filename/start/length: 目录记录字段；start 一般为 0，length 为全文字节。
         2. category_index: 目录下标，写入正文请求。
         输出：
-        1. (正文, status)；status 为 success / none_terminated / empty_terminated。
+        1. (正文, status)；status 为 success / none_terminated / empty_terminated /
+           gbk_ignore_fallback。
         用途：
-        1. 按官方客户端分页：请求 length 填剩余字节，start 每次前进单页上限。
+        1. 按官方客户端分页拉取各页原始字节，拼完整包后再做 GBK 解码。
         边界条件：
         1. 单页上限取 pagination.company_info_chunk_size，缺省 30720。
-        2. 某一页返回 None 或空串时停止后续页。
+        2. 某一页返回 None 或空 bytes 时停止后续页。
+        3. 严格 GBK 失败时 ignore 兜底，并由调用方记入运行态失败。
         """
         chunk_size = int(self.pagination.get("company_info_chunk_size", 30720))
         if chunk_size <= 0:
             chunk_size = 30720
         offset = 0
-        chunks = []
+        chunks: List[bytes] = []
         status = "success"
 
         while offset < int(length):
@@ -4836,16 +4859,17 @@ class UnifiedTdxClient:
             if part is None:
                 status = "none_terminated"
                 break
-            if isinstance(part, (bytes, bytearray)):
-                part = bytes(part).decode("gbk", "ignore")
-            part = str(part)
-            if part == "":
+            part = bytes(part)
+            if part == b"":
                 status = "empty_terminated"
                 break
             chunks.append(part)
             offset += min(chunk_size, remaining)
 
-        return "".join(chunks), status
+        text, decode_status = self._decode_company_info_bytes(b"".join(chunks))
+        if status == "success" and decode_status != "success":
+            status = decode_status
+        return text, status
 
     def _normalize_category_name(self, name: Any) -> str:
         """输入分类名，输出标准化名称；用于分类匹配；会去除全部空白字符。"""
@@ -4950,11 +4974,14 @@ class UnifiedTdxClient:
                 category_index=int(cat.get("index", seq)),
             )
             if status != "success":
+                detail = f"category={cat_name}"
+                if status == "gbk_ignore_fallback":
+                    detail = f"{detail}; strict_gbk_failed_used_ignore"
                 self._record_failure(
                     "company_info",
                     str(code),
                     status,
-                    f"category={cat_name}",
+                    detail,
                 )
             records.append(
                 {"code": str(code), "category": cat_name, "content": content}

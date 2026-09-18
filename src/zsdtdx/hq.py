@@ -297,11 +297,11 @@ class TdxHq_API(BaseSocketClient):
         5. length: 从 start 起的剩余总字节。
         6. category_index: 目录记录下标。
         输出：
-        1. 本页 GBK 正文；失败由底层抛错或返回空。
+        1. 本页原文 bytes（未解码）；失败由底层抛错或返回空。
         用途：
         1. 发送一页公司信息正文请求。
         边界条件：
-        1. 单页服务端上限 30720 字节；完整正文需由上层按剩余 length 继续请求。
+        1. 单页服务端上限 30720 字节；完整正文需由上层拼接各页后再做 GBK 解码。
         """
         cmd = GetCompanyInfoContent(self.client, lock=self.lock)
         cmd.setParams(market, code, filename, start, length, category_index)

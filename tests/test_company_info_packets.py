@@ -86,12 +86,12 @@ def test_content_pack_uses_category_index_and_remaining_length():
 
 
 def test_content_parse_uses_uint16_chunk_length():
-    """输入：10 字节前缀 + uint16 + GBK；输出：按本页字节数解码，不把剩余总长当本页长度。"""
+    """输入：10 字节前缀 + uint16 + GBK；输出：本页原始 bytes，不做解码。"""
     text = "☆公司大事☆"
     encoded = text.encode("gbk")
     body = b"\x00\x00300063\x00\x00" + struct.pack("<H", len(encoded)) + encoded
     parser = GetCompanyInfoContent(client=None)
-    assert parser.parseResponse(body) == text
+    assert parser.parseResponse(body) == encoded
 
 
 def test_fetch_company_content_pages_like_official_client():
@@ -101,12 +101,12 @@ def test_fetch_company_content_pages_like_official_client():
     def fake_call(method_name, *args, allow_none=False, **kwargs):
         """
         输入：连接池方法名与参数。
-        输出：非空占位正文。
+        输出：非空占位正文 bytes。
         用途：记录分页参数。
         边界：不访问网络。
         """
         calls.append((method_name, args))
-        return "x"
+        return b"x"
 
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
     client.pagination = {"company_info_chunk_size": 30720}
@@ -134,6 +134,106 @@ def test_fetch_company_content_pages_like_official_client():
     assert indexes == [8] * 12
     assert all(item[0] == "get_company_info_content" for item in calls)
     assert all(item[1][2] == "300063.V14" for item in calls)
+
+
+def test_fetch_company_content_joins_bytes_before_gbk_decode():
+    """输入：页界切开双字节汉字；输出：整包解码保留该字，不因按页 ignore 丢字节。"""
+    page_size = 30720
+    # 「中」GBK=D6 D0：lead 落在第 1 页末字节，trail 落在第 2 页首字节。
+    full = (b"A" * (page_size - 1)) + "中".encode("gbk") + b"B"
+    assert len(full) == page_size + 2
+    pages = [full[:page_size], full[page_size:]]
+    assert pages[0][-1:] == b"\xd6"
+    assert pages[1][:1] == b"\xd0"
+
+    def fake_call(method_name, *args, allow_none=False, **kwargs):
+        """
+        输入：连接池方法名与参数。
+        输出：按 start 返回对应页 bytes。
+        用途：模拟跨页 GBK 拆字。
+        边界：不访问网络。
+        """
+        start = int(args[3])
+        return pages[start // page_size]
+
+    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+    client.pagination = {"company_info_chunk_size": page_size}
+    client.std_pool = MagicMock()
+    client.std_pool.call.side_effect = fake_call
+    text, status = UnifiedTdxClient._fetch_company_content(
+        client,
+        market=0,
+        code="000001",
+        filename="000001.V14",
+        start=0,
+        length=len(full),
+        category_index=8,
+    )
+    assert status == "success"
+    assert text == ("A" * (page_size - 1)) + "中" + "B"
+    # 对照：按页 ignore 无法还原跨页汉字（lead 被丢，trail 可能被误读成别字）。
+    per_page = "".join(p.decode("gbk", "ignore") for p in pages)
+    assert "中" not in per_page
+    assert text.encode("gbk") == full
+
+
+def test_decode_company_info_bytes_ignore_fallback():
+    """输入：非法尾字节；输出：ignore 文本 + gbk_ignore_fallback 状态。"""
+    text, status = UnifiedTdxClient._decode_company_info_bytes(b"OK\xff")
+    assert status == "gbk_ignore_fallback"
+    assert text == "OK"
+
+
+def test_get_company_info_content_records_gbk_ignore_fallback():
+    """输入：正文含非法 GBK 字节；输出：仍返回正文，并记入运行态失败。"""
+    bad = b"\xff"
+
+    def fake_call(method_name, *args, allow_none=False, **kwargs):
+        """
+        输入：连接池方法名与参数。
+        输出：目录一条或非法正文 bytes。
+        用途：触发整包 GBK ignore 兜底。
+        边界：不访问网络。
+        """
+        if method_name == "get_company_info_category":
+            return [
+                {
+                    "index": 0,
+                    "name": "公司概况",
+                    "filename": "600000.V04",
+                    "start": 0,
+                    "length": len(bad),
+                }
+            ]
+        return bad
+
+    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+    client.pagination = {"company_info_chunk_size": 30720}
+    client.market_rules = {"include_beijing_prefixes": ["92"]}
+    client._stock_route = {
+        "600000": {
+            "code": "600000",
+            "name": "浦发银行",
+            "market": 1,
+            "market_name": "上海",
+            "source": "std",
+            "asset_type": "stock",
+        }
+    }
+    client._runtime_failures = []
+    client.output = {"return_df_default": False}
+    client.std_pool = MagicMock()
+    client.std_pool.call.side_effect = fake_call
+
+    rows = UnifiedTdxClient.get_company_info_content(
+        client, code="600000", return_df=False
+    )
+    assert len(rows) == 1
+    assert rows[0]["content"] == ""
+    assert any(
+        f["reason"] == "gbk_ignore_fallback" and f["task"] == "company_info"
+        for f in client._runtime_failures
+    )
 
 
 def test_company_info_protocol_market_beijing_uses_zero():
@@ -174,7 +274,7 @@ def test_get_company_info_content_beijing_queries_market_zero():
     def fake_call(method_name, *args, allow_none=False, **kwargs):
         """
         输入：连接池方法名与参数。
-        输出：目录一条或占位正文。
+        输出：目录一条或占位正文 bytes。
         用途：记录 F10 实际请求 market。
         边界：不访问网络。
         """
@@ -189,7 +289,7 @@ def test_get_company_info_content_beijing_queries_market_zero():
                     "length": 100,
                 }
             ]
-        return "正文"
+        return "正文".encode("gbk")
 
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
     client.pagination = {"company_info_chunk_size": 30720}
