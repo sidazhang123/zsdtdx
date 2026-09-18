@@ -4798,22 +4798,39 @@ class UnifiedTdxClient:
         filename: str,
         start: int,
         length: int,
+        category_index: int,
     ) -> Tuple[str, str]:
-        """输入公司信息定位参数，输出全文和状态；用于自动分块；None/空片段提前结束。"""
-        chunk_size = int(self.pagination.get("company_info_chunk_size", 30000))
+        """
+        输入目录给出的文件定位与分类下标，输出拼接后的全文和状态。
+
+        输入：
+        1. market/code/filename/start/length: 目录记录字段；start 一般为 0，length 为全文字节。
+        2. category_index: 目录下标，写入正文请求。
+        输出：
+        1. (正文, status)；status 为 success / none_terminated / empty_terminated。
+        用途：
+        1. 按官方客户端分页：请求 length 填剩余字节，start 每次前进单页上限。
+        边界条件：
+        1. 单页上限取 pagination.company_info_chunk_size，缺省 30720。
+        2. 某一页返回 None 或空串时停止后续页。
+        """
+        chunk_size = int(self.pagination.get("company_info_chunk_size", 30720))
+        if chunk_size <= 0:
+            chunk_size = 30720
         offset = 0
         chunks = []
         status = "success"
 
         while offset < int(length):
-            ask = min(chunk_size, int(length) - offset)
+            remaining = int(length) - offset
             part = self.std_pool.call(
                 "get_company_info_content",
                 int(market),
                 str(code),
                 str(filename),
                 int(start) + offset,
-                ask,
+                remaining,
+                int(category_index),
                 allow_none=True,
             )
             if part is None:
@@ -4826,7 +4843,7 @@ class UnifiedTdxClient:
                 status = "empty_terminated"
                 break
             chunks.append(part)
-            offset += ask
+            offset += min(chunk_size, remaining)
 
         return "".join(chunks), status
 
@@ -4851,6 +4868,28 @@ class UnifiedTdxClient:
         if not normalized:
             return None
         return normalized
+
+    def _company_info_protocol_market(self, route: Dict[str, Any]) -> int:
+        """
+        输入股票路由，输出公司信息协议使用的标准行情 market。
+
+        输入：
+        1. route: `_lookup_stock_route` 返回的路由（含 market/source/code）。
+        输出：
+        1. 目录/正文请求用的 market；北交所固定为 0，其余沿用路由 market。
+        用途：
+        1. 北交所行情在 market=2，但 F10 目录/正文挂在 market=0。
+        边界条件：
+        1. 仅根据路由与代码前缀判断；不发起网络请求。
+        """
+        code = str(route.get("code", "")).strip()
+        try:
+            route_market = int(route.get("market", -1))
+        except Exception:
+            route_market = -1
+        if route_market == 2 or self._is_beijing_stock_code(code):
+            return 0
+        return route_market
 
     def get_company_info_content(
         self,
@@ -4877,7 +4916,8 @@ class UnifiedTdxClient:
                 return empty_df
             return empty_df.to_dict(orient="records")
 
-        market = int(route["market"])
+        # 北交所行情路由为 market=2，但 F10 目录/正文需走 market=0。
+        market = self._company_info_protocol_market(route)
         categories = self.std_pool.call(
             "get_company_info_category", market, str(normalized_code), allow_none=True
         )
@@ -4892,7 +4932,7 @@ class UnifiedTdxClient:
         missing_category = set(category_filter) if category_filter else set()
 
         records: List[Dict[str, Any]] = []
-        for cat in categories:
+        for seq, cat in enumerate(categories):
             cat_name = str(cat.get("name", "")).strip()
             cat_name_key = self._normalize_category_name(cat_name)
             if category_filter and cat_name_key not in category_filter:
@@ -4907,6 +4947,7 @@ class UnifiedTdxClient:
                 filename=str(cat.get("filename", "")),
                 start=int(cat.get("start", 0)),
                 length=int(cat.get("length", 0)),
+                category_index=int(cat.get("index", seq)),
             )
             if status != "success":
                 self._record_failure(

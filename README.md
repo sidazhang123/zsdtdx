@@ -761,9 +761,9 @@ pagination:
   # 扩展行情 K线单页数量（get_instrument_bars）。
   # 取值: 正整数；服务端硬上限 700
   extended_kline_page_size: 700
-  # 公司信息正文分块读取长度。
+  # 公司信息正文单页上限（字节）。服务端硬上限 30720；请求的 length 填剩余总字节。
   # 取值: 正整数
-  company_info_chunk_size: 30000
+  company_info_chunk_size: 30720
   # K线最大分页次数上限，防止异常场景下无限循环。
   # 取值: 正整数
   max_kline_pages: 400

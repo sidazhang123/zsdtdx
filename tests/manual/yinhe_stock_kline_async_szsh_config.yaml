@@ -1,0 +1,19 @@
+# 通达信节点：全量深沪股票 async K 线验收（不含北交所）
+bench:
+  # 包内配置（已切通达信 hosts）
+  config_path: "../../src/zsdtdx/config.yaml"
+  hosts_label: "tongdaxin"
+  freqs:
+    - "15"
+    - "30"
+    - "60"
+    - "d"
+    - "w"
+  start_time: "2026-09-14"
+  end_time: "2026-09-18"
+  mode: "async"
+  # 仅标准行情深沪（market 0/1）；显式排除北交所 market=2
+  exclude_beijing: true
+  queue_timeout_seconds: 7200
+  progress_every: 500
+  artifacts_dir: "artifacts/tdx_stock_kline_async_szsh_0914_0918"

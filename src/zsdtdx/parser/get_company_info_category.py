@@ -2,13 +2,12 @@
 模块：`parser/get_company_info_category.py`。
 
 职责：
-1. 提供 zsdtdx 体系中的协议封装、解析或对外接口能力。
-2. 对上层暴露稳定调用契约，屏蔽底层协议数据细节。
-3. 当前统计：类 1 个，函数 3 个。
+1. 组包并解析标准行情公司信息目录（命令 0x02CF）。
+2. 返回按服务端顺序排列的分类记录，下标供正文请求的 category_index 使用。
 
 边界：
-1. 本模块仅负责当前文件定义范围，不承担其它分层编排职责。
-2. 错误语义、重试策略与容错逻辑以实现与调用方约定为准。
+1. 只解析目录，不拉取正文。
+2. 记录布局为 2 字节条数 + N 条 152 字节（64 名称 + 80 文件名 + start + length）。
 """
 
 # coding=utf-8
@@ -97,6 +96,7 @@ class GetCompanyInfoCategory(BaseParser):
             pos += 152
             entry = OrderedDict(
                 [
+                    ("index", i),
                     ("name", get_str(name)),
                     ("filename", get_str(filename)),
                     ("start", start),

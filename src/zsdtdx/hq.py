@@ -285,23 +285,26 @@ class TdxHq_API(BaseSocketClient):
         return cmd.call_api()
 
     @update_last_ack_time
-    def get_company_info_content(self, market, code, filename, start, length):
+    def get_company_info_content(
+        self, market, code, filename, start, length, category_index
+    ):
         """
         输入：
-        1. market: 输入参数，约束以协议定义与函数实现为准。
-        2. code: 输入参数，约束以协议定义与函数实现为准。
-        3. filename: 输入参数，约束以协议定义与函数实现为准。
-        4. start: 输入参数，约束以协议定义与函数实现为准。
-        5. length: 输入参数，约束以协议定义与函数实现为准。
+        1. market: 标准市场编号。
+        2. code: 股票代码。
+        3. filename: 目录返回的文件名。
+        4. start: 本页文件内偏移。
+        5. length: 从 start 起的剩余总字节。
+        6. category_index: 目录记录下标。
         输出：
-        1. 返回值语义由函数实现定义；无返回时为 `None`。
+        1. 本页 GBK 正文；失败由底层抛错或返回空。
         用途：
-        1. 执行 `get_company_info_content` 对应的协议处理、数据解析或调用适配逻辑。
+        1. 发送一页公司信息正文请求。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 单页服务端上限 30720 字节；完整正文需由上层按剩余 length 继续请求。
         """
         cmd = GetCompanyInfoContent(self.client, lock=self.lock)
-        cmd.setParams(market, code, filename, start, length)
+        cmd.setParams(market, code, filename, start, length, category_index)
         return cmd.call_api()
 
     @update_last_ack_time
