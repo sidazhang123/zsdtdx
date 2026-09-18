@@ -58,14 +58,16 @@ class GetSecurityQuotesCmd(BaseParser):
 
     def parseResponse(self, body_buf):
         """
+        解析一批五档报价。
+
         输入：
-        1. body_buf: 输入参数，约束以协议定义与函数实现为准。
+        1. body_buf: 解压后的报价 body。
         输出：
-        1. 返回值语义由函数实现定义；无返回时为 `None`。
+        1. 成功解析的股票行列表；单条损坏时跳过该条，不返回 None。
         用途：
-        1. 执行 `parseResponse` 对应的协议处理、数据解析或调用适配逻辑。
+        1. 供 `get_security_quotes` 解码。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 未上市占位码的 servertime 可能为 0：本条记空时间，不得抛错，以免连接池把整批重试。
         """
         pos = 0
         pos += 2  # skip b1 cb
@@ -78,6 +80,7 @@ class GetSecurityQuotesCmd(BaseParser):
             # b'\x00000001\x95\n\x87\x0e\x01\x01\x05\x00\xb1\xb9\xd6\r\xc7\x0e\x8d\xd7\x1a\x84\x04S\x9c<M\xb6\xc8\x0e\x97\x8e\x0c\x00\xae\n\x00\x01\xa0\x1e\x9e\xb3\x03A\x02\x84\xf9\x01\xa8|B\x03\x8c\xd6\x01\xb0lC\x04\xb7\xdb\x02\xac\x7fD\x05\xbb\xb0\x01\xbe\xa0\x01y\x08\x01GC\x04\x00\x00\x95\n'
             (market, code, active1) = struct.unpack("<B6sH", body_buf[pos : pos + 9])
             pos += 9
+            code_text = code.decode("utf-8", errors="replace").rstrip("\x00").strip()
             price, pos = get_price(body_buf, pos)
             last_close_diff, pos = get_price(body_buf, pos)
             open_diff, pos = get_price(body_buf, pos)
@@ -148,55 +151,59 @@ class GetSecurityQuotesCmd(BaseParser):
             (reversed_bytes9, active2) = struct.unpack("<hH", body_buf[pos : pos + 4])
             pos += 4
 
-            one_stock = OrderedDict(
-                [
-                    ("market", market),
-                    ("code", code.decode("utf-8")),
-                    ("active1", active1),
-                    ("price", self._cal_price(price, 0)),
-                    ("last_close", self._cal_price(price, last_close_diff)),
-                    ("open", self._cal_price(price, open_diff)),
-                    ("high", self._cal_price(price, high_diff)),
-                    ("low", self._cal_price(price, low_diff)),
-                    ("servertime", self._format_time("%s" % reversed_bytes0)),
-                    ("reversed_bytes0", reversed_bytes0),
-                    ("reversed_bytes1", reversed_bytes1),
-                    ("vol", vol),
-                    ("cur_vol", cur_vol),
-                    ("amount", amount),
-                    ("s_vol", s_vol),
-                    ("b_vol", b_vol),
-                    ("reversed_bytes2", reversed_bytes2),
-                    ("reversed_bytes3", reversed_bytes3),
-                    ("bid1", self._cal_price(price, bid1)),
-                    ("ask1", self._cal_price(price, ask1)),
-                    ("bid_vol1", bid_vol1),
-                    ("ask_vol1", ask_vol1),
-                    ("bid2", self._cal_price(price, bid2)),
-                    ("ask2", self._cal_price(price, ask2)),
-                    ("bid_vol2", bid_vol2),
-                    ("ask_vol2", ask_vol2),
-                    ("bid3", self._cal_price(price, bid3)),
-                    ("ask3", self._cal_price(price, ask3)),
-                    ("bid_vol3", bid_vol3),
-                    ("ask_vol3", ask_vol3),
-                    ("bid4", self._cal_price(price, bid4)),
-                    ("ask4", self._cal_price(price, ask4)),
-                    ("bid_vol4", bid_vol4),
-                    ("ask_vol4", ask_vol4),
-                    ("bid5", self._cal_price(price, bid5)),
-                    ("ask5", self._cal_price(price, ask5)),
-                    ("bid_vol5", bid_vol5),
-                    ("ask_vol5", ask_vol5),
-                    ("reversed_bytes4", reversed_bytes4),
-                    ("reversed_bytes5", reversed_bytes5),
-                    ("reversed_bytes6", reversed_bytes6),
-                    ("reversed_bytes7", reversed_bytes7),
-                    ("reversed_bytes8", reversed_bytes8),
-                    ("reversed_bytes9", reversed_bytes9 / 100.0),  # 涨速
-                    ("active2", active2),
-                ]
-            )
+            try:
+                one_stock = OrderedDict(
+                    [
+                        ("market", market),
+                        ("code", code_text),
+                        ("active1", active1),
+                        ("price", self._cal_price(price, 0)),
+                        ("last_close", self._cal_price(price, last_close_diff)),
+                        ("open", self._cal_price(price, open_diff)),
+                        ("high", self._cal_price(price, high_diff)),
+                        ("low", self._cal_price(price, low_diff)),
+                        ("servertime", self._format_time("%s" % reversed_bytes0)),
+                        ("reversed_bytes0", reversed_bytes0),
+                        ("reversed_bytes1", reversed_bytes1),
+                        ("vol", vol),
+                        ("cur_vol", cur_vol),
+                        ("amount", amount),
+                        ("s_vol", s_vol),
+                        ("b_vol", b_vol),
+                        ("reversed_bytes2", reversed_bytes2),
+                        ("reversed_bytes3", reversed_bytes3),
+                        ("bid1", self._cal_price(price, bid1)),
+                        ("ask1", self._cal_price(price, ask1)),
+                        ("bid_vol1", bid_vol1),
+                        ("ask_vol1", ask_vol1),
+                        ("bid2", self._cal_price(price, bid2)),
+                        ("ask2", self._cal_price(price, ask2)),
+                        ("bid_vol2", bid_vol2),
+                        ("ask_vol2", ask_vol2),
+                        ("bid3", self._cal_price(price, bid3)),
+                        ("ask3", self._cal_price(price, ask3)),
+                        ("bid_vol3", bid_vol3),
+                        ("ask_vol3", ask_vol3),
+                        ("bid4", self._cal_price(price, bid4)),
+                        ("ask4", self._cal_price(price, ask4)),
+                        ("bid_vol4", bid_vol4),
+                        ("ask_vol4", ask_vol4),
+                        ("bid5", self._cal_price(price, bid5)),
+                        ("ask5", self._cal_price(price, ask5)),
+                        ("bid_vol5", bid_vol5),
+                        ("ask_vol5", ask_vol5),
+                        ("reversed_bytes4", reversed_bytes4),
+                        ("reversed_bytes5", reversed_bytes5),
+                        ("reversed_bytes6", reversed_bytes6),
+                        ("reversed_bytes7", reversed_bytes7),
+                        ("reversed_bytes8", reversed_bytes8),
+                        ("reversed_bytes9", reversed_bytes9 / 100.0),  # 涨速
+                        ("active2", active2),
+                    ]
+                )
+            except Exception:
+                # 未上市占位票字段已读完，组行失败只跳过本条，不抛给连接池。
+                continue
             stocks.append(one_stock)
         return stocks
 
@@ -216,14 +223,28 @@ class GetSecurityQuotesCmd(BaseParser):
 
     def _format_time(self, time_stamp):
         """
-        format time from reversed_bytes0
-        by using method from https://github.com/rainx/zsdtdx/issues/187
+        将报价记录中的 reversed_bytes0 转成 `HH:MM:SS.mmm`。
+
+        输入：
+        1. time_stamp: 变长整数的十进制字符串（来自 reversed_bytes0）。
+        输出：
+        1. 时间字符串；无法解析时返回空串。
+        用途：
+        1. 填充 `servertime` 字段。
+        边界条件：
+        1. 未上市占位码的 reversed_bytes0 常为 0 / 过短，必须返回空串而不是抛错。
         """
-        time = time_stamp[:-6] + ":"
-        if int(time_stamp[-6:-4]) < 60:
-            time += "%s:" % time_stamp[-6:-4]
-            time += "%06.3f" % (int(time_stamp[-4:]) * 60 / 10000.0)
-        else:
-            time += "%02d:" % (int(time_stamp[-6:]) * 60 / 1000000)
-            time += "%06.3f" % ((int(time_stamp[-6:]) * 60 % 1000000) * 60 / 1000000.0)
-        return time
+        raw = "" if time_stamp is None else str(time_stamp).strip()
+        if len(raw) < 6 or (not raw.isdigit()):
+            return ""
+        try:
+            time = raw[:-6] + ":"
+            if int(raw[-6:-4]) < 60:
+                time += "%s:" % raw[-6:-4]
+                time += "%06.3f" % (int(raw[-4:]) * 60 / 10000.0)
+            else:
+                time += "%02d:" % (int(raw[-6:]) * 60 / 1000000)
+                time += "%06.3f" % ((int(raw[-6:]) * 60 % 1000000) * 60 / 1000000.0)
+            return time
+        except (ValueError, TypeError, IndexError):
+            return ""

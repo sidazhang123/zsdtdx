@@ -13,10 +13,11 @@
 
 # coding=utf-8
 
+import re
 import struct
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Type
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 
 # imported inside functions to avoid circular dependency
 # from zsdtdx.parallel_fetcher import set_active_config_path
@@ -342,6 +343,42 @@ def normalize_task_time_window(start_time: Any, end_time: Any) -> tuple[str, str
     return format_task_datetime(start_dt, start_fmt), format_task_datetime(
         end_dt, end_fmt
     )
+
+
+# 主连/次连/加权：品种 + L + 数字，如 CUL8 / ALL8 / L-FL8。
+FUTURE_CONTINUOUS_CODE_RE = re.compile(r"^([A-Z]+(?:-[A-Z]+)*)L\d+$")
+# 合约月份：品种 + 3~4 位年月（YYMM / YMM），如 CU2603、TA605。
+FUTURE_CONTRACT_MONTH_RE = re.compile(r"^([A-Z]+(?:-[A-Z]+)*)(\d{3,4})$")
+FUTURE_VARIETY_RE = re.compile(r"^[A-Z]+(?:-[A-Z]+)*$")
+
+
+def parse_future_symbol(code: Any) -> Tuple[str, str]:
+    """
+    解析期货代码形态。
+
+    输入：
+    1. code: 任意代码，如 `CU`、`CUL8`、`CUL9`、`CU2603`、`L-FL8`。
+    输出：
+    1. `(kind, variety)`。kind 为 `continuous` / `month` / `variety` / `other`；
+       variety 为品种前缀（`CU` / `AL` / `L-F`），other 时为空串。
+    用途：
+    1. 区分合约月份与 L7/L8/L9 连续合约，供主连补全与股票/期货分流共用。
+    边界条件：
+    1. 连续形态优先于月份：`ALL8` 视为铝主连，而不是品种 ALL + 月份 8。
+    2. 月份只认品种后紧跟的 3~4 位数字，不把 `CUL8` 的 `8` 当成年月。
+    """
+    raw = str(code or "").strip().upper()
+    if raw == "":
+        return "other", ""
+    matched = FUTURE_CONTINUOUS_CODE_RE.match(raw)
+    if matched is not None:
+        return "continuous", matched.group(1)
+    matched = FUTURE_CONTRACT_MONTH_RE.match(raw)
+    if matched is not None:
+        return "month", matched.group(1)
+    if FUTURE_VARIETY_RE.match(raw) is not None:
+        return "variety", raw
+    return "other", ""
 
 
 def normalize_future_time_window(start_time: Any, end_time: Any) -> tuple[str, str]:

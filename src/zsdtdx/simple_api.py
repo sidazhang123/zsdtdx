@@ -353,7 +353,7 @@ def get_supported_markets(return_df: Optional[bool] = None):
 
     返回示例:
     ```json
-    [{"market": 0, "name": "深圳", "source": "std"}, {"market": 1, "name": "上海", "source": "std"}]
+    [{"market": 0, "name": "深圳", "source": "std"}, {"market": 1, "name": "上海", "source": "std"}, {"market": 2, "name": "北京", "source": "std"}]
     ```
     """
     return _call_with_client(
@@ -434,6 +434,7 @@ def get_stock_kline(
         Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
     ] = None,
     mode: str = "async",
+    qfq: bool = True,
 ) -> Any:
     """获取股票 K 线任务结果（任务化输入，支持同步/异步与队列实时回传）。
 
@@ -441,6 +442,7 @@ def get_stock_kline(
     - `mode="sync"` / `mode="async"`：均不要求前置 `with get_client()`；可选 with 以复用主进程连接并调用其它主进程 API。
     - `mode="async"`：数据抓取在 worker 进程内执行，不依赖 with 上下文。
     - `preprocessor_operator`：可选钩子，签名 `f(payload)->dict|None`，返回 None 时丢弃该条 data；OHLC/成交额/成交量默认刻度由协议解析层统一完成。
+    - `qfq`：True 请求服务器前复权（默认），False 请求不复权；A 股与港股共用。期货请用 `get_future_kline`（无复权参数）。不改变 task 字段与返回结构。
 
     时间窗口:
     - start_time/end_time 支持 str/date/datetime；仅日期时补齐 start=09:30:00、end=16:00:00。
@@ -545,6 +547,7 @@ def get_stock_kline(
             tasks=normalized_tasks,
             queue=queue,
             preprocessor_operator=preprocessor_operator,
+            qfq=bool(qfq),
         )
     if mode_key == "async":
         async_queue = queue if queue is not None else std_queue.Queue()
@@ -552,6 +555,7 @@ def get_stock_kline(
             tasks=normalized_tasks,
             queue=async_queue,
             preprocessor_operator=preprocessor_operator,
+            qfq=bool(qfq),
         )
     raise ValueError("mode 仅支持 'sync' 或 'async'")
 
@@ -577,6 +581,7 @@ def get_index_kline(
     - queue: 可选事件队列，需实现 `put()`。
     - preprocessor_operator: 可选钩子 `f(payload)->dict|None`，返回 None 时丢弃该条；默认数值刻度见协议解析层。
     - mode: `"sync"` 或 `"async"`。
+    - 指数无复权语义，不提供 `qfq`；标准行情请求 reserved0 固定为 0。
 
     时间窗口:
     - 与 get_stock_kline 相同：仅日期时补齐 start=09:30:00、end=16:00:00。
@@ -827,13 +832,15 @@ def get_future_kline(
     - 建议在 `with get_client():` 内调用以复用主进程连接；超时回收受 `parallel_total_timeout_seconds` 等配置约束。
 
     输入:
-    - codes: 期货代码，支持 str/list/tuple/set；代码不含数字会自动补 `L8`（如 `AL` -> `ALL8`）。
-      为空时获取全部商品期货。
+    - codes: 期货代码，支持 str/list/tuple/set；纯品种代码按码表名称含「主连」的合约补全（如 `AL` -> `ALL8`，`CU` -> `CUL8`）。
+      为空时获取全部商品期货。带 3~4 位合约月份或 `L7/L8/L9` 连续合约原样查询（如 `CU2603`、`CUL9` 加权）。
+      该品种码表中无主连时抛错。
     - freq: 周期，支持 str 或列表，如 `"d"` / `["d", "60", "30"]`。
       支持周期: d/w/m/60min/30min/15min/5min 与 60/30/15/5。
     - start_time/end_time: 支持字符串/date/datetime，底层过滤按闭区间 `[start_time, end_time]` 执行。
       若传入不带时分秒的日期字符串，自动补齐为 start=09:00:00、end=15:00:00。
       例如 `2026-02-13` 等价于 `start_time="2026-02-13 09:00:00"`、`end_time="2026-02-13 15:00:00"`。
+    - 期货无复权语义，不提供 `qfq`；扩展行情 extra 固定为 0。
     调用示例:
     ```python
     from zsdtdx import get_client, get_future_kline
@@ -950,6 +957,8 @@ def get_stock_latest_price(codes: Optional[Any] = None) -> Dict[str, Optional[fl
     - codes: 可选股票代码列表；支持 `sh./sz./bj./hk.` 前缀；
       为空时按 `config.yaml.stock_scope.defaults_when_codes_none.get_stock_latest_price`
       拉取默认范围全量股票；显式传入代码时不受该范围开关影响。
+      停牌时回退昨收；未上市占位（现价与昨收都非正）为 None，随整批一次解析，不额外重试。
+      单票无有效报价不会把同批其它代码打成 None。
 
     调用示例:
     - 1个code:
@@ -988,7 +997,7 @@ def get_future_latest_price(codes: Optional[Any] = None) -> Dict[str, Optional[f
       一个 with 块内可连续调用多个 `get_*` 函数。
 
     输入:
-    - codes: 可选期货代码列表；不含数字会自动补 `L8`；为空时拉取全部商品期货。
+    - codes: 可选期货代码列表；纯品种代码按码表主连合约补全；为空时拉取全部商品期货。
 
     调用示例:
     - 1个code:

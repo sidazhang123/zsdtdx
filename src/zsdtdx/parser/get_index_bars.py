@@ -7,7 +7,8 @@
 
 边界：
 1. 仅负责指数 K 线单页解析，不承担分页与路由。
-2. 请求包与个股 K 线相同（官方 0x052D，54 字节）。
+2. 请求包与个股 K 线相同（0x052D，54 字节）。
+3. 指数无复权语义；reserved0 写死 0（与个股 qfq 开关无关）。
 """
 
 # coding=utf-8
@@ -18,16 +19,16 @@ from zsdtdx.parser.get_security_bars import pack_standard_kline_request
 
 
 class GetIndexBarsCmd(BaseParser):
-    def setParams(self, category, market, code, start, count, qfq=True):
+    def setParams(self, category, market, code, start, count):
         """
-        输入：category/market/code/start/count，以及 qfq 前复权开关。
+        输入：category/market/code/start/count。
         输出：无；构造 54 字节 send_pkg。
         用途：组装指数 K 线请求包（与个股 0x052D 同布局）。
-        边界条件：code 为 str 时由组包函数转 bytes。
+        边界条件：指数无复权，组包 reserved0 固定为 0；code 为 str 时由组包函数转 bytes。
         """
         self.category = category
         self.send_pkg = pack_standard_kline_request(
-            category, market, code, start, count, qfq=qfq
+            category, market, code, start, count, qfq=False
         )
 
     def parseResponse(self, body_buf):

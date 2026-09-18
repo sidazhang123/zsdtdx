@@ -19,7 +19,9 @@ def test_init_module_no_import_time_tcp_refresh():
 
 def test_default_max_kline_pages_constant():
     assert _DEFAULT_MAX_KLINE_PAGES == 400
-    uc_path = Path(__file__).resolve().parents[1] / "src" / "zsdtdx" / "unified_client.py"
+    uc_path = (
+        Path(__file__).resolve().parents[1] / "src" / "zsdtdx" / "unified_client.py"
+    )
     text = uc_path.read_text(encoding="utf-8")
     assert 'max_kline_pages", 200)' not in text
     assert 'max_kline_pages", 300)' not in text
@@ -58,11 +60,15 @@ def test_ex_market_map_equivalent_to_iterrows():
     current: dict[int, str] = {}
     for rec in ex_df.to_dict(orient="records"):
         market_val = rec.get("market")
-        if market_val is None or (isinstance(market_val, float) and pd.isna(market_val)):
+        if market_val is None or (
+            isinstance(market_val, float) and pd.isna(market_val)
+        ):
             continue
         name_val = rec.get("name", "")
         current[int(market_val)] = (
-            "" if (name_val is None or (isinstance(name_val, float) and pd.isna(name_val))) else str(name_val)
+            ""
+            if (name_val is None or (isinstance(name_val, float) and pd.isna(name_val)))
+            else str(name_val)
         )
     assert legacy == current
 
@@ -71,14 +77,14 @@ def test_filter_stock_df_by_scopes_equivalent_to_apply():
     df = pd.DataFrame(
         [
             {"code": "600000", "source": "std", "market": 1, "name": "A"},
-            {"code": "920001", "source": "ex", "market": 44, "name": "B"},
+            {"code": "920001", "source": "std", "market": 2, "name": "B"},
             {"code": "999999", "source": "other", "market": 9, "name": "C"},
         ]
     )
     scopes = {"szsh", "bj"}
 
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
-    client.market_rules = {"include_hk_market_names": ["港股通"]}
+    client.market_rules = {"include_hk_market_names": ["香港主板"]}
     client._ex_market_name_map = {}
 
     legacy_mask = df.apply(
@@ -111,7 +117,9 @@ def test_filter_stock_df_by_scopes_equivalent_to_apply():
 def test_enter_passes_presorted_hosts_and_worker_client_to_inner():
     init_calls: list[dict] = []
 
-    def recording_init(self, config_path=None, presorted_hosts=None, worker_client=False):
+    def recording_init(
+        self, config_path=None, presorted_hosts=None, worker_client=False
+    ):
         init_calls.append(
             {
                 "config_path": config_path,
@@ -130,21 +138,23 @@ def test_enter_passes_presorted_hosts_and_worker_client_to_inner():
         self.index_kline_cfg = {}
         self.index_kline_aliases_cfg = {}
         self.index_kline_lookup_cfg = {}
-        self._index_kline_fingerprint = ""
         self._index_catalog_records = []
         self._index_name_route_map = {}
-        self.index_kline_route_cache_cfg = {}
-        self._index_route_cache_enabled = False
-        self._index_route_cache_refresh_granularity = "day"
-        self._index_route_cache_date = ""
-        self._index_route_cache_path = None
+        self.catalog_cache_cfg = {}
+        self._catalog_cache_enabled = False
+        self._catalog_cache_refresh_granularity = "day"
+        self._catalog_cache_dir = None
+        self._std_catalog_records = None
+        self._ex_catalog_records = None
+        self._std_catalog_date = ""
+        self._ex_catalog_date = ""
         self._markets_df = None
         self._ex_market_name_map = {}
         self._stock_df = None
         self._future_df = None
         self._stock_route = {}
         self._future_route = {}
-        self._instrument_cache = None
+        self._future_zhulian_by_variety = {}
         self._runtime_failures = []
         self._entered_client = None
         self._worker_client_flag = bool(worker_client)
@@ -158,8 +168,16 @@ def test_enter_passes_presorted_hosts_and_worker_client_to_inner():
 
     with patch.object(UnifiedTdxClient, "__init__", recording_init):
         with patch.object(UnifiedTdxClient, "_warmup_connections", lambda self: None):
-            with patch.object(UnifiedTdxClient, "_push_context_client", classmethod(lambda cls, c: None)):
-                with patch.object(UnifiedTdxClient, "_pop_context_client", classmethod(lambda cls, c: None)):
+            with patch.object(
+                UnifiedTdxClient,
+                "_push_context_client",
+                classmethod(lambda cls, c: None),
+            ):
+                with patch.object(
+                    UnifiedTdxClient,
+                    "_pop_context_client",
+                    classmethod(lambda cls, c: None),
+                ):
                     outer = UnifiedTdxClient(
                         config_path="dummy.yaml",
                         presorted_hosts=presorted,
@@ -215,14 +233,23 @@ def test_discover_index_route_records_reuses_instrument_cache():
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
     client._index_catalog_records = []
     client.pagination = {
-        "standard_security_list_page_size": 800,
+        "standard_security_list_page_size": 1600,
         "extended_instrument_info_page_size": 800,
     }
     client.index_kline_cfg = {"prefer_ex_markets": [62]}
     client.index_kline_lookup_cfg = {}
-    client._index_route_cache_enabled = False
-    client._index_route_cache_path = None
-    client._index_kline_fingerprint = ""
+    client._catalog_cache_enabled = False
+    client._catalog_cache_dir = None
+    client._std_catalog_records = None
+    client._ex_catalog_records = None
+    client._std_catalog_date = ""
+    client._ex_catalog_date = ""
+    client._stock_df = None
+    client._stock_route = {}
+    client._future_df = None
+    client._future_route = {}
+    client._future_zhulian_by_variety = {}
+    client._ex_market_name_map = {}
     client.std_pool = MagicMock()
     client.std_pool.call.return_value = []
     client.ex_pool = MagicMock()
@@ -231,22 +258,23 @@ def test_discover_index_route_records_reuses_instrument_cache():
     instrument_rows = [
         {"name": "中证500", "code": "IC9999", "market": 62},
     ]
-    fetch_calls: list[bool] = []
+    fetch_calls: list[int] = []
 
-    def fake_fetch_all(self, refresh=False):
-        fetch_calls.append(bool(refresh))
+    def fake_download_ex():
+        fetch_calls.append(1)
         return list(instrument_rows)
 
-    client._fetch_all_instrument_info = fake_fetch_all.__get__(client, UnifiedTdxClient)
+    client._download_ex_instrument_catalog = fake_download_ex
+    client._download_std_security_catalog = lambda: []
 
     records = client._discover_index_route_records(refresh=False)
     assert len(records) == 1
     assert records[0]["source"] == "ex"
     client.ex_pool.call.assert_not_called()
-    assert fetch_calls == [False]
+    assert fetch_calls == [1]
 
     client._discover_index_route_records(refresh=False)
-    assert fetch_calls == [False]
+    assert fetch_calls == [1]
 
 
 def test_parallel_fetcher_load_config_uses_resolve_and_active_path(tmp_path):
@@ -279,8 +307,12 @@ def test_restart_parallel_fetcher_reads_config_defaults(monkeypatch):
         auto_prewarm_timeout_seconds = 88.0
         auto_prewarm_max_rounds = 5
 
-    monkeypatch.setattr(simple_api, "_force_restart_parallel_fetcher", fake_force_restart)
-    monkeypatch.setattr(simple_api, "_ensure_active_config_ready", lambda caller_name: "cfg.yaml")
+    monkeypatch.setattr(
+        simple_api, "_force_restart_parallel_fetcher", fake_force_restart
+    )
+    monkeypatch.setattr(
+        simple_api, "_ensure_active_config_ready", lambda caller_name: "cfg.yaml"
+    )
     monkeypatch.setattr(simple_api, "get_fetcher", lambda: FakeFetcher())
 
     simple_api.restart_parallel_fetcher()
@@ -288,7 +320,9 @@ def test_restart_parallel_fetcher_reads_config_defaults(monkeypatch):
     assert captured["prewarm_timeout_seconds"] == 88.0
     assert captured["max_rounds"] == 5
 
-    simple_api.restart_parallel_fetcher(prewarm=False, prewarm_timeout_seconds=12.0, max_rounds=2)
+    simple_api.restart_parallel_fetcher(
+        prewarm=False, prewarm_timeout_seconds=12.0, max_rounds=2
+    )
     assert captured["prewarm"] is False
     assert captured["prewarm_timeout_seconds"] == 12.0
     assert captured["max_rounds"] == 2
@@ -312,10 +346,12 @@ def test_paginate_kline_pages_no_df_and_pandas_boundaries():
             return pages[1]
         return None
 
-    client._append_raw_kline_page_rows = UnifiedTdxClient._append_raw_kline_page_rows.__get__(
+    client._append_raw_kline_page_rows = (
+        UnifiedTdxClient._append_raw_kline_page_rows.__get__(client, UnifiedTdxClient)
+    )
+    client._to_datetime_no_df = UnifiedTdxClient._to_datetime_no_df.__get__(
         client, UnifiedTdxClient
     )
-    client._to_datetime_no_df = UnifiedTdxClient._to_datetime_no_df.__get__(client, UnifiedTdxClient)
     client._is_placeholder_raw_kline_row = lambda row: False
 
     rows = client._paginate_kline_pages(
@@ -339,7 +375,9 @@ def test_paginate_kline_pages_no_df_and_pandas_boundaries():
 
 
 def test_parallel_fetcher_no_chunk_timeout_executor_shutdown():
-    pf_path = Path(__file__).resolve().parents[1] / "src" / "zsdtdx" / "parallel_fetcher.py"
+    pf_path = (
+        Path(__file__).resolve().parents[1] / "src" / "zsdtdx" / "parallel_fetcher.py"
+    )
     text = pf_path.read_text(encoding="utf-8")
     assert "_shutdown_chunk_timeout_executor" not in text
     assert "_get_chunk_timeout_executor" not in text
@@ -368,8 +406,18 @@ def test_fetch_one_task_chunk_async_timeout_marks_all_tasks_failed():
         "chunk_id": "c1",
         "task_kind": "stock",
         "tasks": [
-            {"code": "600000", "freq": "d", "start_time": "2026-01-01", "end_time": "2026-01-02"},
-            {"code": "600001", "freq": "d", "start_time": "2026-01-01", "end_time": "2026-01-02"},
+            {
+                "code": "600000",
+                "freq": "d",
+                "start_time": "2026-01-01",
+                "end_time": "2026-01-02",
+            },
+            {
+                "code": "600001",
+                "freq": "d",
+                "start_time": "2026-01-01",
+                "end_time": "2026-01-02",
+            },
         ],
         "chunk_timeout_seconds": 0.01,
         "chunk_retry_max_attempts": 0,
@@ -378,15 +426,23 @@ def test_fetch_one_task_chunk_async_timeout_marks_all_tasks_failed():
     async def instant_timeout(_prep):
         raise asyncio.TimeoutError("chunk attempt timeout")
 
-    with patch.object(pf, "_fetch_one_chunk_attempt_with_timeout_async", side_effect=instant_timeout):
-        with patch.object(pf, "_recover_worker_pools_current_thread", return_value={"std": {}, "ex": {}}):
+    with patch.object(
+        pf, "_fetch_one_chunk_attempt_with_timeout_async", side_effect=instant_timeout
+    ):
+        with patch.object(
+            pf,
+            "_recover_worker_pools_current_thread",
+            return_value={"std": {}, "ex": {}},
+        ):
             report = asyncio.run(pf._fetch_one_task_chunk_async(chunk_payload))
 
     assert int(report.get("chunk_hit_tasks", 0)) == 0
     payloads = list(report.get("payloads") or [])
     assert len(payloads) == 2
     assert all(str(item.get("error") or "").strip() for item in payloads)
-    assert all("attempt timeout" in str(item.get("error") or "").lower() for item in payloads)
+    assert all(
+        "attempt timeout" in str(item.get("error") or "").lower() for item in payloads
+    )
 
 
 def test_index_chunk_partition_refresh_at_most_once():
@@ -452,8 +508,8 @@ def test_index_chunk_partition_refresh_at_most_once():
         return dt_key, dt_key
 
     client._merge_chunk_cache_page_rows = fake_merge
-    client._dt_key_for_raw_kline_row = UnifiedTdxClient._dt_key_for_raw_kline_row.__get__(
-        client, UnifiedTdxClient
+    client._dt_key_for_raw_kline_row = (
+        UnifiedTdxClient._dt_key_for_raw_kline_row.__get__(client, UnifiedTdxClient)
     )
 
     tasks = [

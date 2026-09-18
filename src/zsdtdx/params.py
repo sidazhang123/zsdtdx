@@ -17,6 +17,7 @@ class TDXParams:
 
     MARKET_SZ = 0  # 深圳
     MARKET_SH = 1  # 上海
+    MARKET_BJ = 2  # 北京
 
     # K线种类
     # K 线种类
@@ -40,22 +41,19 @@ class TDXParams:
     KLINE_TYPE_DAILY = 4
     KLINE_TYPE_WEEKLY = 5
     KLINE_TYPE_MONTHLY = 6
-    # 官方 TdxW 1 分钟用 7；8 为历史别名，服务器通常仍接受。
+    # 1 分钟 category=7；8 为同义别名。
     KLINE_TYPE_EXHQ_1MIN = 7
     KLINE_TYPE_1MIN = 8
-    # 官方 TdxW 日线用 4；9 为历史别名，服务器通常仍接受。
+    # 日线 category=4；9 为同义别名。
     KLINE_TYPE_RI_K = 9
     KLINE_TYPE_3MONTH = 10
     KLINE_TYPE_YEARLY = 11
 
-    # ref : https://github.com/rainx/zsdtdx/issues/7
-    # 分笔行情最多2000条
-    MAX_TRANSACTION_COUNT = 2000
-    # 官方客户端标准行情 K 线单页 420 条
-    MAX_KLINE_COUNT = 420
-
-    # 板块相关参数
-    BLOCK_SZ = "block_zs.dat"
-    BLOCK_FG = "block_fg.dat"
-    BLOCK_GN = "block_gn.dat"
-    BLOCK_DEFAULT = "block.dat"
+    # 标准行情 K 线单页上限 800
+    MAX_KLINE_COUNT = 800
+    # 扩展行情 K 线单页上限 700
+    MAX_EXTENDED_KLINE_COUNT = 700
+    # 标准行情码表 0x044D 单页条数
+    MAX_SECURITY_LIST_COUNT = 1600
+    # 标准行情码表单条记录字节数
+    SECURITY_LIST_RECORD_SIZE = 37

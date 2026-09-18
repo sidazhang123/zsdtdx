@@ -2,50 +2,41 @@
 模块：`parser/ex_setup_commands.py`。
 
 职责：
-1. 提供 zsdtdx 体系中的协议封装、解析或对外接口能力。
-2. 对上层暴露稳定调用契约，屏蔽底层协议数据细节。
-3. 当前统计：类 1 个，函数 2 个。
+1. 构造扩展行情连接后的握手请求。
+2. 握手为 92 字节，命令号 0x6548，inner=0x2454。
 
 边界：
-1. 本模块仅负责当前文件定义范围，不承担其它分层编排职责。
-2. 错误语义、重试策略与容错逻辑以实现与调用方约定为准。
+1. 仅负责组包与丢弃握手回包，不解析业务字段。
+2. 正文为固定身份块；回包无业务字段。
 """
 
 # coding=utf-8
 
 from zsdtdx.parser.base import BaseParser
 
+# 扩展行情握手：92 字节，cmd=0x6548，inner=0x2454。
+_EX_SETUP1 = bytes.fromhex(
+    "010148650001520052005424e5bb1c2fafe525941f32c6e5d53dfb415b734cc9"
+    "cdbf0ac92021bfdd1eb06d22e158c0abaff8069b6af7dccba67484f71f32c6e5"
+    "d53dfb411f32c6e5d53dfb41a9325ac935dc0837335a16e4ce17c1bb"
+)
+
 
 class ExSetupCmd1(BaseParser):
     def setup(self):
         """
-        输入：
-        1. 无显式输入参数。
-        输出：
-        1. 返回值语义由函数实现定义；无返回时为 `None`。
-        用途：
-        1. 执行 `setup` 对应的协议处理、数据解析或调用适配逻辑。
-        边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        输入：无。
+        输出：无；写入 92 字节 send_pkg。
+        用途：发送扩展行情握手。
+        边界：正文为固定 92 字节身份块；回包无业务字段。
         """
-        self.send_pkg = bytearray.fromhex(
-            "01 01 48 65 00 01 52 00 52 00 54 24 1f 32 c6 e5"
-            "d5 3d fb 41 1f 32 c6 e5 d5 3d fb 41 1f 32 c6 e5"
-            "d5 3d fb 41 1f 32 c6 e5 d5 3d fb 41 1f 32 c6 e5"
-            "d5 3d fb 41 1f 32 c6 e5 d5 3d fb 41 1f 32 c6 e5"
-            "d5 3d fb 41 1f 32 c6 e5 d5 3d fb 41 cc e1 6d ff"
-            "d5 ba 3f b8 cb c5 7a 05 4f 77 48 ea"
-        )
+        self.send_pkg = bytearray(_EX_SETUP1)
 
     def parseResponse(self, body_buf):
         """
-        输入：
-        1. body_buf: 输入参数，约束以协议定义与函数实现为准。
-        输出：
-        1. 返回值语义由函数实现定义；无返回时为 `None`。
-        用途：
-        1. 执行 `parseResponse` 对应的协议处理、数据解析或调用适配逻辑。
-        边界条件：
-        1. 扩展 setup 无结构化字段，原样返回 body_buf。
+        输入：握手回包体。
+        输出：原样 body_buf。
+        用途：握手回包无业务字段，仅确认收包。
+        边界：不解析、不校验内容。
         """
         return body_buf

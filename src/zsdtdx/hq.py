@@ -13,7 +13,6 @@
 
 # coding=utf-8
 
-import random
 from collections import OrderedDict
 
 import pandas as pd
@@ -42,10 +41,10 @@ class TdxHq_API(BaseSocketClient):
         """
         输入：无。
         输出：无。
-        用途：连接成功后发送 TdxW 对齐的三条标准行情握手。
+        用途：连接成功后发送三条标准行情握手。
         边界：任一条握手失败时由 `connect()` 断开连接并抛错，不会继续发行情请求。
         """
-        # 对齐 TdxW：292 字节首包 → 合并后的 13 字节第二包 → tdxlevel 身份包。
+        # 292 字节首包 → 13 字节第二包 → tdxlevel 身份包。
         SetupCmd1(self.client).call_api()
         SetupCmd2(self.client).call_api()
         SetupCmd3(self.client).call_api()
@@ -61,7 +60,7 @@ class TdxHq_API(BaseSocketClient):
         用途:
             供统一封装层发现标准行情的市场能力。
         边界条件:
-            该方法不发起网络请求，固定返回上海与深圳两个市场。
+            该方法不发起网络请求，固定返回深圳、上海、北京三个市场。
         """
         return [
             OrderedDict(
@@ -80,6 +79,14 @@ class TdxHq_API(BaseSocketClient):
                     ("short_name", "SH"),
                 ]
             ),
+            OrderedDict(
+                [
+                    ("market", TDXParams.MARKET_BJ),
+                    ("category", 1),
+                    ("name", "北京"),
+                    ("short_name", "BJ"),
+                ]
+            ),
         ]
 
     # API List
@@ -89,16 +96,16 @@ class TdxHq_API(BaseSocketClient):
     def get_security_bars(self, category, market, code, start, count, qfq=True):
         """
         输入：
-        1. category: K 线周期；官方 1 分钟=7，日线=4。
-        2. market: 市场号（0 深圳 / 1 上海）。
+        1. category: K 线周期；1 分钟=7，日线=4。
+        2. market: 市场号（0 深圳 / 1 上海 / 2 北京）。
         3. code: 证券代码。
         4. start: 分页偏移，0 表示从最新一段起取。
-        5. count: 本页条数，官方常用 420。
+        5. count: 本页条数，服务端硬上限 800。
         6. qfq: True 请求前复权，False 请求不复权。
         输出：
         1. 已解析的 K 线 dict 列表；失败时为 `None`。
         用途：
-        1. 发送官方 54 字节 0x052D 个股 K 线请求并解析回包。
+        1. 发送 54 字节 0x052D 个股 K 线请求并解析回包。
         边界条件：
         1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
@@ -107,24 +114,24 @@ class TdxHq_API(BaseSocketClient):
         return cmd.call_api()
 
     @update_last_ack_time
-    def get_index_bars(self, category, market, code, start, count, qfq=True):
+    def get_index_bars(self, category, market, code, start, count):
         """
         输入：
-        1. category: K 线周期；官方 1 分钟=7，日线=4。
-        2. market: 市场号（0 深圳 / 1 上海）。
+        1. category: K 线周期；1 分钟=7，日线=4。
+        2. market: 市场号（0 深圳 / 1 上海 / 2 北京）。
         3. code: 指数代码。
         4. start: 分页偏移，0 表示从最新一段起取。
-        5. count: 本页条数，官方常用 420。
-        6. qfq: True 请求前复权，False 请求不复权。
+        5. count: 本页条数，服务端硬上限 800。
         输出：
         1. 已解析的指数 K 线 dict 列表；失败时为 `None`。
         用途：
-        1. 发送官方 54 字节 0x052D 指数 K 线请求并解析回包。
+        1. 发送 54 字节 0x052D 指数 K 线请求并解析回包。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 指数无复权语义，请求 reserved0 固定为 0。
+        2. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
         cmd = GetIndexBarsCmd(self.client, lock=self.lock)
-        cmd.setParams(category, market, code, start, count, qfq=qfq)
+        cmd.setParams(category, market, code, start, count)
         return cmd.call_api()
 
     @update_last_ack_time
@@ -169,20 +176,21 @@ class TdxHq_API(BaseSocketClient):
         return cmd.call_api()
 
     @update_last_ack_time
-    def get_security_list(self, market, start):
+    def get_security_list(self, market, start, count=None):
         """
         输入：
-        1. market: 输入参数，约束以协议定义与函数实现为准。
-        2. start: 输入参数，约束以协议定义与函数实现为准。
+        1. market: 标准市场号（0 深圳 / 1 上海 / 2 北京）。
+        2. start: 本页起始下标。
+        3. count: 本页条数，默认 1600。
         输出：
-        1. 返回值语义由函数实现定义；无返回时为 `None`。
+        1. 本页证券记录列表；无数据时为空列表或 `None`（由底层 allow_none 决定）。
         用途：
-        1. 执行 `get_security_list` 对应的协议处理、数据解析或调用适配逻辑。
+        1. 拉取标准行情码表单页，供深沪京股票与 HQ 指数目录分页。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 仅单页；完整市场需由调用方按返回条数累加 start，直到不足一页。
         """
         cmd = GetSecurityList(self.client, lock=self.lock)
-        cmd.setParams(market, start)
+        cmd.setParams(market, start, count)
         return cmd.call_api()
 
     @update_last_ack_time
@@ -376,19 +384,6 @@ class TdxHq_API(BaseSocketClient):
                     break
 
         return filecontent
-
-    def do_heartbeat(self):
-        """
-        输入：
-        1. 无显式输入参数。
-        输出：
-        1. 返回值语义由函数实现定义；无返回时为 `None`。
-        用途：
-        1. 执行 `do_heartbeat` 对应的协议处理、数据解析或调用适配逻辑。
-        边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
-        """
-        self.get_security_count(random.randint(0, 1))
 
     def get_k_data(self, code, start_date, end_date):
         # 具体详情参见 https://github.com/rainx/zsdtdx/issues/5

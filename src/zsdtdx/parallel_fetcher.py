@@ -34,6 +34,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 import yaml
+from zsdtdx.helper import parse_future_symbol
 from zsdtdx.unified_client import UnifiedTdxClient
 
 try:
@@ -540,7 +541,7 @@ def _cleanup_worker_dead_thread_connections() -> None:
     输出：
     1. 无返回值。
     用途：
-    1. 防止进程内短生命周期线程遗留 socket/heartbeat。
+    1. 防止进程内短生命周期线程遗留 socket。
     边界条件：
     1. 若上下文未初始化或不支持清理接口则静默跳过。
     """
@@ -1306,7 +1307,7 @@ def _init_worker(
 
 def is_future_code(code: str) -> bool:
     """
-    判断代码是否属于期货品种集合。
+    判断代码是否应走期货 K 线通路。
 
     输入：
     1. code: 任意代码字符串。
@@ -1315,12 +1316,22 @@ def is_future_code(code: str) -> bool:
     用途：
     1. 在旧版 DataFrame 接口中做股票/期货分流。
     边界条件：
-    1. 空值返回 False；会自动过滤数字，仅按字母前缀判断。
+    1. 空值返回 False。
+    2. `CUL8`/`ALL8` 等 L+数字连续合约视为期货，不把 `L` 并进品种字母。
+    3. 带 3~4 位合约月份的代码（如 `CU2603`）按品种前缀匹配 `FUTURE_PATTERNS`。
+    4. 纯品种代码（如 `CU`、`L-F`）按品种名匹配；带连字符的品种视为期货。
     """
     if not code:
         return False
-    base_code = "".join(c for c in code.upper() if c.isalpha())
-    return base_code in FUTURE_PATTERNS
+    kind, variety = parse_future_symbol(code)
+    if kind == "continuous":
+        return True
+    if kind == "other":
+        return False
+    if kind == "variety" and "-" in variety:
+        return True
+    compact = variety.replace("-", "")
+    return variety in FUTURE_PATTERNS or compact in FUTURE_PATTERNS
 
 
 def get_optimal_process_count(core_multiplier: float = 1.5) -> int:
@@ -1804,6 +1815,7 @@ def _prepare_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
         "chunk_retry_max": max(
             0, int(chunk_payload.get("chunk_retry_max_attempts", 2) or 0)
         ),
+        "qfq": bool(chunk_payload.get("qfq", True)),
     }
 
 
@@ -1821,6 +1833,7 @@ def _fetch_one_chunk_fetch_attempt(prep: Dict[str, Any]) -> Dict[str, Any]:
     task_kind = str(prep["task_kind"])
     normalized_tasks = list(prep["normalized_tasks"])
     enable_cache = bool(prep["enable_cache"])
+    qfq = bool(prep.get("qfq", True))
     chunk_timeout = float(prep["chunk_timeout"])
     attempt_deadline = time.monotonic() + chunk_timeout
 
@@ -1835,6 +1848,7 @@ def _fetch_one_chunk_fetch_attempt(prep: Dict[str, Any]) -> Dict[str, Any]:
         return client_context.get_stock_kline_rows_for_chunk_tasks(
             tasks=normalized_tasks,
             enable_cache=enable_cache,
+            qfq=qfq,
         )
     finally:
         # D3 优化：chunk 结束时还原 socket 读超时，避免短超时残留影响后续 chunk/心跳。
@@ -2361,6 +2375,9 @@ async def _fetch_chunk_bundle_async(bundle_payload: Dict[str, Any]) -> Dict[str,
         normalized_payload["reconnect_on_unavailable"] = bool(reconnect_on_unavailable)
         normalized_payload["chunk_timeout_seconds"] = float(chunk_timeout_seconds)
         normalized_payload["chunk_retry_max_attempts"] = int(chunk_retry_max_attempts)
+        normalized_payload["qfq"] = bool(
+            normalized_payload.get("qfq", bundle_payload.get("qfq", True))
+        )
         prepared_chunk_payloads.append(normalized_payload)
 
     chunk_reports: List[Dict[str, Any]] = []
@@ -3128,7 +3145,7 @@ class ParallelKlineFetcher:
         ]
 
     def _iter_task_payloads_inproc_chunked(
-        self, tasks: List[Dict[str, Any]], task_kind: str = "stock"
+        self, tasks: List[Dict[str, Any]], task_kind: str = "stock", qfq: bool = True
     ):
         """
         主进程内 chunk 并发迭代任务结果（不启用多进程）。
@@ -3201,6 +3218,7 @@ class ParallelKlineFetcher:
             chunk_payload["chunk_retry_max_attempts"] = int(
                 self.chunk_retry_max_attempts
             )
+            chunk_payload["qfq"] = bool(qfq)
             dispatch_items.append((chunk, chunk_payload))
 
         async def _gather_inproc() -> List[Tuple[TaskChunk, Dict[str, Any]]]:
@@ -3317,7 +3335,7 @@ class ParallelKlineFetcher:
                     )
 
     def _iter_task_payloads_parallel_chunked(
-        self, tasks: List[Dict[str, Any]], task_kind: str = "stock"
+        self, tasks: List[Dict[str, Any]], task_kind: str = "stock", qfq: bool = True
     ):
         """
         chunk 化并行迭代任务结果（完成顺序回收）。
@@ -3444,6 +3462,7 @@ class ParallelKlineFetcher:
             for chunk_payload in list(bundle_payload.get("chunks") or []):
                 if isinstance(chunk_payload, dict):
                     chunk_payload["task_kind"] = str(kind)
+                    chunk_payload["qfq"] = bool(qfq)
             bundle_payload["inproc_coroutine_workers"] = int(
                 self.task_chunk_inproc_coroutine_workers
             )
@@ -3457,6 +3476,7 @@ class ParallelKlineFetcher:
             bundle_payload["chunk_retry_max_attempts"] = int(
                 self.chunk_retry_max_attempts
             )
+            bundle_payload["qfq"] = bool(qfq)
             submitted_at = time.monotonic()
             future = executor.submit(_fetch_chunk_bundle, bundle_payload)
             pending_futures[future] = {
@@ -3676,11 +3696,12 @@ class ParallelKlineFetcher:
         preprocessor_operator: Optional[
             Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
         ] = None,
+        qfq: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         同步执行 task 列表（stock/index 共用），并实时写入队列。
 
-        输入：task_kind、tasks、queue、preprocessor_operator。
+        输入：task_kind、tasks、queue、preprocessor_operator、qfq。
         输出：处理后的 task payload 列表。
         边界：tasks 为空时返回 [] 并发送 done；主进程内 chunk 调度，不用多进程池。
         """
@@ -3718,7 +3739,7 @@ class ParallelKlineFetcher:
             ),
         )
         iterator = self._iter_task_payloads_inproc_chunked(
-            normalized_tasks, task_kind=kind
+            normalized_tasks, task_kind=kind, qfq=bool(qfq)
         )
 
         for raw_payload in iterator:
@@ -3754,6 +3775,7 @@ class ParallelKlineFetcher:
         preprocessor_operator: Optional[
             Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
         ] = None,
+        qfq: bool = True,
     ) -> List[Dict[str, Any]]:
         """同步执行股票 task 列表，并实时写入队列。"""
         return self._fetch_tasks_sync(
@@ -3761,6 +3783,7 @@ class ParallelKlineFetcher:
             tasks=tasks,
             queue=queue,
             preprocessor_operator=preprocessor_operator,
+            qfq=bool(qfq),
         )
 
     def fetch_index_tasks_sync(
@@ -3771,6 +3794,7 @@ class ParallelKlineFetcher:
         preprocessor_operator: Optional[
             Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
         ] = None,
+        qfq: bool = True,
     ) -> List[Dict[str, Any]]:
         """同步执行指数 task 列表，并实时写入队列。"""
         return self._fetch_tasks_sync(
@@ -3778,6 +3802,7 @@ class ParallelKlineFetcher:
             tasks=tasks,
             queue=queue,
             preprocessor_operator=preprocessor_operator,
+            qfq=bool(qfq),
         )
 
     def _fetch_tasks_async(
@@ -3789,11 +3814,12 @@ class ParallelKlineFetcher:
         preprocessor_operator: Optional[
             Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
         ] = None,
+        qfq: bool = True,
     ) -> StockKlineJob:
         """
         异步启动 task 执行（stock/index 共用）并立即返回句柄。
 
-        输入：task_kind、tasks、queue、preprocessor_operator。
+        输入：task_kind、tasks、queue、preprocessor_operator、qfq。
         输出：StockKlineJob 异步句柄。
         边界：任务异常由 job.exception()/job.result() 暴露。
         """
@@ -3839,7 +3865,7 @@ class ParallelKlineFetcher:
                 ),
             )
             iterator = self._iter_task_payloads_parallel_chunked(
-                normalized_tasks, task_kind=kind
+                normalized_tasks, task_kind=kind, qfq=bool(qfq)
             )
 
             for raw_payload in iterator:
@@ -3887,6 +3913,7 @@ class ParallelKlineFetcher:
         preprocessor_operator: Optional[
             Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
         ] = None,
+        qfq: bool = True,
     ) -> StockKlineJob:
         """异步启动股票 task 执行并立即返回句柄。"""
         return self._fetch_tasks_async(
@@ -3894,6 +3921,7 @@ class ParallelKlineFetcher:
             tasks=tasks,
             queue=queue,
             preprocessor_operator=preprocessor_operator,
+            qfq=bool(qfq),
         )
 
     def fetch_index_tasks_async(
@@ -3904,6 +3932,7 @@ class ParallelKlineFetcher:
         preprocessor_operator: Optional[
             Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
         ] = None,
+        qfq: bool = True,
     ) -> StockKlineJob:
         """异步启动指数 task 执行并立即返回句柄。"""
         return self._fetch_tasks_async(
@@ -3911,6 +3940,7 @@ class ParallelKlineFetcher:
             tasks=tasks,
             queue=queue,
             preprocessor_operator=preprocessor_operator,
+            qfq=bool(qfq),
         )
 
     def fetch_stock(

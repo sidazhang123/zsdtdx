@@ -20,17 +20,39 @@ import yaml
 
 from zsdtdx.exhq import TdxExHq_API
 from zsdtdx.hq import TdxHq_API
-from zsdtdx.index_route_disk_cache import (
-    fingerprint_index_kline_config,
-    load_index_route_cache,
-    resolve_index_route_cache_file_path,
-    save_index_route_cache,
+from zsdtdx.params import TDXParams
+from zsdtdx.catalog_disk_cache import (
+    KIND_EX,
+    KIND_STD,
+    catalog_cache_file_path,
+    load_catalog_cache,
+    resolve_catalog_cache_dir,
+    save_catalog_cache,
 )
+from zsdtdx.helper import parse_future_symbol
 from zsdtdx.log import log
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
 _DEFAULT_CONFIG_PATH = _PACKAGE_DIR / "config.yaml"
 _DEFAULT_MAX_KLINE_PAGES = 400
+
+
+def _future_variety_prefix_from_main_code(code: Any) -> str:
+    """输入合约代码，输出主连形态下的品种前缀；非 `字母+L+数字` 返回空串。
+
+    输入:
+    - code: 期货代码，如 `CUL8`、`AL8`、`ALL8`、`L-FL8`。
+    输出:
+    - 品种前缀：`CU` / `A` / `AL` / `L-F`；无法解析时为空串。
+    用途:
+    - 把码表中名称含「主连」的合约编成品种索引，供无合约月份查询自动补全。
+    边界:
+    - `CU2603`、`EHR00W` 等非连续合约形态返回空串；大小写不敏感。
+    """
+    kind, variety = parse_future_symbol(code)
+    if kind != "continuous":
+        return ""
+    return variety
 
 
 def _resolve_zsdtdx_config_path(config_path: Optional[str]) -> Path:
@@ -631,7 +653,7 @@ class PersistentFailoverPool:
         输出：
         1. 无返回值。
         用途：
-        1. 避免 thread-local 所在线程结束后遗留未关闭 socket/heartbeat。
+        1. 避免 thread-local 所在线程结束后遗留未关闭 socket。
         边界条件：
         1. 清理过程中的断开异常会被忽略，确保调用链稳定。
         """
@@ -1239,33 +1261,31 @@ class UnifiedTdxClient:
         self.index_kline_cfg = self.config.get("index_kline", {}) or {}
         self.index_kline_aliases_cfg = self.index_kline_cfg.get("aliases", {}) or {}
         self.index_kline_lookup_cfg = self.index_kline_cfg.get("lookup", {}) or {}
-        self._index_kline_fingerprint = fingerprint_index_kline_config(
-            self.index_kline_cfg
-        )
-        # 动态发现的指数目录快照（全量候选列表），可 refresh 重建。
+        # 指数目录由码表聚合层在使用时过滤得到，仅保留进程内快照。
         self._index_catalog_records: List[Dict[str, Any]] = []
         self._index_name_route_map: Dict[str, Dict[str, Any]] = {}
-        self.index_kline_route_cache_cfg = (
-            self.index_kline_cfg.get("route_cache", {}) or {}
-        )
-        self._index_route_cache_enabled = bool(
-            self.index_kline_route_cache_cfg.get("enabled", True)
-        )
-        self._index_route_cache_refresh_granularity = (
-            str(self.index_kline_route_cache_cfg.get("refresh_granularity", "day"))
+        self.catalog_cache_cfg = self.config.get("catalog_cache", {}) or {}
+        self._catalog_cache_enabled = bool(self.catalog_cache_cfg.get("enabled", True))
+        self._catalog_cache_refresh_granularity = (
+            str(self.catalog_cache_cfg.get("refresh_granularity", "day"))
             .strip()
             .lower()
             or "day"
         )
-        self._index_route_cache_date = dt.datetime.now().date().isoformat()
-        self._index_route_cache_path: Optional[Path] = None
+        self._catalog_cache_dir: Optional[Path] = None
+        self._std_catalog_records: Optional[List[Dict[str, Any]]] = None
+        self._ex_catalog_records: Optional[List[Dict[str, Any]]] = None
+        self._std_catalog_date = ""
+        self._ex_catalog_date = ""
         if (
-            self._index_route_cache_enabled
-            and self._index_route_cache_refresh_granularity == "day"
+            self._catalog_cache_enabled
+            and self._catalog_cache_refresh_granularity == "day"
         ):
-            self._index_route_cache_path = self._resolve_index_route_cache_path()
-            if self._index_route_cache_path is None:
-                self._index_route_cache_enabled = False
+            self._catalog_cache_dir = resolve_catalog_cache_dir(
+                config_path=self.catalog_cache_cfg.get("path")
+            )
+            if self._catalog_cache_dir is None:
+                self._catalog_cache_enabled = False
         self.client_cfg = self.config.get("client", {})
         self.preconnect_on_enter = bool(
             self.client_cfg.get("preconnect_on_enter", True)
@@ -1275,7 +1295,6 @@ class UnifiedTdxClient:
         connect_timeout = float(pool_cfg.get("connect_timeout", 1.5))
         api_kwargs = {
             "multithread": True,
-            "heartbeat": bool(pool_cfg.get("heartbeat", True)),
             "raise_exception": False,
         }
 
@@ -1317,7 +1336,7 @@ class UnifiedTdxClient:
         self._future_df = None
         self._stock_route = {}
         self._future_route = {}
-        self._instrument_cache = None
+        self._future_zhulian_by_variety: Dict[str, str] = {}
         self._runtime_failures: List[Dict[str, Any]] = []
         self._entered_client = None
         self._worker_client_flag = bool(worker_client)
@@ -1355,12 +1374,19 @@ class UnifiedTdxClient:
         return self.PERIOD_MAP[p]
 
     def _standard_kline_page_size(self) -> int:
-        """输入无，输出标准行情 K 线单页条数；配置缺省时用官方 420。"""
+        """输入无，输出标准行情 K 线单页条数；配置缺省时用服务端上限 800。"""
         pagination = getattr(self, "pagination", None) or {}
-        return int(pagination.get("standard_kline_page_size", 420))
+        return int(pagination.get("standard_kline_page_size", 800))
 
-    def _standard_kline_qfq(self) -> bool:
-        """输入无，输出是否请求服务器前复权；配置缺省时为 True。"""
+    def _standard_kline_qfq(self, qfq: Optional[bool] = None) -> bool:
+        """
+        输入：qfq 为本次调用覆盖值；None 时读配置。
+        输出：True 请求前复权，False 请求不复权。
+        用途：统一个股前复权开关（A 股 reserved0 / 港股 extra）。
+        边界：配置缺省时为 True；期货与指数不走本函数。
+        """
+        if qfq is not None:
+            return bool(qfq)
         pagination = getattr(self, "pagination", None) or {}
         return bool(pagination.get("standard_kline_qfq", True))
 
@@ -1570,7 +1596,9 @@ class UnifiedTdxClient:
                     "standard_kline_page_size"
                     if source == "std"
                     else "extended_kline_page_size",
-                    420 if source == "std" else 700,
+                    TDXParams.MAX_KLINE_COUNT
+                    if source == "std"
+                    else TDXParams.MAX_EXTENDED_KLINE_COUNT,
                 )
             )
 
@@ -1584,7 +1612,6 @@ class UnifiedTdxClient:
                         str(code),
                         int(start),
                         int(page_size),
-                        qfq=self._standard_kline_qfq(),
                     )
                 return self._pool_call_allow_none(
                     self.ex_pool,
@@ -1661,9 +1688,9 @@ class UnifiedTdxClient:
         return self._ex_market_name_map.get(int(market), "")
 
     def _is_hk_market_ex_no_df(self, market: int) -> bool:
-        """输入扩展市场号，输出是否港股市场；用于无 DataFrame 路径；未配置时按默认港股通。"""
+        """输入扩展市场号，输出是否港股市场；用于无 DataFrame 路径；未配置时按默认香港主板。"""
         target_market_names = set(
-            self.market_rules.get("include_hk_market_names", ["港股通"])
+            self.market_rules.get("include_hk_market_names", ["香港主板"])
         )
         market_name = self._get_ex_market_name_no_df(int(market))
         return market_name in target_market_names
@@ -1683,80 +1710,36 @@ class UnifiedTdxClient:
         s = str(source).strip().lower()
         m = int(market)
         if s == "std":
-            return f"sz.{c}" if m == 0 else f"sh.{c}"
-        if s == "ex":
-            if m == 44:
+            if m == 0:
+                return f"sz.{c}"
+            if m == 1:
+                return f"sh.{c}"
+            if m == 2:
                 return f"bj.{c}"
+        if s == "ex":
             if self._is_hk_market_ex_no_df(m):
                 return f"hk.{c}"
         return c
 
     def _ensure_stock_route_cache_no_df(self, refresh: bool = False):
-        """输入刷新开关，输出无；用于无 DataFrame 股票路由；分页空页视为结束。"""
+        """输入刷新开关，输出无；用于无 DataFrame 股票路由；码表过滤在使用时完成。"""
         if self._stock_route and not refresh:
             return
-
-        security_page = int(
-            self.pagination.get("standard_security_list_page_size", 800)
-        )
-        route: Dict[str, Dict[str, Any]] = {}
-
-        for market in [0, 1]:
-            start = 0
-            while True:
-                page = self.std_pool.call(
-                    "get_security_list", market, start, allow_none=True
-                )
-                if not page:
-                    break
-                for item in page:
-                    code = str(item.get("code", "")).strip()
-                    if not code or not self._is_a_share_std(market, code):
-                        continue
-                    if code in route:
-                        continue
-                    route[code] = {
-                        "code": code,
-                        "name": str(item.get("name", "")).strip(),
-                        "market": int(market),
-                        "market_name": "深圳" if market == 0 else "上海",
-                        "source": "std",
-                        "asset_type": "stock",
-                    }
-                start += len(page)
-                if len(page) < security_page:
-                    break
-
-        for item in self._fetch_all_instrument_info(refresh=refresh):
-            market = int(item.get("market", -1))
-            code = str(item.get("code", "")).strip()
-            is_beijing_stock = market == 44 and self._is_beijing_stock_ex(code)
-            is_hk_stock = self._is_hk_stock_ex_no_df(market, code)
-            if not is_beijing_stock and not is_hk_stock:
-                continue
-            if code in route:
-                continue
-            route[code] = {
-                "code": code,
-                "name": str(item.get("name", "")).strip(),
-                "market": market,
-                "market_name": self._get_ex_market_name_no_df(market),
-                "source": "ex",
-                "asset_type": "stock",
-            }
-
-        self._stock_route = route
+        self.ensure_code_catalog(need_std=True, need_ex=True, refresh=refresh)
+        self._rebuild_stock_views_from_catalogs()
 
     def _resolve_stock_route_no_df(
         self, code: str, freq: str
     ) -> Tuple[str, Dict[str, Any]]:
         """输入代码和频率，输出标准化代码与路由；用于无 DataFrame 查询；未找到抛错。"""
         normalized_code = self._normalize_stock_query_code(code)
-        self._ensure_stock_route_cache_no_df(refresh=False)
-        route = self._stock_route.get(str(normalized_code))
+        route = self._lookup_stock_route(normalized_code)
+        if route is None:
+            self._ensure_stock_route_cache_no_df(refresh=False)
+            route = self._lookup_stock_route(normalized_code)
         if route is None:
             self._ensure_stock_route_cache_no_df(refresh=True)
-            route = self._stock_route.get(str(normalized_code))
+            route = self._lookup_stock_route(normalized_code)
         if route is None:
             self._record_failure(
                 "stock_kline", str(code), "code_not_found", "route_missing", freq
@@ -2177,6 +2160,7 @@ class UnifiedTdxClient:
         freq: str,
         start_dt: dt.datetime,
         end_dt: dt.datetime,
+        qfq: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """输入标准行情参数，输出标准化K线列表；用于无 DataFrame 路径；空页即结束。"""
         page_size = self._standard_kline_page_size()
@@ -2190,7 +2174,7 @@ class UnifiedTdxClient:
                 str(code),
                 int(start),
                 int(page_size),
-                qfq=self._standard_kline_qfq(),
+                qfq=self._standard_kline_qfq(qfq),
             )
 
         rows = self._paginate_kline_pages(
@@ -2217,9 +2201,15 @@ class UnifiedTdxClient:
         freq: str,
         start_dt: dt.datetime,
         end_dt: dt.datetime,
+        qfq: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """输入扩展行情参数，输出标准化K线列表；用于无 DataFrame 路径；空页即结束。"""
-        page_size = int(self.pagination.get("extended_kline_page_size", 700))
+        page_size = int(
+            self.pagination.get(
+                "extended_kline_page_size", TDXParams.MAX_EXTENDED_KLINE_COUNT
+            )
+        )
+        qfq_flag = self._standard_kline_qfq(qfq)
 
         def _fetch_page(start: int) -> Any:
             return self._pool_call_allow_none(
@@ -2230,6 +2220,7 @@ class UnifiedTdxClient:
                 str(code),
                 int(start),
                 int(page_size),
+                qfq=qfq_flag,
             )
 
         rows = self._paginate_kline_pages(
@@ -2257,6 +2248,7 @@ class UnifiedTdxClient:
         category: int,
         start: int,
         page_size: int,
+        qfq: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """
         按分页偏移抓取单页原始 K 线。
@@ -2285,7 +2277,7 @@ class UnifiedTdxClient:
                 str(code),
                 int(start),
                 int(page_size),
-                qfq=self._standard_kline_qfq(),
+                qfq=self._standard_kline_qfq(qfq),
             )
             return list(rows or [])
         if source_key == "ex":
@@ -2297,6 +2289,7 @@ class UnifiedTdxClient:
                 str(code),
                 int(start),
                 int(page_size),
+                qfq=self._standard_kline_qfq(qfq),
             )
             return list(rows or [])
         raise ValueError(f"不支持的 source: {source}")
@@ -2336,7 +2329,6 @@ class UnifiedTdxClient:
                 str(code),
                 int(start),
                 int(page_size),
-                qfq=self._standard_kline_qfq(),
             )
             return list(rows or [])
         if source_key == "ex":
@@ -2397,6 +2389,7 @@ class UnifiedTdxClient:
         normalized_task: Dict[str, str],
         normalized_code: str,
         route: Dict[str, Any],
+        qfq: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """
         输入已标准化任务和已解析路由，输出任务K线列表；用于 chunk 执行复用路由结果。
@@ -2426,6 +2419,7 @@ class UnifiedTdxClient:
                 freq=freq,
                 start_dt=start_dt,
                 end_dt=end_dt,
+                qfq=qfq,
             )
         return self._fetch_ex_kline_rows(
             market=int(route["market"]),
@@ -2434,12 +2428,14 @@ class UnifiedTdxClient:
             freq=freq,
             start_dt=start_dt,
             end_dt=end_dt,
+            qfq=qfq,
         )
 
     def get_stock_kline_rows_for_chunk_tasks(
         self,
         tasks: List[Dict[str, Any]],
         enable_cache: bool,
+        qfq: bool = True,
     ) -> Dict[str, Any]:
         """
         执行同 `code+freq` 的 chunk 任务并返回逐任务结果。
@@ -2447,6 +2443,7 @@ class UnifiedTdxClient:
         输入：
         1. tasks: 任务列表，元素至少包含 code/freq/start_time/end_time。
         2. enable_cache: 是否启用 chunk 级轻量缓存。
+        3. qfq: True 前复权，False 不复权。
         输出：
         1. 结果字典：{"results":[{"task","rows","error"}...], "chunk_hit_tasks", "chunk_network_page_calls"}。
         用途：
@@ -2491,6 +2488,7 @@ class UnifiedTdxClient:
                         normalized_task=task,
                         normalized_code=normalized_code,
                         route=route,
+                        qfq=qfq,
                     )
                 except Exception as exc:
                     results.append({"task": task, "rows": [], "error": str(exc)[:200]})
@@ -2512,7 +2510,9 @@ class UnifiedTdxClient:
                 "standard_kline_page_size"
                 if source == "std"
                 else "extended_kline_page_size",
-                420 if source == "std" else 700,
+                TDXParams.MAX_KLINE_COUNT
+                if source == "std"
+                else TDXParams.MAX_EXTENDED_KLINE_COUNT,
             )
         )
         max_pages = int(
@@ -2572,6 +2572,7 @@ class UnifiedTdxClient:
                         category=category,
                         start=page_start,
                         page_size=page_size,
+                        qfq=qfq,
                     )
                     fetched_pages += 1
                     chunk_network_page_calls += 1
@@ -2687,6 +2688,7 @@ class UnifiedTdxClient:
         边界条件：
         1. 若任务不属于同一 index_name+freq，直接抛 ValueError。
         2. `chunk_network_page_calls` 统计的是分页请求次数；发生分页时会累计多次。
+        3. 指数无复权；标准行情 reserved0 由 get_index_bars 写死为 0。
         """
         raw_tasks = list(tasks or [])
         if not raw_tasks:
@@ -2769,7 +2771,9 @@ class UnifiedTdxClient:
                 "standard_kline_page_size"
                 if source == "std"
                 else "extended_kline_page_size",
-                420 if source == "std" else 700,
+                TDXParams.MAX_KLINE_COUNT
+                if source == "std"
+                else TDXParams.MAX_EXTENDED_KLINE_COUNT,
             )
         )
         max_pages = int(
@@ -3010,6 +3014,78 @@ class UnifiedTdxClient:
             self.get_supported_markets(return_df=True)
         return self._ex_market_name_map.get(int(market), "")
 
+    def _std_stock_market_name(self, market: int) -> str:
+        """输入标准市场号，输出市场中文名；未知市场返回空串。"""
+        if int(market) == 0:
+            return "深圳"
+        if int(market) == 1:
+            return "上海"
+        if int(market) == 2:
+            return "北京"
+        return ""
+
+    def _is_beijing_stock_code(self, code: str) -> bool:
+        """输入代码，输出是否北交所股票；按 92 前缀且 6 位过滤。"""
+        prefixes = self.market_rules.get("include_beijing_prefixes", ["92"])
+        code = str(code)
+        return any(code.startswith(prefix) and len(code) == 6 for prefix in prefixes)
+
+    def _is_listed_std_stock(self, market: int, code: str) -> bool:
+        """输入标准市场与代码，输出是否纳入个股清单。"""
+        if int(market) in (0, 1):
+            return self._is_a_share_std(market, code)
+        if int(market) == 2:
+            return self._is_beijing_stock_code(code)
+        return False
+
+    def _is_std_index_item(self, market: int, code: str, name: str) -> bool:
+        """
+        输入标准市场、代码与名称，输出是否纳入 HQ 指数目录。
+
+        输入：
+        1. market: 0 深圳 / 1 上海 / 2 北京。
+        2. code/name: 码表中的代码与名称。
+        输出：
+        1. True 表示按标准行情指数处理。
+        用途：
+        1. 从深沪京码表中筛出指数，供 `resolve_index_name` 使用。
+        边界条件：
+        1. 名称关键字未命中时，深市 399、沪市 000、京市 899 仍纳入。
+        """
+        markers = ("指数", "中证", "深证", "上证", "沪深", "创业板", "科创", "北证")
+        if any(marker in str(name) for marker in markers):
+            return True
+        raw_code = str(code).strip()
+        m = int(market)
+        if m == 0:
+            return raw_code.startswith("399")
+        if m == 1:
+            return raw_code.startswith("000")
+        if m == 2:
+            return raw_code.startswith("899")
+        return False
+
+    def _beijing_std_route(self, code: str, name: str) -> Dict[str, Any]:
+        """输入北交所代码与名称，输出标准行情 market=2 路由；名称未知时为空串。"""
+        return {
+            "code": str(code).strip(),
+            "name": str(name).strip(),
+            "market": 2,
+            "market_name": "北京",
+            "source": "std",
+            "asset_type": "stock",
+        }
+
+    def _lookup_stock_route(self, code: str) -> Optional[Dict[str, Any]]:
+        """输入标准化代码，输出股票路由；北交所 92 前缀直接走标准行情 market=2；未识别返回 None。"""
+        code = str(code).strip()
+        route = self._stock_route.get(code) if self._stock_route else None
+        if route is not None:
+            return route
+        if self._is_beijing_stock_code(code):
+            return self._beijing_std_route(code, "")
+        return None
+
     def _is_a_share_std(self, market: int, code: str) -> bool:
         """输入标准市场与代码，输出是否 A 股；用于股票口径过滤；未配置前缀则不纳入。"""
         code = str(code)
@@ -3021,16 +3097,10 @@ class UnifiedTdxClient:
             return False
         return any(code.startswith(prefix) for prefix in prefixes)
 
-    def _is_beijing_stock_ex(self, code: str) -> bool:
-        """输入代码，输出是否北京股票；用于 92* 过滤；前缀为空则不纳入。"""
-        prefixes = self.market_rules.get("include_beijing_prefixes", ["92"])
-        code = str(code)
-        return any(code.startswith(prefix) and len(code) == 6 for prefix in prefixes)
-
     def _is_hk_market_ex(self, market: int) -> bool:
-        """输入扩展市场号，输出是否港股市场；用于港股识别；未配置市场名则默认仅港股通。"""
+        """输入扩展市场号，输出是否港股市场；用于港股识别；未配置市场名则默认仅香港主板。"""
         target_market_names = set(
-            self.market_rules.get("include_hk_market_names", ["港股通"])
+            self.market_rules.get("include_hk_market_names", ["香港主板"])
         )
         market_name = self._get_ex_market_name(int(market))
         return market_name in target_market_names
@@ -3050,10 +3120,13 @@ class UnifiedTdxClient:
         s = str(source).strip().lower()
         m = int(market)
         if s == "std":
-            return f"sz.{c}" if m == 0 else f"sh.{c}"
-        if s == "ex":
-            if m == 44:
+            if m == 0:
+                return f"sz.{c}"
+            if m == 1:
+                return f"sh.{c}"
+            if m == 2:
                 return f"bj.{c}"
+        if s == "ex":
             if self._is_hk_market_ex(m):
                 return f"hk.{c}"
         return c
@@ -3110,14 +3183,49 @@ class UnifiedTdxClient:
             return newest_cached_dt.date() >= end_dt.date()
         return newest_cached_dt >= end_dt
 
+    def _rebuild_future_zhulian_index(self) -> None:
+        """根据当前商品期货码表重建「品种前缀 -> 主连代码」索引；码表为空则得到空索引。"""
+        mapping: Dict[str, str] = {}
+        if self._future_df is not None and not self._future_df.empty:
+            for row_dict in self._future_df.to_dict(orient="records"):
+                name = str(row_dict.get("name", "")).strip()
+                if "主连" not in name:
+                    continue
+                code_raw = str(row_dict.get("code", "")).strip()
+                variety = _future_variety_prefix_from_main_code(code_raw)
+                if variety == "":
+                    continue
+                if variety not in mapping:
+                    mapping[variety] = code_raw.upper()
+        self._future_zhulian_by_variety = mapping
+
     def _normalize_future_query_code(self, code: Any) -> str:
-        """输入期货代码，输出标准化代码；用于容错查询；空代码会抛错。"""
+        """输入期货代码，输出可查询代码；无合约月份时按码表主连补全。
+
+        输入:
+        - code: 用户传入的期货代码，如 `CU`、`AL`、`CU2603`、`CUL8`、`CUL9`。
+        输出:
+        - 标准化后的大写代码；纯品种代码为该品种码表中名称含「主连」的合约。
+        用途:
+        - `get_future_kline` / `get_future_latest_price` 在查询前解析代码。
+        边界:
+        - 空代码抛错。
+        - 带 3~4 位合约月份的代码原样返回（如 `CU2603`）。
+        - `L7/L8/L9` 连续合约原样返回（如 `CUL8` 主连、`CUL9` 加权），不把末位数字当成年月。
+        - 纯品种代码（如 `CU`）按码表主连补全；该品种无主连时抛错。
+        """
         raw_code = str(code or "").strip().upper()
         if raw_code == "":
             raise ValueError("期货代码不能为空")
-        if not any(ch.isdigit() for ch in raw_code):
-            raw_code = f"{raw_code}L8"
-        return raw_code
+        kind, _variety = parse_future_symbol(raw_code)
+        if kind in {"month", "continuous", "other"}:
+            return raw_code
+        if self._future_df is None:
+            self.get_all_future_list(return_df=True)
+        mapped = self._future_zhulian_by_variety.get(raw_code)
+        if mapped:
+            return mapped
+        raise ValueError(f"期货品种 {raw_code} 在码表中没有主连合约")
 
     def _normalize_stock_query_code(self, code: Any) -> str:
         """输入股票代码，输出标准化代码；用于容错查询；支持 sh./sz./bj./hk. 前缀。"""
@@ -3182,22 +3290,6 @@ class UnifiedTdxClient:
             return 90
         return 100
 
-    def _resolve_index_route_cache_path(self) -> Optional[Path]:
-        """
-        解析指数路由磁盘缓存路径并校验可写性。
-
-        输入：
-        1. 无显式输入参数，内部读取 `index_kline.route_cache.path`。
-        输出：
-        1. 可写缓存文件路径；无可写位置时返回 None。
-        用途：
-        1. 兼容 pip install 后站点目录只读场景。
-        边界条件：
-        1. 配置路径不可写时自动回退默认路径和临时目录。
-        """
-        configured_path = self.index_kline_route_cache_cfg.get("path")
-        return resolve_index_route_cache_file_path(config_path=configured_path)
-
     def _rebuild_index_name_route_map(
         self, records: List[Dict[str, Any]]
     ) -> Dict[str, Dict[str, Any]]:
@@ -3242,154 +3334,64 @@ class UnifiedTdxClient:
                 route_map[key] = route
         return route_map
 
-    def _try_load_index_route_cache_from_disk(self) -> None:
-        """
-        从磁盘加载日级指数路由缓存并回填内存。
-
-        输入：
-        1. 无显式输入参数。
-        输出：
-        1. 无；命中时更新内存快照。
-        用途：
-        1. 在同日重启场景复用缓存，避免重复全市场目录扫描。
-        边界条件：
-        1. 缓存缺失、损坏、跨日或配置指纹变化时保持当前内存状态不变。
-        """
-        if (
-            not self._index_route_cache_enabled
-        ) or self._index_route_cache_path is None:
-            return
-        loaded = load_index_route_cache(
-            self._index_route_cache_path,
-            expected_fingerprint=self._index_kline_fingerprint,
-            expected_cache_date=self._index_route_cache_date,
-        )
-        if loaded is None:
-            return
-        name_route, catalog, _ = loaded
-        self._index_name_route_map = {
-            str(k): dict(v) for k, v in dict(name_route).items()
-        }
-        self._index_catalog_records = [dict(item) for item in list(catalog)]
-
-    def _ensure_index_route_cache_ready(self) -> List[Dict[str, Any]]:
-        """
-        确保指数路由缓存在运行时可用并返回目录快照。
-
-        输入：
-        1. 无显式输入参数。
-        输出：
-        1. 目录快照列表。
-        用途：
-        1. 保证 `resolve_index_name` 先读内存，内存缺失时再查磁盘，磁盘无效时立即重建。
-        边界条件：
-        1. 磁盘缓存不可用或无效时会触发全量重建；重建失败时返回可能为空的快照。
-        """
+    def _ensure_index_catalog_ready(self) -> List[Dict[str, Any]]:
+        """确保指数目录已从码表两侧过滤出来并返回快照。"""
         if self._index_catalog_records and self._index_name_route_map:
             return list(self._index_catalog_records)
-        self._try_load_index_route_cache_from_disk()
-        if self._index_catalog_records and self._index_name_route_map:
-            return list(self._index_catalog_records)
-        return self._discover_index_route_records(refresh=True)
-
-    def _persist_index_route_cache_to_disk(self) -> None:
-        """
-        将当前索引路由内存快照持久化到磁盘。
-
-        输入：
-        1. 无显式输入参数。
-        输出：
-        1. 无。
-        用途：
-        1. 保存“当天首次重建结果”，供同日后续运行直接复用。
-        边界条件：
-        1. 写失败时自动降级禁用磁盘缓存，不影响主流程继续执行。
-        """
-        if (
-            not self._index_route_cache_enabled
-        ) or self._index_route_cache_path is None:
-            return
-        if not self._index_catalog_records or not self._index_name_route_map:
-            return
-        try:
-            save_index_route_cache(
-                self._index_route_cache_path,
-                fingerprint=self._index_kline_fingerprint,
-                name_route=self._index_name_route_map,
-                catalog=self._index_catalog_records,
-                cache_date=self._index_route_cache_date,
-            )
-        except Exception:
-            self._index_route_cache_enabled = False
+        return self._discover_index_route_records(refresh=False)
 
     def _discover_index_route_records(
         self, refresh: bool = False
     ) -> List[Dict[str, Any]]:
         """
-        动态发现指数名称路由并缓存。
+        从当日 std/ex 码表中过滤指数路由。
 
         输入：
-        1. refresh: 是否强制刷新发现缓存。
+        1. refresh: 是否强制刷新两侧码表后再过滤。
         输出：
         1. `[{name, source, market, code, market_name}, ...]` 路由记录列表。
         用途：
-        1. 在运行时通过标准/扩展行情清单动态定位指数名称对应路由。
+        1. 指数名称解析需要 HQ 与 ExHQ 两边最新码表，再在使用时筛出指数。
         边界条件：
-        1. 网络异常时返回当前已缓存结果（可能为空）。
-        2. 扩展侧合约遍历复用 `_fetch_all_instrument_info`，避免与路由发现重复分页。
+        1. 码表缺失时返回当前已缓存结果（可能为空）。
         """
-        # refresh=False 时优先复用进程内快照，避免重复全市场扫描。
         if (not bool(refresh)) and self._index_catalog_records:
             return list(self._index_catalog_records)
 
+        self.ensure_code_catalog(need_std=True, need_ex=True, refresh=bool(refresh))
         records: List[Dict[str, Any]] = []
         seen_keys: set[str] = set()
-        security_page = int(
-            self.pagination.get("standard_security_list_page_size", 800)
-        )
         index_name_markers = ("指数", "中证", "深证", "上证", "沪深", "创业板", "科创")
 
-        for market in [0, 1]:
-            start = 0
-            while True:
-                page = self.std_pool.call(
-                    "get_security_list", market, start, allow_none=True
-                )
-                if not page:
-                    break
-                for item in page:
-                    name = str(item.get("name", "")).strip()
-                    code = str(item.get("code", "")).strip()
-                    if name == "" or code == "":
-                        continue
-                    looks_like_std_index_code = (
-                        int(market) == 1 and code.startswith("000")
-                    ) or (int(market) == 0 and code.startswith("399"))
-                    if (not any(marker in name for marker in index_name_markers)) and (
-                        not looks_like_std_index_code
-                    ):
-                        continue
-                    key = f"std|{int(market)}|{code}|{name}"
-                    if key in seen_keys:
-                        continue
-                    seen_keys.add(key)
-                    records.append(
-                        {
-                            "name": name,
-                            "source": "std",
-                            "market": int(market),
-                            "code": code,
-                            "market_name": "深圳" if int(market) == 0 else "上海",
-                        }
-                    )
-                start += len(page)
-                if len(page) < security_page:
-                    break
+        for item in self._std_catalog_records or []:
+            name = str(item.get("name", "")).strip()
+            code = str(item.get("code", "")).strip()
+            try:
+                market = int(item.get("market", -1))
+            except Exception:
+                market = -1
+            if name == "" or code == "" or market < 0:
+                continue
+            if not self._is_std_index_item(market, code, name):
+                continue
+            key = f"std|{int(market)}|{code}|{name}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            records.append(
+                {
+                    "name": name,
+                    "source": "std",
+                    "market": int(market),
+                    "code": code,
+                    "market_name": self._std_stock_market_name(market),
+                }
+            )
 
         ex_index_markets = set(
             self.index_kline_cfg.get("prefer_ex_markets", [62, 102, 37, 27])
         )
-        for item in self._fetch_all_instrument_info(refresh=bool(refresh)):
+        for item in self._ex_catalog_records or []:
             name = str(item.get("name", "")).strip()
             code = str(item.get("code", "")).strip()
             try:
@@ -3424,7 +3426,6 @@ class UnifiedTdxClient:
         self._index_name_route_map = self._rebuild_index_name_route_map(
             self._index_catalog_records
         )
-        self._persist_index_route_cache_to_disk()
         return list(records)
 
     def resolve_index_name(
@@ -3462,7 +3463,7 @@ class UnifiedTdxClient:
         if bool(refresh):
             records = self._discover_index_route_records(refresh=True)
         else:
-            self._ensure_index_route_cache_ready()
+            self._ensure_index_catalog_ready()
             cached_route = self._index_name_route_map.get(canonical_key)
             if cached_route is not None:
                 return dict(cached_route)
@@ -3487,7 +3488,6 @@ class UnifiedTdxClient:
             picked = dict(sorted_matches[0])
             if canonical_key != "":
                 self._index_name_route_map[canonical_key] = dict(picked)
-                self._persist_index_route_cache_to_disk()
             return picked
 
         max_candidates = int(
@@ -3591,11 +3591,13 @@ class UnifiedTdxClient:
             market = -1
 
         if source == "std":
-            return "szsh"
+            if market == 2:
+                return "bj"
+            if market in {0, 1}:
+                return "szsh"
+            return None
         if source != "ex":
             return None
-        if market == 44:
-            return "bj"
         if self._is_hk_market_ex(market):
             return "hk"
         return None
@@ -3657,87 +3659,314 @@ class UnifiedTdxClient:
             return None
         return parsed
 
-    def _fetch_all_instrument_info(self, refresh: bool = False) -> List[Dict[str, Any]]:
-        """输入是否刷新，输出扩展合约全量；用于路由；None/空分页视为结束。"""
-        if self._instrument_cache is not None and not refresh:
-            return self._instrument_cache
+    def _quote_last_price(self, row: Optional[Dict[str, Any]]) -> Optional[float]:
+        """
+        从单条报价记录取对外最新价。
 
+        输入：
+        1. row: `get_security_quotes` / `get_instrument_quote` 的一行。
+        输出：
+        1. 正价浮点数；现价与昨收都非正则返回 None。
+        用途：
+        1. 统一股票最新价取值；停牌回退昨收，未上市占位（现价与昨收都非正）记 None。
+        边界条件：
+        1. 一次报价结果即终态，不再为 None 拆单重试。
+        """
+        if not row:
+            return None
+        price = self._safe_float(row.get("price"))
+        if price is not None and price > 0:
+            return price
+        last_close = self._safe_float(row.get("last_close"))
+        if last_close is not None and last_close > 0:
+            return last_close
+        return None
+
+    def _today_catalog_cache_date(self) -> str:
+        """输出当天自然日 YYYY-MM-DD，供码表日级缓存判定。"""
+        return dt.datetime.now().date().isoformat()
+
+    def _catalog_memory_fresh(self, kind: str) -> bool:
+        """输入 std/ex，输出该侧内存码表是否已是当日快照。"""
+        kind_key = str(kind or "").strip().lower()
+        if kind_key == KIND_STD:
+            return (
+                self._std_catalog_records is not None
+                and self._std_catalog_date == self._today_catalog_cache_date()
+            )
+        if kind_key == KIND_EX:
+            return (
+                self._ex_catalog_records is not None
+                and self._ex_catalog_date == self._today_catalog_cache_date()
+            )
+        return False
+
+    def _invalidate_derived_catalog_views(self) -> None:
+        """码表原文更新后清空股票/期货/指数等使用时过滤产物。"""
+        self._stock_df = None
+        self._stock_route = {}
+        self._future_df = None
+        self._future_route = {}
+        self._future_zhulian_by_variety = {}
+        self._index_catalog_records = []
+        self._index_name_route_map = {}
+
+    def _persist_one_catalog(
+        self,
+        kind: str,
+        records: List[Dict[str, Any]],
+        market_names: Optional[Dict[int, str]] = None,
+    ) -> None:
+        """将一侧未过滤码表写入当日磁盘缓存；写失败时禁用磁盘缓存。"""
+        if (
+            not self._catalog_cache_enabled
+            or self._catalog_cache_dir is None
+            or not records
+        ):
+            return
+        try:
+            save_catalog_cache(
+                catalog_cache_file_path(self._catalog_cache_dir, kind),
+                kind=kind,
+                cache_date=self._today_catalog_cache_date(),
+                records=records,
+                market_names=market_names,
+            )
+        except Exception:
+            self._catalog_cache_enabled = False
+
+    def _try_load_one_catalog_from_disk(self, kind: str) -> bool:
+        """尝试加载一侧当日磁盘码表；命中返回 True 并回填内存。"""
+        if not self._catalog_cache_enabled or self._catalog_cache_dir is None:
+            return False
+        loaded = load_catalog_cache(
+            catalog_cache_file_path(self._catalog_cache_dir, kind),
+            expected_kind=kind,
+            expected_cache_date=self._today_catalog_cache_date(),
+        )
+        if loaded is None:
+            return False
+        cache_date, records, market_names = loaded
+        if kind == KIND_STD:
+            self._std_catalog_records = records
+            self._std_catalog_date = cache_date
+        else:
+            self._ex_catalog_records = records
+            self._ex_catalog_date = cache_date
+            if market_names:
+                self._ex_market_name_map.update(market_names)
+        return True
+
+    def _std_catalog_markets(self) -> List[int]:
+        """输出标准行情码表市场号；get_markets 失败时回退深沪京 0/1/2。"""
+        try:
+            rows = self.std_pool.call("get_markets") or []
+        except Exception:
+            rows = []
+        if not isinstance(rows, (list, tuple)):
+            rows = []
+        markets: List[int] = []
+        seen: set[int] = set()
+        for row in rows:
+            try:
+                market = int(row.get("market", -1))
+            except Exception:
+                continue
+            if market < 0 or market in seen:
+                continue
+            seen.add(market)
+            markets.append(market)
+        return markets or [0, 1, 2]
+
+    def _download_std_security_catalog(self) -> List[Dict[str, Any]]:
+        """分页下载标准行情未过滤码表；空页视为该市场结束。"""
+        security_page = int(
+            self.pagination.get(
+                "standard_security_list_page_size", TDXParams.MAX_SECURITY_LIST_COUNT
+            )
+        )
+        records: List[Dict[str, Any]] = []
+        for market in self._std_catalog_markets():
+            start = 0
+            while True:
+                page = self.std_pool.call(
+                    "get_security_list",
+                    market,
+                    start,
+                    security_page,
+                    allow_none=True,
+                )
+                if not page:
+                    break
+                for item in page:
+                    row = dict(item)
+                    code = str(row.get("code", "")).strip()
+                    if code == "":
+                        continue
+                    row["code"] = code
+                    row["name"] = str(row.get("name", "")).strip()
+                    row["market"] = int(market)
+                    records.append(row)
+                start += len(page)
+                if len(page) < security_page:
+                    break
+        return records
+
+    def _download_ex_instrument_catalog(self) -> List[Dict[str, Any]]:
+        """分页下载扩展行情未过滤码表；空页或短页视为结束。"""
+        if not self._ex_market_name_map:
+            try:
+                self.get_supported_markets(return_df=True)
+            except Exception:
+                pass
         page_size = int(self.pagination.get("extended_instrument_info_page_size", 800))
         start = 0
         rows: List[Dict[str, Any]] = []
-
         while True:
             page = self.ex_pool.call(
                 "get_instrument_info", start, page_size, allow_none=True
             )
             if not page:
                 break
-            rows.extend(page)
+            for item in page:
+                row = dict(item)
+                code = str(row.get("code", "")).strip()
+                if code == "":
+                    continue
+                try:
+                    market = int(row.get("market", -1))
+                except Exception:
+                    continue
+                if market < 0:
+                    continue
+                row["code"] = code
+                row["name"] = str(row.get("name", "")).strip()
+                row["market"] = market
+                rows.append(row)
             start += len(page)
             if len(page) < page_size:
                 break
-
-        self._instrument_cache = rows
         return rows
 
-    def get_all_stock_list(
-        self, return_df: Optional[bool] = None, refresh: bool = False
-    ):
-        """输入返回与刷新开关，输出全股票清单；用于统一上深京；分页 None 作为结束。"""
-        if self._stock_df is not None and not refresh:
-            if self._default_return_df(return_df):
-                return self._stock_df.copy()
-            return self._stock_df.to_dict(orient="records")
+    def _ensure_std_catalog(self, refresh: bool = False) -> None:
+        """确保标准行情码表为当日内存快照；缺失则读盘或下载。"""
+        if not refresh and self._catalog_memory_fresh(KIND_STD):
+            return
+        replaced = False
+        if not refresh and self._try_load_one_catalog_from_disk(KIND_STD):
+            replaced = True
+        else:
+            rows = self._download_std_security_catalog()
+            if rows:
+                self._std_catalog_records = rows
+                self._std_catalog_date = self._today_catalog_cache_date()
+                self._persist_one_catalog(KIND_STD, rows)
+                replaced = True
+            elif self._std_catalog_records is None:
+                self._std_catalog_records = []
+                self._std_catalog_date = ""
+        if replaced:
+            self._invalidate_derived_catalog_views()
 
-        security_page = int(
-            self.pagination.get("standard_security_list_page_size", 800)
-        )
-        records = []
-
-        for market in [0, 1]:
-            start = 0
-            while True:
-                page = self.std_pool.call(
-                    "get_security_list", market, start, allow_none=True
+    def _ensure_ex_catalog(self, refresh: bool = False) -> None:
+        """确保扩展行情码表为当日内存快照；缺失则读盘或下载。"""
+        if not refresh and self._catalog_memory_fresh(KIND_EX):
+            return
+        replaced = False
+        if not refresh and self._try_load_one_catalog_from_disk(KIND_EX):
+            replaced = True
+        else:
+            rows = self._download_ex_instrument_catalog()
+            if rows:
+                self._ex_catalog_records = rows
+                self._ex_catalog_date = self._today_catalog_cache_date()
+                self._persist_one_catalog(
+                    KIND_EX,
+                    rows,
+                    market_names=dict(getattr(self, "_ex_market_name_map", {}) or {}),
                 )
-                if not page:
-                    break
-                for item in page:
-                    code = str(item.get("code", "")).strip()
-                    if not code or not self._is_a_share_std(market, code):
-                        continue
-                    records.append(
-                        {
-                            "code": code,
-                            "name": str(item.get("name", "")).strip(),
-                            "market": int(market),
-                            "market_name": "深圳" if market == 0 else "上海",
-                            "source": "std",
-                            "asset_type": "stock",
-                        }
-                    )
-                start += len(page)
-                if len(page) < security_page:
-                    break
+                replaced = True
+            elif self._ex_catalog_records is None:
+                self._ex_catalog_records = []
+                self._ex_catalog_date = ""
+        if replaced:
+            self._invalidate_derived_catalog_views()
 
-        for item in self._fetch_all_instrument_info(refresh=refresh):
-            market = int(item.get("market", -1))
+    def ensure_code_catalog(
+        self,
+        *,
+        need_std: bool = False,
+        need_ex: bool = False,
+        refresh: bool = False,
+    ) -> None:
+        """码表聚合入口：按需保证 std / ex 当日缓存可用。
+
+        输入:
+        - need_std: 是否需要标准行情码表（深沪京证券全集）。
+        - need_ex: 是否需要扩展行情码表（期货/港股/扩展指数全集）。
+        - refresh: True 时忽略内存与磁盘，重新下载对应侧。
+        输出:
+        - 无；命中后 `_std_catalog_records` / `_ex_catalog_records` 为未过滤原文。
+        用途:
+        - 股票、期货、指数等函数在需要码表时调用，由调用方声明需要哪一侧。
+        边界:
+        - 过滤（A 股前缀、港股、商品期货所、指数关键字）只在使用时进行；
+          指数需要两边时应对 `need_std` 与 `need_ex` 同时为 True。
+        """
+        if need_std:
+            self._ensure_std_catalog(refresh=refresh)
+        if need_ex:
+            self._ensure_ex_catalog(refresh=refresh)
+
+    def _fetch_all_instrument_info(self, refresh: bool = False) -> List[Dict[str, Any]]:
+        """输入是否刷新，输出扩展合约全量未过滤码表。"""
+        self.ensure_code_catalog(need_ex=True, refresh=refresh)
+        return list(self._ex_catalog_records or [])
+
+    def _rebuild_stock_views_from_catalogs(self) -> None:
+        """从已加载的 std/ex 码表过滤出股票清单与路由。"""
+        records: List[Dict[str, Any]] = []
+        for item in self._std_catalog_records or []:
             code = str(item.get("code", "")).strip()
-            is_beijing_stock = market == 44 and self._is_beijing_stock_ex(code)
-            is_hk_stock = self._is_hk_stock_ex(market, code)
-            if not is_beijing_stock and not is_hk_stock:
+            try:
+                market = int(item.get("market", -1))
+            except Exception:
+                market = -1
+            if not code or market < 0 or not self._is_listed_std_stock(market, code):
                 continue
             records.append(
                 {
                     "code": code,
                     "name": str(item.get("name", "")).strip(),
+                    "market": int(market),
+                    "market_name": self._std_stock_market_name(market),
+                    "source": "std",
+                    "asset_type": "stock",
+                }
+            )
+        existing = {str(rec["code"]) for rec in records}
+        for item in self._ex_catalog_records or []:
+            try:
+                market = int(item.get("market", -1))
+            except Exception:
+                market = -1
+            code = str(item.get("code", "")).strip()
+            name = str(item.get("name", "")).strip()
+            if not self._is_hk_stock_ex(market, code):
+                continue
+            if code in existing:
+                continue
+            records.append(
+                {
+                    "code": code,
+                    "name": name,
                     "market": market,
                     "market_name": self._get_ex_market_name(market),
                     "source": "ex",
                     "asset_type": "stock",
                 }
             )
-
+            existing.add(code)
         df = pd.DataFrame(records)
         if not df.empty:
             df = (
@@ -3756,6 +3985,18 @@ class UnifiedTdxClient:
                 if rec.get("code") is not None
             }
 
+    def get_all_stock_list(
+        self, return_df: Optional[bool] = None, refresh: bool = False
+    ):
+        """输入返回与刷新开关，输出股票清单；码表过滤在使用时完成。"""
+        if self._stock_df is not None and not refresh:
+            if self._default_return_df(return_df):
+                return self._stock_df.copy()
+            return self._stock_df.to_dict(orient="records")
+
+        self.ensure_code_catalog(need_std=True, need_ex=True, refresh=refresh)
+        self._rebuild_stock_views_from_catalogs()
+        df = self._stock_df if self._stock_df is not None else pd.DataFrame()
         if self._default_return_df(return_df):
             return df.copy()
         return df.to_dict(orient="records")
@@ -3803,9 +4044,10 @@ class UnifiedTdxClient:
                 return self._future_df.copy()
             return self._future_df.to_dict(orient="records")
 
+        self.ensure_code_catalog(need_ex=True, refresh=not bool(use_cache))
         target_market_names = set(self.market_rules.get("future_market_names", []))
         records = []
-        for item in self._fetch_all_instrument_info(refresh=not bool(use_cache)):
+        for item in self._ex_catalog_records or []:
             market = int(item.get("market", -1))
             market_name = self._get_ex_market_name(market)
             if market_name not in target_market_names:
@@ -3836,6 +4078,7 @@ class UnifiedTdxClient:
                 continue
             self._future_route[code_raw] = row_dict
             self._future_route[code_raw.upper()] = row_dict
+        self._rebuild_future_zhulian_index()
 
         if self._default_return_df(return_df):
             return df.copy()
@@ -3844,11 +4087,22 @@ class UnifiedTdxClient:
     def get_stock_latest_price(
         self, codes: Optional[Any] = None
     ) -> Dict[str, Optional[float]]:
-        """输入股票代码列表，输出最新价字典；用于实时报价；不传代码时按配置范围拉取全量股票。"""
-        self.get_all_stock_list(return_df=True)
+        """
+        输入股票代码列表，输出最新价字典。
+
+        输入：
+        1. codes: 可选代码列表；为空时按配置默认范围拉取。
+        输出：
+        1. `{code: price}`；无有效报价为 None。
+        用途：
+        1. 实时最新价；现价非正时回退昨收。
+        边界条件：
+        1. 未上市占位码随整批一次解析，现价与昨收都非正则记 None，不再拆单重试。
+        """
         query_codes = self._normalize_code_list(codes)
 
         if query_codes is None:
+            self.get_all_stock_list(return_df=True)
             targets = self._get_default_scoped_stock_codes("get_stock_latest_price")
         else:
             targets = []
@@ -3858,14 +4112,14 @@ class UnifiedTdxClient:
                     code = self._normalize_stock_query_code(raw_code)
                 except Exception:
                     continue
-                if code in self._stock_route:
+                if self._lookup_stock_route(code) is not None:
                     targets.append(code)
                 else:
                     missing.append(code)
             if missing:
                 self.get_all_stock_list(return_df=True, refresh=True)
                 for code in missing:
-                    if code in self._stock_route:
+                    if self._lookup_stock_route(code) is not None:
                         targets.append(code)
 
         targets = list(dict.fromkeys(targets))
@@ -3876,7 +4130,7 @@ class UnifiedTdxClient:
         std_targets: List[Tuple[str, int, str]] = []
         ex_targets: List[Tuple[str, int, str]] = []
         for code in targets:
-            route = self._stock_route.get(code)
+            route = self._lookup_stock_route(code)
             if route is None:
                 self._record_failure(
                     "stock_latest_price", code, "code_not_found", "route_missing"
@@ -3900,7 +4154,7 @@ class UnifiedTdxClient:
             chunk = std_targets[start : start + quote_batch_size]
             req = [(int(market), str(code)) for _, market, code in chunk]
             pair_to_key = {(int(market), str(code)): key for key, market, code in chunk}
-            resolved = set()
+            resolved: set = set()
             try:
                 rows = self._pool_call_allow_none(
                     self.std_pool,
@@ -3919,11 +4173,11 @@ class UnifiedTdxClient:
                     market = int(row.get("market", -1))
                 except Exception:
                     market = -1
-                code = str(row.get("code", "")).strip()
+                code = str(row.get("code", "")).strip().rstrip("\x00")
                 key = pair_to_key.get((market, code))
                 if key is None:
                     continue
-                result[key] = self._safe_float(row.get("price"))
+                result[key] = self._quote_last_price(row)
                 resolved.add(key)
 
             for key, _, _ in chunk:
@@ -3943,10 +4197,7 @@ class UnifiedTdxClient:
                 result[key] = None
                 continue
             one = (rows or [None])[0]
-            if one is None:
-                result[key] = None
-                continue
-            result[key] = self._safe_float(one.get("price"))
+            result[key] = self._quote_last_price(one)
 
         return result
 
@@ -4071,6 +4322,7 @@ class UnifiedTdxClient:
         freq: str,
         start_ts: pd.Timestamp,
         end_ts: pd.Timestamp,
+        qfq: Optional[bool] = None,
     ) -> pd.DataFrame:
         """输入标准股票参数，输出区间 K 线；用于自动分页；None/空页即结束。"""
         page_size = self._standard_kline_page_size()
@@ -4084,7 +4336,7 @@ class UnifiedTdxClient:
                 str(code),
                 int(start),
                 int(page_size),
-                qfq=self._standard_kline_qfq(),
+                qfq=self._standard_kline_qfq(qfq),
             )
 
         rows = self._paginate_kline_pages(
@@ -4093,7 +4345,7 @@ class UnifiedTdxClient:
             boundary_mode="pandas",
             fetch_page=_fetch_page,
         )
-        market_name = "深圳" if int(market) == 0 else "上海"
+        market_name = self._std_stock_market_name(int(market))
         return self._kline_dataframe(
             rows, code, int(market), market_name, "std", freq, start_ts, end_ts
         )
@@ -4106,9 +4358,14 @@ class UnifiedTdxClient:
         freq: str,
         start_ts: pd.Timestamp,
         end_ts: pd.Timestamp,
+        qfq: bool = False,
     ) -> pd.DataFrame:
         """输入扩展参数，输出区间 K 线；用于自动分页；None/空页即结束。"""
-        page_size = int(self.pagination.get("extended_kline_page_size", 700))
+        page_size = int(
+            self.pagination.get(
+                "extended_kline_page_size", TDXParams.MAX_EXTENDED_KLINE_COUNT
+            )
+        )
 
         def _fetch_page(start: int) -> Any:
             return self._pool_call_allow_none(
@@ -4119,6 +4376,7 @@ class UnifiedTdxClient:
                 str(code),
                 int(start),
                 int(page_size),
+                qfq=bool(qfq),
             )
 
         rows = self._paginate_kline_pages(
@@ -4284,9 +4542,9 @@ class UnifiedTdxClient:
 
     def _resolve_stock_codes(self, codes: Optional[Any], freq: str) -> List[str]:
         """输入股票代码参数，输出可查询代码列表；用于统一 code 解析；codes=None 时按配置范围取全量。"""
-        self.get_all_stock_list(return_df=True)
         query_codes = self._normalize_code_list(codes)
         if query_codes is None:
+            self.get_all_stock_list(return_df=True)
             return self._get_default_scoped_stock_codes("get_stock_kline")
 
         targets: List[str] = []
@@ -4299,7 +4557,7 @@ class UnifiedTdxClient:
                     "stock_kline", str(raw_code), "invalid_code", str(exc), freq
                 )
                 continue
-            if code in self._stock_route:
+            if self._lookup_stock_route(code) is not None:
                 targets.append(code)
             else:
                 unresolved.append(code)
@@ -4307,7 +4565,7 @@ class UnifiedTdxClient:
         if unresolved:
             self.get_all_stock_list(return_df=True, refresh=True)
             for code in unresolved:
-                if code in self._stock_route:
+                if self._lookup_stock_route(code) is not None:
                     targets.append(code)
                 else:
                     self._record_failure(
@@ -4364,13 +4622,13 @@ class UnifiedTdxClient:
         """输入单只股票参数，输出单只股票K线；用于批量迭代内部复用；代码不存在时抛错。"""
         normalized_code = self._normalize_stock_query_code(code)
         category = self._freq_to_category(freq)
-        self.get_all_stock_list(return_df=True)
-        route = self._stock_route.get(str(normalized_code))
+        route = self._lookup_stock_route(str(normalized_code))
         if route is None:
             self.get_all_stock_list(return_df=True, refresh=True)
-            route = self._stock_route.get(str(normalized_code))
+            route = self._lookup_stock_route(str(normalized_code))
         if route is None:
             raise ValueError(f"股票代码未找到: {code}")
+        qfq = self._standard_kline_qfq()
         if route["source"] == "std":
             df = self._fetch_std_kline(
                 int(route["market"]),
@@ -4379,6 +4637,7 @@ class UnifiedTdxClient:
                 freq,
                 start_ts,
                 end_ts,
+                qfq=qfq,
             )
         else:
             df = self._fetch_ex_kline(
@@ -4388,6 +4647,7 @@ class UnifiedTdxClient:
                 freq,
                 start_ts,
                 end_ts,
+                qfq=qfq,
             )
         return self._normalize_stock_kline_fields(
             df=df,
@@ -4599,11 +4859,11 @@ class UnifiedTdxClient:
         return_df: Optional[bool] = None,
     ):
         """输入股票代码与中文分类列表，输出分类正文；用于单股抓取；返回 code/category/content 三列。"""
-        self.get_all_stock_list(return_df=True)
-        route = self._stock_route.get(str(code))
+        normalized_code = self._normalize_stock_query_code(code)
+        route = self._lookup_stock_route(normalized_code)
         if route is None:
             self.get_all_stock_list(return_df=True, refresh=True)
-            route = self._stock_route.get(str(code))
+            route = self._lookup_stock_route(normalized_code)
         if route is None:
             raise ValueError(f"股票代码未找到: {code}")
 
@@ -4619,7 +4879,7 @@ class UnifiedTdxClient:
 
         market = int(route["market"])
         categories = self.std_pool.call(
-            "get_company_info_category", market, str(code), allow_none=True
+            "get_company_info_category", market, str(normalized_code), allow_none=True
         )
 
         if not categories:
@@ -4643,7 +4903,7 @@ class UnifiedTdxClient:
 
             content, status = self._fetch_company_content(
                 market=market,
-                code=str(code),
+                code=str(normalized_code),
                 filename=str(cat.get("filename", "")),
                 start=int(cat.get("start", 0)),
                 length=int(cat.get("length", 0)),

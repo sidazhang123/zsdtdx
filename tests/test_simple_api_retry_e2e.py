@@ -14,7 +14,7 @@ import sys
 import unittest
 from concurrent.futures import Future
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Tuple
 from unittest.mock import MagicMock, patch
 
 # 保证优先加载工作区 src，而非 site-packages 旧包
@@ -91,12 +91,15 @@ class _InlineThreadPoolExecutor:
 def _inline_thread_pools() -> Iterator[None]:
     """chunk 调度线程池内联执行，避免子线程重建真实连接。"""
     inline = _InlineThreadPoolExecutor()
-    with patch(
-        "zsdtdx.parallel_fetcher.ThreadPoolExecutor",
-        _InlineThreadPoolExecutor,
-    ), patch(
-        "zsdtdx.parallel_fetcher._get_worker_chunk_executor",
-        return_value=inline,
+    with (
+        patch(
+            "zsdtdx.parallel_fetcher.ThreadPoolExecutor",
+            _InlineThreadPoolExecutor,
+        ),
+        patch(
+            "zsdtdx.parallel_fetcher._get_worker_chunk_executor",
+            return_value=inline,
+        ),
     ):
         yield
 
@@ -213,11 +216,16 @@ class TestSimpleApiSameConnectionRetryE2E(unittest.TestCase):
 
     def test_sync_persistent_none_no_chunk_recover(self):
         """simple_api sync：真 None 仍 no_data，不触发 chunk 重建连接。"""
-        ctx, self._worker_ensure_patch = _install_mock_worker(bars_side_effect=[None, None])
+        ctx, self._worker_ensure_patch = _install_mock_worker(
+            bars_side_effect=[None, None]
+        )
 
-        with patch(
-            "zsdtdx.parallel_fetcher._recover_worker_standard_connection_current_thread"
-        ) as recover_mock, _inline_thread_pools():
+        with (
+            patch(
+                "zsdtdx.parallel_fetcher._recover_worker_standard_connection_current_thread"
+            ) as recover_mock,
+            _inline_thread_pools(),
+        ):
             payloads = get_stock_kline(task=[dict(_SAMPLE_TASK)], mode="sync")
 
         recover_mock.assert_not_called()
@@ -238,13 +246,17 @@ class TestSimpleApiSameConnectionRetryE2E(unittest.TestCase):
         ctx, self._worker_ensure_patch = _install_mock_worker(bars_side_effect=_bars)
         inline_pool = _InlineProcessPool()
 
-        with patch(
-            "zsdtdx.parallel_fetcher._get_global_process_pool",
-            return_value=inline_pool,
-        ), patch(
-            "zsdtdx.parallel_fetcher.ParallelKlineFetcher._ensure_async_prewarm",
-            return_value=None,
-        ), _inline_thread_pools():
+        with (
+            patch(
+                "zsdtdx.parallel_fetcher._get_global_process_pool",
+                return_value=inline_pool,
+            ),
+            patch(
+                "zsdtdx.parallel_fetcher.ParallelKlineFetcher._ensure_async_prewarm",
+                return_value=None,
+            ),
+            _inline_thread_pools(),
+        ):
             job = get_stock_kline(task=[dict(_SAMPLE_TASK)], mode="async")
             payloads = job.result(timeout=60)
 
@@ -267,7 +279,7 @@ class TestSimpleApiChunkReconnectRetryE2E(unittest.TestCase):
         _reset_parallel_state()
 
     def _make_flaky_chunk_fetch(self, state: Dict[str, int]):
-        def _impl(*, tasks: List[Dict[str, Any]], enable_cache: bool):
+        def _impl(*, tasks: List[Dict[str, Any]], enable_cache: bool, qfq: bool = True):
             state["chunk_attempts"] = int(state.get("chunk_attempts", 0)) + 1
             if state["chunk_attempts"] == 1:
                 raise RuntimeError("standard 无可用连接")
@@ -303,10 +315,13 @@ class TestSimpleApiChunkReconnectRetryE2E(unittest.TestCase):
                 "active_host_after": "1.2.3.4:7709",
             }
 
-        with patch(
-            "zsdtdx.parallel_fetcher._recover_worker_standard_connection_current_thread",
-            side_effect=_fake_recover,
-        ), _inline_thread_pools():
+        with (
+            patch(
+                "zsdtdx.parallel_fetcher._recover_worker_standard_connection_current_thread",
+                side_effect=_fake_recover,
+            ),
+            _inline_thread_pools(),
+        ):
             payloads = get_stock_kline(task=[dict(_SAMPLE_TASK)], mode="sync")
 
         self.assertGreaterEqual(len(recover_calls), 1)
@@ -325,19 +340,29 @@ class TestSimpleApiChunkReconnectRetryE2E(unittest.TestCase):
 
         def _fake_recover(reason: str = "") -> Dict[str, Any]:
             recover_calls.append(str(reason))
-            return {"ok": True, "reason": str(reason), "active_host_before": "", "active_host_after": ""}
+            return {
+                "ok": True,
+                "reason": str(reason),
+                "active_host_before": "",
+                "active_host_after": "",
+            }
 
         inline_pool = _InlineProcessPool()
-        with patch(
-            "zsdtdx.parallel_fetcher._recover_worker_standard_connection_current_thread",
-            side_effect=_fake_recover,
-        ), patch(
-            "zsdtdx.parallel_fetcher._get_global_process_pool",
-            return_value=inline_pool,
-        ), patch(
-            "zsdtdx.parallel_fetcher.ParallelKlineFetcher._ensure_async_prewarm",
-            return_value=None,
-        ), _inline_thread_pools():
+        with (
+            patch(
+                "zsdtdx.parallel_fetcher._recover_worker_standard_connection_current_thread",
+                side_effect=_fake_recover,
+            ),
+            patch(
+                "zsdtdx.parallel_fetcher._get_global_process_pool",
+                return_value=inline_pool,
+            ),
+            patch(
+                "zsdtdx.parallel_fetcher.ParallelKlineFetcher._ensure_async_prewarm",
+                return_value=None,
+            ),
+            _inline_thread_pools(),
+        ):
             job = get_stock_kline(task=[dict(_SAMPLE_TASK)], mode="async")
             payloads = job.result(timeout=60)
 

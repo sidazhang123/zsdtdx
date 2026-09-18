@@ -3,9 +3,8 @@
 
 职责：
 1. 提供底层Socket通信能力，封装TCP连接管理。
-2. 实现心跳保活、流量统计等功能。
-3. 提供统一请求/响应处理框架。
-4. 通过atexit注册清理函数，确保程序退出时关闭残留连接。
+2. 实现流量统计与统一请求/响应处理框架。
+3. 通过atexit注册清理函数，确保程序退出时关闭残留连接。
 
 边界：
 1. 本模块为底层模块，不处理业务逻辑（如市场路由、分页等）。
@@ -26,7 +25,6 @@ import time
 import pandas as pd
 
 from zsdtdx.errors import TdxConnectionError, TdxFunctionCallError
-from zsdtdx.heartbeat import HqHeartBeatThread
 from zsdtdx.log import log
 from zsdtdx.parser.raw_parser import RawParser
 
@@ -34,8 +32,6 @@ from zsdtdx.parser.raw_parser import RawParser
 CONNECT_TIMEOUT = 5.0
 # 接收包头长度
 RECV_HEADER_LEN = 0x10
-# 默认心跳间隔（秒）
-DEFAULT_HEARTBEAT_INTERVAL = 10.0
 
 # 全局客户端弱引用集合，用于程序退出时清理
 _all_clients = weakref.WeakSet()
@@ -164,24 +160,20 @@ class BaseSocketClient(object):
     2. 连接异常时根据raise_exception配置决定行为。
     """
 
-    def __init__(self, multithread=False, heartbeat=False, raise_exception=False):
+    def __init__(self, multithread=False, raise_exception=False):
         """
-        输入：是否多线程、是否启用心跳、是否抛出异常
+        输入：是否多线程、是否抛出异常
         输出：无
         用途：初始化客户端
         边界：注册到全局清理列表，确保程序退出时自动关闭
         """
         self.need_setup = True
-        if multithread or heartbeat:
+        if multithread:
             self.lock = threading.Lock()
         else:
             self.lock = None
 
         self.client = None
-        self.heartbeat = heartbeat
-        self.heartbeat_thread = None
-        self.stop_event = None
-        self.heartbeat_interval = DEFAULT_HEARTBEAT_INTERVAL
         self.last_ack_time = time.time()
         self.last_transaction_failed = False
         self.ip = None
@@ -206,7 +198,7 @@ class BaseSocketClient(object):
         边界：
         1. 如有现有连接先关闭
         2. 失败时根据raise_exception决定是否抛出异常
-        3. 启用心跳时自动启动心跳线程
+        3. 连接成功后执行 setup 握手
         """
         # 如果已有连接，先关闭
         if self.client is not None:
@@ -256,36 +248,17 @@ class BaseSocketClient(object):
                 self.disconnect()
                 raise
 
-        if self.heartbeat:
-            self.stop_event = threading.Event()
-            self.heartbeat_thread = HqHeartBeatThread(
-                self, self.stop_event, self.heartbeat_interval
-            )
-            self.heartbeat_thread.start()
         return self
 
     def disconnect(self):
         """
         输入：无
         输出：无
-        用途：关闭TCP连接并停止心跳线程
+        用途：关闭TCP连接
         边界：
         1. 重复调用安全，忽略所有异常
-        2. 先停止心跳线程再关闭socket
-        3. 清理后重置client/ip/port为None
+        2. 清理后重置client/ip/port为None
         """
-        # 先停止心跳线程
-        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
-            try:
-                if self.stop_event:
-                    self.stop_event.set()
-                # 给线程一点时间自行退出
-                self.heartbeat_thread.join(timeout=1.0)
-            except Exception:
-                pass
-            self.heartbeat_thread = None
-
-        # 关闭 socket 连接
         if self.client:
             log.debug("disconnecting")
             try:

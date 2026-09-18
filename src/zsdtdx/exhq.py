@@ -14,6 +14,7 @@
 # coding=utf-8
 
 from zsdtdx.base_socket_client import BaseSocketClient, update_last_ack_time
+from zsdtdx.params import TDXParams
 from zsdtdx.parser.ex_get_history_instrument_bars_range import (
     GetHistoryInstrumentBarsRange,
 )
@@ -94,23 +95,32 @@ class TdxExHq_API(BaseSocketClient):
         return cmd.call_api()
 
     @update_last_ack_time
-    def get_instrument_bars(self, category, market, code, start=0, count=700):
+    def get_instrument_bars(
+        self,
+        category,
+        market,
+        code,
+        start=0,
+        count=TDXParams.MAX_EXTENDED_KLINE_COUNT,
+        qfq=False,
+    ):
         """
         输入：
-        1. category: 输入参数，约束以协议定义与函数实现为准。
-        2. market: 输入参数，约束以协议定义与函数实现为准。
-        3. code: 输入参数，约束以协议定义与函数实现为准。
-        4. start: 输入参数，约束以协议定义与函数实现为准。
-        5. count: 输入参数，约束以协议定义与函数实现为准。
+        1. category: K 线周期。
+        2. market/code: 扩展市场与代码。
+        3. start: 分页偏移，0 为最新窗口。
+        4. count: 本页条数，默认 700（服务端硬上限）。
+        5. qfq: 港股前复权；True extra=1，False extra=0。期货忽略该字段。
         输出：
-        1. 返回值语义由函数实现定义；无返回时为 `None`。
+        1. 本页 K 线 dict 列表。
         用途：
-        1. 执行 `get_instrument_bars` 对应的协议处理、数据解析或调用适配逻辑。
+        1. 发送 0xD808/0xD908 请求并解析回包。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 请求 count>700 时服务端仍最多返回 700 条。
+        2. 默认 qfq=False（extra=0）；港股由 get_stock_kline 传入 True/False。
         """
         cmd = GetInstrumentBars(self.client)
-        cmd.setParams(category, market, code, start=start, count=count)
+        cmd.setParams(category, market, code, start=start, count=count, qfq=qfq)
         return cmd.call_api()
 
     @update_last_ack_time
@@ -207,17 +217,17 @@ class TdxExHq_API(BaseSocketClient):
         return cmd.call_api()
 
     @update_last_ack_time
-    def get_instrument_info(self, start, count=100):
+    def get_instrument_info(self, start, count=None):
         """
         输入：
-        1. start: 输入参数，约束以协议定义与函数实现为准。
-        2. count: 输入参数，约束以协议定义与函数实现为准。
+        1. start: 本页起始下标。
+        2. count: 保留参数，服务端按自身页长返回。
         输出：
-        1. 返回值语义由函数实现定义；无返回时为 `None`。
+        1. 本页合约记录列表（market/code/name）。
         用途：
-        1. 执行 `get_instrument_info` 对应的协议处理、数据解析或调用适配逻辑。
+        1. 拉取扩展行情码表单页，供港股、期货与扩展指数目录分页。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 仅单页；完整目录需由调用方按返回条数累加 start，直到空页。
         """
         cmd = GetInstrumentInfo(self.client)
         cmd.setParams(start, count)
@@ -241,16 +251,3 @@ class TdxExHq_API(BaseSocketClient):
         cmd = GetInstrumentQuoteList(self.client)
         cmd.setParams(market, category, start, count)
         return cmd.call_api()
-
-    def do_heartbeat(self):
-        """
-        输入：
-        1. 无显式输入参数。
-        输出：
-        1. 返回值语义由函数实现定义；无返回时为 `None`。
-        用途：
-        1. 执行 `do_heartbeat` 对应的协议处理、数据解析或调用适配逻辑。
-        边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
-        """
-        self.get_instrument_count()

@@ -10,6 +10,9 @@
 | `verify_zz2000_1315_bar.py` | 中证2000 单 bar（13:15）行为验证 | 是 |
 | `weaknet_inject_retry.py` | 弱网注入与 chunk 重试路径（离线） | 否 |
 | `run_stock_kline_async_full_compare.py` | 全量股票 async K 线单环境基准（workspace / site_packages） | 是 |
+| `run_stock_kline_async_week.py` | 默认股票清单指定日期区间 15/30/60/d/w async 抽样 | 是 |
+| `compare_std_host_bars.py` | 钉死 `hosts.standard` 对比同一已收盘 15 分钟 K 线跨站是否一致 | 是 |
+| `live_full_api/run_one.py` | 分轮现场验证对外 `get_*` API | 是 |
 
 全量基准需主 Agent 分两次单独运行。**不要用「主进程是否退出」判断完成**；async 进程池不会自动关闭，脚本在收到队列 `event=done` 后会立刻调用 `destroy_parallel_fetcher()`，并写入 lifecycle 状态。
 
