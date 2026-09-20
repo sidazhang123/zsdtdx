@@ -1,0 +1,20 @@
+# 本周京沪深日线 TdxQuant vs zsdtdx 对比参数（手工脚本读取，非 CLI 参数）
+compare:
+  # 本周一至五（含今天 2026-07-03 周五）
+  start_time: "2026-06-29"
+  end_time: "2026-07-03"
+  tdxquant_start: "20260629"
+  tdxquant_end: "20260703"
+  freq: "d"
+  artifacts_root: "artifacts/tdxquant_vs_zsdtdx_weekly_d"
+  # 与 zsdtdx/config.yaml 对齐
+  process_count_core_multiplier: 5
+  default_batch_size: 100
+  task_chunk_max_inflight_multiplier: 2
+  task_chunk_inproc_coroutine_workers: 3
+  # TdxQuant 模块路径
+  tdx_pyplugins_user: "C:/new_tdx_test/PYPlugins/user"
+  # zsdtdx 专用 host 配置（相对 tests/manual）
+  zsdtdx_config_path: "zsdtdx_bench_hosts_config.yaml"
+  queue_timeout_seconds: 7200
+  lifecycle_flush_every: 200

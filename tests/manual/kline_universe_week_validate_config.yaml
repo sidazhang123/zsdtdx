@@ -1,0 +1,32 @@
+# 京沪深+港股 / 期货 / 指定指数 一周 K 线拉取校验参数（手工脚本读取，非 CLI）
+run:
+  start_time: "2026-09-07"
+  end_time: "2026-09-11"
+  freqs:
+    - "5"
+    - "15"
+    - "30"
+    - "60"
+    - "d"
+    - "w"
+  indices:
+    - "上证50"
+    - "沪深300"
+    - "科创50"
+    - "中证2000"
+    - "中证500"
+  # 股票范围：覆盖 yaml market_rules 过滤后的京沪深及香港
+  stock_scopes:
+    - "szsh"
+    - "bj"
+    - "hk"
+  # 期货：codes=null 表示 get_all_future_list（future_market_names 过滤后）全量
+  future_codes: null
+  queue_timeout_seconds: 7200
+  progress_every: 200
+  # 相对本 yaml 的包内默认配置，脚本会复制并覆盖超时/scope
+  base_config: "../../src/zsdtdx/config.yaml"
+  # 按周期分批拉取并单独计时的产物目录
+  artifacts_dir: "artifacts/kline_universe_week_validate_by_freq"
+  # true=每个周期单独提交（可得到真实分周期墙钟）；false=一次提交全部周期
+  measure_elapsed_per_freq: true
