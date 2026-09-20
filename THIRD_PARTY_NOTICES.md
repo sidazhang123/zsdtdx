@@ -9,9 +9,17 @@ the upstream project:
 
 ## Attribution
 
-Portions of protocol parsing and API behavior are derived from or inspired by
-`pytdx`, with additional wrapper, retry, routing, batching, and parallel-fetch
-logic implemented in this project.
+Portions of protocol parsing, socket framing, and API surface naming are derived
+from or inspired by `pytdx`, with additional wrapper, retry, routing, batching,
+and parallel-fetch logic implemented in this project.
+
+However, `zsdtdx` is **not** a direct secondary wrapper of `pytdx` as a runtime
+dependency. A number of request builders and response parsers (including, but
+not limited to, handshake packets, K-line requests, security/instrument catalog
+pages, company-info / F10 paging, and related decode paths) have been
+**re-analyzed and reimplemented** against live client/server captures. Their
+wire formats and field layouts may therefore diverge from `pytdx` and must not
+be assumed byte-identical to upstream.
 
 ## License Status Note
 
