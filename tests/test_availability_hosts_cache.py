@@ -221,3 +221,54 @@ def test_config_yaml_no_probe_on_init():
     cfg_path = Path(__file__).resolve().parents[1] / "src" / "zsdtdx" / "config.yaml"
     text = cfg_path.read_text(encoding="utf-8")
     assert "probe_on_init" not in text
+
+
+def _fake_probe_latency_map(latency_by_host):
+    """按 host 返回固定延迟；缺失视为不可达。"""
+
+    def _probe(host, port, timeout):
+        key = (str(host), int(port))
+        lat = latency_by_host.get(key)
+        return (key, lat)
+
+    return _probe
+
+
+@patch("zsdtdx.unified_client._tcp_probe_one")
+def test_short_host_pool_keeps_all_reachable_no_drop_slowest(mock_probe):
+    """配置侧 ≤3：两站都可达时保留全部，不删最慢。"""
+    hosts = [("10.0.0.1", 7720), ("10.0.0.2", 7730)]
+    mock_probe.side_effect = _fake_probe_latency_map(
+        {("10.0.0.1", 7720): 80.0, ("10.0.0.2", 7730): 20.0}
+    )
+    out = uc._tcp_probe_and_trim_available_hosts(
+        hosts, timeout=0.5, fallback_hosts=hosts, pool_label="extended"
+    )
+    assert out == [("10.0.0.2", 7730), ("10.0.0.1", 7720)]
+
+
+@patch("zsdtdx.unified_client._tcp_probe_one")
+def test_long_host_pool_still_drops_slowest_when_reachable_ge_2(mock_probe):
+    """配置侧 >3：可达≥2 时仍去掉最慢 1 个。"""
+    hosts = [
+        ("10.0.0.1", 7709),
+        ("10.0.0.2", 7709),
+        ("10.0.0.3", 7709),
+        ("10.0.0.4", 7709),
+    ]
+    mock_probe.side_effect = _fake_probe_latency_map(
+        {
+            ("10.0.0.1", 7709): 10.0,
+            ("10.0.0.2", 7709): 20.0,
+            ("10.0.0.3", 7709): 30.0,
+            ("10.0.0.4", 7709): 40.0,
+        }
+    )
+    out = uc._tcp_probe_and_trim_available_hosts(
+        hosts, timeout=0.5, fallback_hosts=hosts, pool_label="standard"
+    )
+    assert out == [
+        ("10.0.0.1", 7709),
+        ("10.0.0.2", 7709),
+        ("10.0.0.3", 7709),
+    ]

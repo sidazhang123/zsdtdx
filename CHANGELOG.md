@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v2.0.1 - 2026-09-20
+
+### Summary
+1. TCP 探测裁剪：配置侧地址数 ≤ 3 的短池只剔除不可达、保留全部可达站，不再去掉最慢节点；长池（>3）行为不变。短池阈值写死为 3。
+2. 文档：补充 `docs/ex_std_host_concurrency_plan.md`（std/ex 并发亲和后续方案与残留问题）。
+3. 版本号：`pyproject.toml` 与 `__init__.__version__` 对齐为 `2.0.1`。
+
 ## v2.0.0 - 2026-09-20
 
 ### Summary

@@ -155,6 +155,10 @@ def compute_hosts_fingerprint(
     return (std_key, ex_key)
 
 
+# 短地址池阈值：配置侧 hosts 长度 ≤ 该值时，探测后只剔不可达，不再去掉最慢节点。
+_SHORT_HOST_POOL_NO_DROP_SLOWEST_MAX = 3
+
+
 def _tcp_probe_and_trim_available_hosts(
     hosts: List[Tuple[str, int]],
     timeout: float,
@@ -162,7 +166,9 @@ def _tcp_probe_and_trim_available_hosts(
     pool_label: str = "",
 ) -> List[Tuple[str, int]]:
     """
-    对地址池做 TCP 探测后裁剪：剔除不可达；可达按延迟升序；若可达数≥2 再去掉最慢 1 个；若结果为空则回退 fallback 顺序。
+    对地址池做 TCP 探测后裁剪：剔除不可达；可达按延迟升序；
+    仅当配置侧地址数 > 3 且可达数 ≥ 2 时再去掉最慢 1 个；短池（≤3）保留全部可达站；
+    若结果为空则回退 fallback 顺序。
 
     输入：
     1. hosts: 待探测的 (host, port) 列表。
@@ -175,6 +181,7 @@ def _tcp_probe_and_trim_available_hosts(
     1. 主进程刷新缓存与 PersistentFailoverPool 首次探测共用。
     边界条件：
     1. hosts 为空时返回 fallback 副本。
+    2. 短池阈值写死为 3，不提供 YAML 配置。
     """
     label = str(pool_label or "").strip()
     prefix = f"[{label}] " if label else ""
@@ -218,10 +225,22 @@ def _tcp_probe_and_trim_available_hosts(
         log.info(f"{prefix}[TCP Probe] 不可达已剔除: {fail_str}")
 
     trimmed = [ht for ht, _ in reachable]
-    if len(trimmed) >= 2:
+    # 短池（配置侧 ≤3）只剔不可达，保留全部可达以便 rotate；长池仍去掉最慢 1 个。
+    if (
+        len(hosts) > _SHORT_HOST_POOL_NO_DROP_SLOWEST_MAX
+        and len(trimmed) >= 2
+    ):
         dropped = trimmed[-1]
         trimmed = trimmed[:-1]
         log.info(f"{prefix}[TCP Probe] 去掉最慢节点: {dropped[0]}:{dropped[1]}")
+    elif (
+        len(hosts) <= _SHORT_HOST_POOL_NO_DROP_SLOWEST_MAX
+        and len(trimmed) >= 2
+    ):
+        log.info(
+            f"{prefix}[TCP Probe] 短地址池(配置{len(hosts)}≤"
+            f"{_SHORT_HOST_POOL_NO_DROP_SLOWEST_MAX})，保留全部 {len(trimmed)} 个可达节点"
+        )
     if not trimmed:
         log.warning(
             f"{prefix}[TCP Probe] 裁剪后为空，回退配置原始顺序 ({len(fallback_hosts)} 项)"
