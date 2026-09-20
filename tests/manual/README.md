@@ -13,6 +13,13 @@
 | `run_stock_kline_async_week.py` | 默认股票清单指定日期区间 15/30/60/d/w async 抽样 | 是 |
 | `compare_std_host_bars.py` | 钉死 `hosts.standard` 对比同一已收盘 15 分钟 K 线跨站是否一致 | 是 |
 | `live_full_api/run_one.py` | 分轮现场验证对外 `get_*` API | 是 |
+| `run_simple_api_full_acceptance.py` | 对外 `get_*` 全量验收 | 是 |
+| `run_kline_universe_week_validate.py` | 全市场周区间多周期 K 线质量校验 | 是 |
+| `run_zsdtdx_weekly_daily_bench.py` | zsdtdx 周/日线基准 | 是 |
+| `run_tdxquant_weekly_daily_bench.py` | tdxquant 周/日线对照基准 | 是 |
+| `analyze_tdxquant_vs_zsdtdx_weekly.py` | tdxquant vs zsdtdx 周线差异分析 | 否 |
+| `check_boc_ohlcv_quality.py` | 单标的 OHLCV 质量抽检 | 是 |
+| `_analyze_kline_errors.py` | K 线错误日志辅助分析 | 否 |
 
 全量基准需主 Agent 分两次单独运行。**不要用「主进程是否退出」判断完成**；async 进程池不会自动关闭，脚本在收到队列 `event=done` 后会立刻调用 `destroy_parallel_fetcher()`，并写入 lifecycle 状态。
 
