@@ -226,17 +226,11 @@ def _tcp_probe_and_trim_available_hosts(
 
     trimmed = [ht for ht, _ in reachable]
     # 短池（配置侧 ≤3）只剔不可达，保留全部可达以便 rotate；长池仍去掉最慢 1 个。
-    if (
-        len(hosts) > _SHORT_HOST_POOL_NO_DROP_SLOWEST_MAX
-        and len(trimmed) >= 2
-    ):
+    if len(hosts) > _SHORT_HOST_POOL_NO_DROP_SLOWEST_MAX and len(trimmed) >= 2:
         dropped = trimmed[-1]
         trimmed = trimmed[:-1]
         log.info(f"{prefix}[TCP Probe] 去掉最慢节点: {dropped[0]}:{dropped[1]}")
-    elif (
-        len(hosts) <= _SHORT_HOST_POOL_NO_DROP_SLOWEST_MAX
-        and len(trimmed) >= 2
-    ):
+    elif len(hosts) <= _SHORT_HOST_POOL_NO_DROP_SLOWEST_MAX and len(trimmed) >= 2:
         log.info(
             f"{prefix}[TCP Probe] 短地址池(配置{len(hosts)}≤"
             f"{_SHORT_HOST_POOL_NO_DROP_SLOWEST_MAX})，保留全部 {len(trimmed)} 个可达节点"
@@ -3121,6 +3115,66 @@ class UnifiedTdxClient:
             return False
         return any(code.startswith(prefix) for prefix in prefixes)
 
+    def _etf_name_compact(self, name: str) -> str:
+        """输入原始名称，输出去掉全部空白后的名称；用于 ETF 名称匹配。"""
+        return "".join(ch for ch in str(name or "") if not ch.isspace())
+
+    def _etf_name_include_hit(self, name: str) -> bool:
+        """
+        输入证券名称，输出是否命中 ETF/LOF 初筛子串。
+
+        输入：名称字符串。
+        输出：True 表示去空白后大小写不敏感命中 etf 或 lof。
+        用途：`get_etf_code_name_map` 初筛。
+        边界：子串写死为 etf/lof，不读配置；空名称 False。
+        """
+        compact = self._etf_name_compact(name).lower()
+        if not compact:
+            return False
+        return "etf" in compact or "lof" in compact
+
+    def _etf_name_dropped(self, name: str) -> bool:
+        """
+        输入证券名称，输出是否因剔除子串丢弃。
+
+        输入：名称字符串。
+        输出：True 表示应丢弃。
+        用途：`get_etf_code_name_map` 二次过滤。
+        边界：空名称视为丢弃；未配置时默认债/货币/增强/红利/现金流。
+        """
+        compact = self._etf_name_compact(name)
+        if not compact:
+            return True
+        tokens = self.market_rules.get(
+            "etf_name_drop_substr",
+            ["债", "货币", "增强", "红利", "现金流"],
+        )
+        return any(str(token) in compact for token in tokens if str(token))
+
+    def _is_etf_std_candidate(self, market: int, code: str, name: str) -> bool:
+        """
+        输入标准市场、代码与名称，输出是否纳入场内 ETF/LOF 码表。
+
+        输入：
+        1. market: 0 深圳 / 1 上海。
+        2. code/name: 码表代码与名称。
+        输出：True 表示保留。
+        用途：仅从 std 深/沪按名称过滤场内 etf（含 LOF）。
+        边界：排除 399*；不做 ex 补全。
+        """
+        raw_code = str(code or "").strip()
+        if int(market) not in (0, 1):
+            return False
+        if len(raw_code) != 6 or not raw_code.isdigit():
+            return False
+        if raw_code.startswith("399"):
+            return False
+        if not self._etf_name_include_hit(name):
+            return False
+        if self._etf_name_dropped(name):
+            return False
+        return True
+
     def _is_hk_market_ex(self, market: int) -> bool:
         """输入扩展市场号，输出是否港股市场；用于港股识别；未配置市场名则默认仅香港主板。"""
         target_market_names = set(
@@ -4057,6 +4111,43 @@ class UnifiedTdxClient:
             if prefixed_code == "":
                 continue
             result[prefixed_code] = str(rec.get("name", "")).strip()
+        return result
+
+    def get_etf_code_name_map(self, use_cache: bool = True) -> Dict[str, str]:
+        """
+        输入缓存开关，输出场内 ETF/LOF（语境含两者）带前缀代码名称字典。
+
+        输入：
+        1. use_cache: True 时复用当日 std 码表缓存；False 强制刷新。
+        输出：
+        1. `Dict[str, str]`，键为 `sz.`/`sh.` 前缀代码。
+        用途：
+        1. 独立于 `get_stock_code_name_map`，不扩宽 A 股宇宙。
+        边界条件：
+        1. 仅扫 std market 0/1；排除 399*；初筛写死 etf/lof；drop 见 market_rules；同码先出现优先。
+        """
+        self.ensure_code_catalog(need_std=True, refresh=not bool(use_cache))
+        result: Dict[str, str] = {}
+        for item in self._std_catalog_records or []:
+            code = str(item.get("code", "")).strip()
+            name = str(item.get("name", "")).strip()
+            try:
+                market = int(item.get("market", -1))
+            except Exception:
+                market = -1
+            if not self._is_etf_std_candidate(market, code, name):
+                continue
+            try:
+                prefixed = self._stock_code_with_prefix(
+                    source="std", market=market, code=code
+                )
+            except Exception:
+                continue
+            if not str(prefixed).startswith(("sz.", "sh.")):
+                continue
+            if prefixed in result:
+                continue
+            result[prefixed] = name
         return result
 
     def get_all_future_list(

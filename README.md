@@ -15,6 +15,7 @@ pip install zsdtdx
 - `get_client`
 - `get_supported_markets`
 - `get_stock_code_name`
+- `get_etf_code_name`
 - `get_all_future_list`
 - `get_stock_kline`
 - `get_index_kline`
@@ -141,6 +142,33 @@ with get_client():
 **返回示例:**
 ```json
 {"sh.600000": "浦发银行", "sz.000001": "平安银行"}
+```
+
+#### get_etf_code_name
+
+获取场内 ETF/LOF（本语境统称 etf）代码名称字典。从标准行情深/沪码表按名称过滤，不改动 `get_stock_code_name` 口径。
+
+**调用前置约定:**
+- 请先进入 `with get_client():`；
+
+**输入:**
+- use_cache: 是否复用当日 std 码表缓存；为 False 时强制刷新标准行情码表。
+- 初筛固定为名称含 etf/lof（大小写不敏感，代码写死）；剔除子串见 `market_rules.etf_name_drop_substr`。
+
+**输出:**
+- 返回 `Dict[str, str]`：key 为 `sz.`/`sh.` 前缀代码，value 为名称；排除深指 `399*` 与名称命中剔除子串的品种。
+
+**调用示例:**
+```python
+from zsdtdx import get_client, get_etf_code_name
+
+with get_client():
+    etf_map = get_etf_code_name()
+```
+
+**返回示例:**
+```json
+{"sz.159915": "创业板ETF", "sh.510300": "沪深300ETF"}
 ```
 
 #### get_all_future_list
@@ -859,6 +887,14 @@ market_rules:
     - "大连商品"
     - "上海期货"
     - "广州期货"
+  # 场内 ETF/LOF 名称二次剔除子串（去空白后命中任一即丢弃）。
+  # 作用对象: get_etf_code_name；初筛子串 etf/lof 写死在代码中（大小写不敏感）。
+  etf_name_drop_substr:
+    - "债"
+    - "货币"
+    - "增强"
+    - "红利"
+    - "现金流"
 
 stock_scope:
   # 当股票接口不传 codes（即 codes=None）时，默认抓取范围。

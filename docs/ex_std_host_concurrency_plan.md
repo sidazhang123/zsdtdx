@@ -88,6 +88,15 @@
 当前全量 worker 预热都会碰 ex。若仍 40 进程全预热 ex，亲和配额未生效前启动瞬间又是满扇出。  
 需要：**ex 懒建连**，或**仅 ex 配额进程预热 ex**；进程级预热是否应以 `ex_ok` 为门槛需单独决策（过严会导致有港股任务时启动失败）。
 
+#### 临时配置：`auto_prewarm_require_all_workers: false`（已核对，勿误读）
+
+配置项：`parallel.auto_prewarm_require_all_workers`（默认 `true`）。
+
+- **实际作用**：预热轮次结束后若 `warmed_pids < target_workers`，`true` 会直接 `RuntimeError: 预热失败` 并关池；`false` 则允许带着部分已预热 worker 继续进入 async 抓取。
+- **不是**：降低对 ex 站的并发建连/握手压力，也**不是** `extended 无可用连接` 的根治开关。预热探针仍会按 `target_workers×2` 扇出，且仍会碰 std/ex；进程池目标规模也不因该项变小。
+- **与 ex 过载的关系（弱相关）**：ex 握手拥挤时，部分 worker 预热探针更容易超时/失败 → `require_all=true` 会把「预热未满员」放大成整次 async 启动失败；改为 `false` 可**绕过这道闸门**，让任务在负载稍缓时由未预热 worker 懒建连再试。这最多是运维侧临时止血，**不能**替代 §3 亲和/配额或 ex 懒建连。
+- **实测对照（2026-09）**：本机默认银河 hosts、约 40 worker 时，`true` 常见卡在 36–38/40 预热失败；改为 `false` 后中证500/1000/2000 多周期近 2 年 async 可跑通。该对照验证的是「预热闸门」，不等于大批港股场景下 `extended 无可用连接` 已消失。
+
 ### 4.3 Worker 亲和在现有进程池上不是免费能力
 
 `ProcessPoolExecutor` 默认轮询分发，**不能保证**某类 chunk 只落到某几个 PID。  

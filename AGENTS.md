@@ -7,7 +7,7 @@
 `zsdtdx` 是一个面向 A 股/期货行情场景的 Python 封装库，参考 pytdx 生态提供统一 API、连接池、重试和并行抓取能力。部分请求组包与回包解析已按实盘抓包重新实现，并非对 `pytdx` 的直接二次封装或运行时依赖；归属说明见 `THIRD_PARTY_NOTICES.md`。
 
 - **名称**：`zsdtdx`
-- **版本**：`2.0.1`（同时定义在 `pyproject.toml` 与 `src/zsdtdx/__init__.py`）
+- **版本**：`2.0.2`（同时定义在 `pyproject.toml` 与 `src/zsdtdx/__init__.py`）
 - **许可证**：MIT（见 `LICENSE`）
 - **Python 要求**：`>=3.10`
 - **核心依赖**：`numpy`、`pandas`、`PyYAML`、`six`、`psutil`
@@ -134,6 +134,7 @@ with get_client():
 
 - `get_supported_markets`
 - `get_stock_code_name`
+- `get_etf_code_name`
 - `get_all_future_list`
 - `get_future_kline`
 - `get_company_info`

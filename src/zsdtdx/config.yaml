@@ -180,7 +180,7 @@ parallel:
   # 自动预热时是否要求所有 worker 都完成预热。
   # 取值: true/false
   # 影响: true 时只要有 worker 预热不足会直接失败并抛错。
-  auto_prewarm_require_all_workers: true
+  auto_prewarm_require_all_workers: false
   # 自动预热总超时（秒）。
   # 取值: 正浮点数
   # 影响: 控制 async 自动预热最多等待时长。
@@ -268,6 +268,14 @@ market_rules:
     - "大连商品"
     - "上海期货"
     - "广州期货"
+  # 场内 ETF/LOF 名称二次剔除子串（去空白后命中任一即丢弃）。
+  # 作用对象: get_etf_code_name；初筛子串 etf/lof 写死在代码中（大小写不敏感）。
+  etf_name_drop_substr:
+    - "债"
+    - "货币"
+    - "增强"
+    - "红利"
+    - "现金流"
 
 stock_scope:
   # 当股票接口不传 codes（即 codes=None）时，默认抓取范围。

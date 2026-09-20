@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v2.0.2 - 2026-09-20
+
+### Summary
+1. 新增 `get_etf_code_name`：从标准行情深/沪码表按名称过滤场内 ETF/LOF（语境含两者），返回 `sz.`/`sh.` 前缀字典；不改动 `get_stock_code_name` 与其它股票宇宙。
+2. 配置：`market_rules.etf_name_drop_substr`（默认债/货币/增强/红利/现金流）；名称初筛 etf/lof 写死在代码中。
+3. 版本号：`pyproject.toml` 与 `__init__.__version__` 对齐为 `2.0.2`。
+
 ## v2.0.1 - 2026-09-20
 
 ### Summary

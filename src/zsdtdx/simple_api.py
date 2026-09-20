@@ -398,6 +398,40 @@ def get_stock_code_name(use_cache: bool = True) -> Dict[str, str]:
     )
 
 
+def get_etf_code_name(use_cache: bool = True) -> Dict[str, str]:
+    """获取场内 ETF/LOF（本语境统称 etf）代码名称字典。
+
+    调用前置约定:
+    - 请先进入 `with get_client():`；
+      一个 with 块内可连续调用多个 `get_*` 函数。
+
+    输入:
+    - use_cache: 是否复用当日标准行情码表缓存；为 False 时强制刷新。
+      名称初筛固定为 etf/lof（代码写死，大小写不敏感）；剔除见
+      `config.yaml.market_rules.etf_name_drop_substr`（默认债/货币等）。
+
+    输出:
+    - 返回 `Dict[str, str]`：key 为 `sz.`/`sh.` 前缀代码，value 为名称；
+      仅来自 std 深/沪码表，不扩宽 `get_stock_code_name` 口径。
+
+    调用示例:
+    ```python
+    with get_client():
+        etf_map = get_etf_code_name()
+    ```
+
+    返回示例:
+    ```json
+    {"sz.159915": "创业板ETF", "sh.510300": "沪深300ETF"}
+    ```
+    """
+    return _call_with_client(
+        lambda client: client.get_etf_code_name_map(use_cache=use_cache),
+        get_active_context_client=UnifiedTdxClient.get_active_context_client,
+        build_client=lambda: get_client(),
+    )
+
+
 def get_all_future_list(return_df: Optional[bool] = None, use_cache: bool = True):
     """获取统一商品期货列表（郑州/大连/上海/广州）。
 
@@ -1049,7 +1083,6 @@ def get_company_info(
     )
 
 
-
 def get_stock_latest_price(codes: Optional[Any] = None) -> Dict[str, Optional[float]]:
     """获取股票实时最新价字典。
 
@@ -1190,6 +1223,7 @@ __all__ = [
     "get_client",
     "get_supported_markets",
     "get_stock_code_name",
+    "get_etf_code_name",
     "get_all_future_list",
     "get_stock_kline",
     "get_index_kline",
