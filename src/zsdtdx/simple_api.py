@@ -899,7 +899,7 @@ def get_future_kline(
     并行模式说明:
     - 入口策略: 进程数 > 1 时默认并行；进程数不足时自动串行
     - 进程数: 自动计算 = int(CPU物理核心数 × process_count_core_multiplier)，至少2个进程
-      （`process_count_core_multiplier` 位于 `config.yaml.parallel`，默认 1.5）
+      （`process_count_core_multiplier` 位于 `config.yaml.parallel`，默认 1）
     - 全局进程池: 首次并行调用时创建（约2-3秒开销），后续调用复用，程序退出时统一关闭
     - 建议分批: 100个期货×5周期=500任务/批
 

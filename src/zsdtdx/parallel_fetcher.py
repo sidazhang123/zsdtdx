@@ -2690,10 +2690,10 @@ class ParallelKlineFetcher:
         )
         self.process_count_core_multiplier = self._safe_float_config(
             parallel_cfg.get("process_count_core_multiplier"),
-            default=1.5,
+            default=1.0,
             minimum=0.1,
         )
-        # 自动计算进程数：CPU物理核心数 * 配置倍率（默认 1.5）
+        # 自动计算进程数：CPU物理核心数 * 配置倍率（默认 1）
         self.num_processes = get_optimal_process_count(
             core_multiplier=self.process_count_core_multiplier
         )

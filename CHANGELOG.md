@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v2.0.3 - 2026-09-20
+
+### Summary
+1. 默认并行进程倍率 `parallel.process_count_core_multiplier` 由 5 调整为 1，降低默认进程池规模与行情站并发压力。
+2. 版本号：`pyproject.toml` 与 `__init__.__version__` 对齐为 `2.0.3`。
+
 ## v2.0.2 - 2026-09-20
 
 ### Summary

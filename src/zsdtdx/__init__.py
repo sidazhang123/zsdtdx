@@ -24,7 +24,7 @@ from zsdtdx.simple_api import (
 from zsdtdx.parallel_fetcher import StockKlineJob
 from zsdtdx.unified_client import UnifiedTdxClient
 
-__version__ = "2.0.2"
+__version__ = "2.0.3"
 
 __all__ = [
     "__version__",

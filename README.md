@@ -743,7 +743,7 @@ parallel:
   # 并行进程数倍率：推荐进程数 = max(2, int(物理核心数 * 该倍率))。
   # 取值: 正浮点数（建议 0.5~3.0）
   # 影响: 倍率越大并发越高，吞吐可能提升，但 CPU/内存占用也会上升。
-  process_count_core_multiplier: 5
+  process_count_core_multiplier: 1
   # [DEPRECATED-E5] 以下 4 项仅用于尚未迁移的 get_future_kline → ParallelKlineFetcher.fetch_stock
   # → _fetch_parallel DataFrame 批处理路径；该路径预计在后续 release 中迁移到 task/chunk/bundle 链路，
   # 届时本组配置将整体删除。新工程不要在 task 链路上读取这些字段。
