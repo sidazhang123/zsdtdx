@@ -84,7 +84,7 @@ def test_filter_stock_df_by_scopes_equivalent_to_apply():
     scopes = {"szsh", "bj"}
 
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
-    client.market_rules = {"include_hk_market_names": ["香港主板"]}
+    client.market_rules = {}
     client._ex_market_name_map = {}
 
     legacy_mask = df.apply(

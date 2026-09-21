@@ -33,12 +33,15 @@ from zsdtdx.exhq import TdxExHq_API
 from zsdtdx.hq import TdxHq_API
 from zsdtdx.params import TDXParams
 from zsdtdx.catalog_disk_cache import (
+    KIND_ETF,
     KIND_EX,
     KIND_STD,
     catalog_cache_file_path,
     load_catalog_cache,
+    load_etf_catalog_cache,
     resolve_catalog_cache_dir,
     save_catalog_cache,
+    save_etf_catalog_cache,
 )
 from zsdtdx.helper import parse_future_symbol
 from zsdtdx.log import log
@@ -1337,6 +1340,8 @@ class UnifiedTdxClient:
         "m": "m",
     }
     STOCK_SCOPE_TOKENS = {"szsh", "bj", "hk"}
+    # 港股只认扩展行情「港股通」（抓包 0x2422 市场 71）；不含香港主板/创业板。
+    HK_EX_MARKET_NAME = "港股通"
     _CONTEXT_STACK: List["UnifiedTdxClient"] = []
 
     def __init__(
@@ -1376,6 +1381,9 @@ class UnifiedTdxClient:
         self._ex_catalog_records: Optional[List[Dict[str, Any]]] = None
         self._std_catalog_date = ""
         self._ex_catalog_date = ""
+        self._etf_name_records: Optional[List[Dict[str, Any]]] = None
+        self._etf_name_date = ""
+        self._etf_board_records: Optional[List[Dict[str, Any]]] = None
         if (
             self._catalog_cache_enabled
             and self._catalog_cache_refresh_granularity == "day"
@@ -1794,15 +1802,18 @@ class UnifiedTdxClient:
         return self._ex_market_name_map.get(int(market), "")
 
     def _is_hk_market_ex_no_df(self, market: int) -> bool:
-        """输入扩展市场号，输出是否港股市场；用于无 DataFrame 路径；未配置时按默认香港主板。"""
-        target_market_names = set(
-            self.market_rules.get("include_hk_market_names", ["香港主板"])
-        )
-        market_name = self._get_ex_market_name_no_df(int(market))
-        return market_name in target_market_names
+        """
+        输入扩展市场号，输出是否港股通市场。
+
+        输入：扩展行情 market。
+        输出：True 表示该市场名为「港股通」。
+        用途：无 DataFrame 路径的港股识别。
+        边界：名称写死为港股通；香港主板不纳入。
+        """
+        return self._get_ex_market_name_no_df(int(market)) == self.HK_EX_MARKET_NAME
 
     def _is_hk_stock_ex_no_df(self, market: int, code: str) -> bool:
-        """输入扩展市场与代码，输出是否港股；用于无 DataFrame 路由；固定按5位数字过滤。"""
+        """输入扩展市场与代码，输出是否港股通标的；用于无 DataFrame 路由；固定按5位数字过滤。"""
         if not self._is_hk_market_ex_no_df(int(market)):
             return False
         raw_code = str(code).strip()
@@ -3243,16 +3254,16 @@ class UnifiedTdxClient:
         )
         return any(str(token) in compact for token in tokens if str(token))
 
-    def _is_etf_std_candidate(self, market: int, code: str, name: str) -> bool:
+    def _is_etf_name_candidate(self, market: int, code: str, name: str) -> bool:
         """
-        输入标准市场、代码与名称，输出是否纳入场内 ETF/LOF 码表。
+        输入市场、代码与名称，输出是否纳入场内 ETF/LOF 码表。
 
         输入：
         1. market: 0 深圳 / 1 上海。
-        2. code/name: 码表代码与名称。
+        2. code/name: 远程名称文件中的代码与名称。
         输出：True 表示保留。
-        用途：仅从 std 深/沪按名称过滤场内 etf（含 LOF）。
-        边界：排除 399*；不做 ex 补全。
+        用途：名称文件中未列入板块的额外代码，按 etf/lof 子串初筛。
+        边界：板块成分不走本函数；排除 399* 与 drop 子串。
         """
         raw_code = str(code or "").strip()
         if int(market) not in (0, 1):
@@ -3268,15 +3279,18 @@ class UnifiedTdxClient:
         return True
 
     def _is_hk_market_ex(self, market: int) -> bool:
-        """输入扩展市场号，输出是否港股市场；用于港股识别；未配置市场名则默认仅香港主板。"""
-        target_market_names = set(
-            self.market_rules.get("include_hk_market_names", ["香港主板"])
-        )
-        market_name = self._get_ex_market_name(int(market))
-        return market_name in target_market_names
+        """
+        输入扩展市场号，输出是否港股通市场。
+
+        输入：扩展行情 market。
+        输出：True 表示该市场名为「港股通」。
+        用途：股票清单、前缀与 scope=hk 的港股识别。
+        边界：名称写死为港股通；香港主板不纳入。
+        """
+        return self._get_ex_market_name(int(market)) == self.HK_EX_MARKET_NAME
 
     def _is_hk_stock_ex(self, market: int, code: str) -> bool:
-        """输入扩展市场与代码，输出是否港股；用于股票路由；固定按5位数字代码过滤。"""
+        """输入扩展市场与代码，输出是否港股通标的；用于股票路由；固定按5位数字过滤。"""
         if not self._is_hk_market_ex(int(market)):
             return False
         raw_code = str(code).strip()
@@ -4205,29 +4219,356 @@ class UnifiedTdxClient:
             result[prefixed_code] = str(rec.get("name", "")).strip()
         return result
 
+    def _named_hq_file_chunk_size(self) -> int:
+        """输入：无。输出：命名文件单页字节。用途：0x06B9 翻页。边界：非法时回退 30000。"""
+        try:
+            size = int(self.pagination.get("named_file_chunk_size", 30000))
+        except Exception:
+            size = 30000
+        return size if size > 0 else 30000
+
+    def _download_named_hq_file(self, filename: str) -> bytes:
+        """
+        输入远程文件名，输出完整文件 bytes。
+
+        输入：
+        1. filename: 如 `infoharbor_ex.name`。
+        输出：
+        1. 内存拼接后的原文；失败为空 bytes。
+        用途：
+        1. 走 `TdxHq_API.get_report_file_by_size`（0x02C5 元数据 + 0x06B9 分页）。
+        边界条件：
+        1. 不读银河安装目录；调用失败返回空。
+        """
+        name = str(filename or "").strip()
+        if not name:
+            return b""
+        try:
+            raw = self.std_pool.call(
+                "get_report_file_by_size",
+                name,
+                0,
+                None,
+                self._named_hq_file_chunk_size(),
+                allow_none=True,
+            )
+        except Exception:
+            return b""
+        if not raw:
+            return b""
+        return bytes(raw)
+
+    def _etf_board_remote_files(self) -> List[str]:
+        """输入：无。输出：配置的板块远程路径列表。用途：下载与校验。边界：去掉空串。"""
+        items = self.market_rules.get("etf_board_remote_files") or [
+            "spec/specetfdata.txt",
+            "spec/speclofdata.txt",
+        ]
+        out: List[str] = []
+        seen: set[str] = set()
+        for item in items:
+            name = str(item or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+        return out
+
+    def _etf_catalog_records_ok(
+        self,
+        name_records: Optional[List[Dict[str, Any]]],
+        board_records: Optional[List[Dict[str, Any]]],
+    ) -> bool:
+        """
+        输入名称与板块列表，输出是否可作为当日快照。
+
+        输入：解析后的两份记录。
+        输出：True 表示两侧均非空且字段合法。
+        用途：内存命中、落盘前与磁盘加载后的统一校验。
+        边界：空列表视为失败，避免把下载失败缓存成当天成功。
+        """
+        if not isinstance(name_records, list) or not name_records:
+            return False
+        if not isinstance(board_records, list) or not board_records:
+            return False
+        for item in name_records:
+            if not isinstance(item, dict):
+                return False
+            code = str(item.get("code", "")).strip()
+            if not code:
+                return False
+            try:
+                int(item.get("market", -1))
+            except Exception:
+                return False
+        for item in board_records:
+            if not isinstance(item, dict):
+                return False
+            code = str(item.get("code", "")).strip()
+            if len(code) != 6 or not code.isdigit():
+                return False
+            try:
+                market = int(item.get("market", -1))
+            except Exception:
+                return False
+            if market not in (0, 1):
+                return False
+        return True
+
+    def _clear_etf_name_catalog(self) -> None:
+        """输入：无。输出：无。用途：下载失败时丢掉半成品，迫使下次重试。边界：不删磁盘文件。"""
+        self._etf_name_records = None
+        self._etf_board_records = None
+        self._etf_name_date = ""
+
+    def _etf_memory_fresh(self) -> bool:
+        """输入：无。输出：内存 ETF 快照是否为当日且通过校验。"""
+        return (
+            self._etf_name_date == self._today_catalog_cache_date()
+            and self._etf_catalog_records_ok(
+                self._etf_name_records, self._etf_board_records
+            )
+        )
+
+    def _persist_etf_catalog(self) -> None:
+        """输入：无。输出：无。用途：把当日 ETF 名称/板块写入磁盘。边界：未启用或校验失败则跳过。"""
+        if (
+            not bool(getattr(self, "_catalog_cache_enabled", False))
+            or getattr(self, "_catalog_cache_dir", None) is None
+            or not self._etf_catalog_records_ok(
+                self._etf_name_records, self._etf_board_records
+            )
+        ):
+            return
+        try:
+            save_etf_catalog_cache(
+                catalog_cache_file_path(self._catalog_cache_dir, KIND_ETF),
+                cache_date=self._today_catalog_cache_date(),
+                name_records=list(self._etf_name_records or []),
+                board_records=list(self._etf_board_records or []),
+            )
+        except Exception:
+            self._catalog_cache_enabled = False
+
+    def _try_load_etf_catalog_from_disk(self) -> bool:
+        """输入：无。输出：是否命中当日磁盘 ETF 缓存并回填内存。"""
+        if (
+            not bool(getattr(self, "_catalog_cache_enabled", False))
+            or getattr(self, "_catalog_cache_dir", None) is None
+        ):
+            return False
+        loaded = load_etf_catalog_cache(
+            catalog_cache_file_path(self._catalog_cache_dir, KIND_ETF),
+            expected_cache_date=self._today_catalog_cache_date(),
+        )
+        if loaded is None:
+            return False
+        cache_date, names, boards = loaded
+        if not self._etf_catalog_records_ok(names, boards):
+            return False
+        self._etf_name_records = names
+        self._etf_board_records = boards
+        self._etf_name_date = cache_date
+        return True
+
+    def _parse_infoharbor_name_file(self, raw: bytes) -> List[Dict[str, Any]]:
+        """
+        输入命名文件原文，输出 market/code/name 记录。
+
+        输入：
+        1. raw: `infoharbor_ex.name` 全文 bytes。
+        输出：
+        1. list[dict]，字段 market/code/name。
+        用途：
+        1. 解析 `市场|代码|名称` 行。
+        边界条件：
+        1. 列不足 3 或代码为空则跳过；GBK 严格失败时 ignore。
+        """
+        text, _status = self._decode_company_info_bytes(bytes(raw or b""))
+        records: List[Dict[str, Any]] = []
+        for line in str(text or "").splitlines():
+            parts = line.split("|")
+            if len(parts) < 3:
+                continue
+            code = str(parts[1] or "").strip()
+            if not code:
+                continue
+            try:
+                market = int(str(parts[0]).strip())
+            except Exception:
+                continue
+            name = str(parts[2] or "").strip()
+            records.append({"market": market, "code": code, "name": name})
+        return records
+
+    def _parse_etf_board_file(self, raw: bytes) -> List[Dict[str, Any]]:
+        """
+        输入板块成分原文，输出 market/code。
+
+        输入：
+        1. raw: `spec/specetfdata.txt` / `spec/speclofdata.txt` 全文。
+        输出：
+        1. list[dict]，字段 market/code。
+        用途：
+        1. 对齐客户端 ETF/LOF 板块成分。
+        边界条件：
+        1. 首列市场 0/1，次列为 6 位代码；其余列忽略。
+        """
+        text, _status = self._decode_company_info_bytes(bytes(raw or b""))
+        records: List[Dict[str, Any]] = []
+        for line in str(text or "").splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 2:
+                continue
+            code = parts[1]
+            if len(code) != 6 or not code.isdigit():
+                continue
+            try:
+                market = int(parts[0])
+            except Exception:
+                continue
+            if market not in (0, 1):
+                continue
+            records.append({"market": market, "code": code})
+        return records
+
+    def _etf_std_name_lookup(self) -> Dict[Tuple[int, str], str]:
+        """
+        输入：无。输出：(market,code)->std 16 字节 GBK 名称。用途：板块成分缺 infoharbor 名时回退。边界：未拉码表则空。
+        """
+        out: Dict[Tuple[int, str], str] = {}
+        for item in self._std_catalog_records or []:
+            code = str(item.get("code", "")).strip()
+            if not code:
+                continue
+            try:
+                market = int(item.get("market", -1))
+            except Exception:
+                continue
+            name = str(item.get("name", "")).strip()
+            if name:
+                out[(market, code)] = name
+        return out
+
+    def _ensure_etf_name_catalog(self, refresh: bool = False) -> None:
+        """
+        输入刷新开关，输出无。
+
+        输入：
+        1. refresh: True 时忽略内存与当日磁盘快照，重新下载。
+        输出：
+        1. 无；成功后 `_etf_name_records` / `_etf_board_records` 非空。
+        用途：
+        1. 先复用当日磁盘/内存，没有才冷启动下载命名文件。
+        边界条件：
+        1. 名称或任一块配置板块文件解析为空则不落盘、不把空列表当成当天成功。
+        2. 不读银河安装目录。
+        """
+        if (not bool(refresh)) and self._etf_memory_fresh():
+            return
+        if (not bool(refresh)) and self._try_load_etf_catalog_from_disk():
+            return
+        filename = (
+            str(
+                self.market_rules.get("etf_name_remote_file") or "infoharbor_ex.name"
+            ).strip()
+            or "infoharbor_ex.name"
+        )
+        board_files = self._etf_board_remote_files()
+        if not board_files:
+            self._clear_etf_name_catalog()
+            return
+        raw_names = self._download_named_hq_file(filename)
+        names = self._parse_infoharbor_name_file(raw_names)
+        boards: List[Dict[str, Any]] = []
+        seen: set[Tuple[int, str]] = set()
+        boards_ok = True
+        for board_name in board_files:
+            raw_board = self._download_named_hq_file(board_name)
+            parsed = self._parse_etf_board_file(raw_board)
+            if not parsed:
+                boards_ok = False
+                break
+            for rec in parsed:
+                key = (int(rec["market"]), str(rec["code"]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                boards.append(rec)
+        if (not boards_ok) or (not self._etf_catalog_records_ok(names, boards)):
+            self._clear_etf_name_catalog()
+            return
+        self._etf_name_records = names
+        self._etf_board_records = boards
+        self._etf_name_date = self._today_catalog_cache_date()
+        self._persist_etf_catalog()
+
     def get_etf_code_name_map(self, use_cache: bool = True) -> Dict[str, str]:
         """
         输入缓存开关，输出场内 ETF/LOF（语境含两者）带前缀代码名称字典。
 
         输入：
-        1. use_cache: True 时复用当日 std 码表缓存；False 强制刷新。
+        1. use_cache: True 时复用当日磁盘/内存快照；False 强制重新下载命名文件。
         输出：
         1. `Dict[str, str]`，键为 `sz.`/`sh.` 前缀代码。
         用途：
         1. 独立于 `get_stock_code_name_map`，不扩宽 A 股宇宙。
         边界条件：
-        1. 仅扫 std market 0/1；排除 399*；初筛写死 etf/lof；drop 见 market_rules；同码先出现优先。
+        1. 成分来自 `spec/specetfdata.txt`/`spec/speclofdata.txt`（板块跳过 etf/lof 初筛），
+           名称优先 `infoharbor_ex.name`，缺名才回退 std 码表 16 字节 GBK；
+           名称文件中额外命中 etf/lof 的代码一并纳入；排除 399*；drop 见 market_rules；
+           同码先出现优先；命名文件与 std 码表均按 `catalog_cache` 自然日落盘。
         """
-        self.ensure_code_catalog(need_std=True, refresh=not bool(use_cache))
-        result: Dict[str, str] = {}
-        for item in self._std_catalog_records or []:
+        self._ensure_etf_name_catalog(refresh=not bool(use_cache))
+        name_by_key: Dict[Tuple[int, str], str] = {}
+        for item in self._etf_name_records or []:
             code = str(item.get("code", "")).strip()
-            name = str(item.get("name", "")).strip()
             try:
                 market = int(item.get("market", -1))
             except Exception:
-                market = -1
-            if not self._is_etf_std_candidate(market, code, name):
+                continue
+            name = str(item.get("name", "")).strip()
+            if code and name:
+                name_by_key[(market, code)] = name
+        keys: List[Tuple[int, str, bool]] = []
+        seen: set[Tuple[int, str]] = set()
+        need_std_fallback = False
+        for rec in self._etf_board_records or []:
+            key = (int(rec["market"]), str(rec["code"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            keys.append((key[0], key[1], True))
+            if key not in name_by_key:
+                need_std_fallback = True
+        for item in self._etf_name_records or []:
+            code = str(item.get("code", "")).strip()
+            try:
+                market = int(item.get("market", -1))
+            except Exception:
+                continue
+            key = (market, code)
+            if key in seen:
+                continue
+            seen.add(key)
+            keys.append((market, code, False))
+        std_names: Dict[Tuple[int, str], str] = {}
+        if need_std_fallback:
+            self.ensure_code_catalog(need_std=True, refresh=False)
+            std_names = self._etf_std_name_lookup()
+        result: Dict[str, str] = {}
+        for market, code, from_board in keys:
+            name = name_by_key.get((market, code)) or std_names.get((market, code), "")
+            if from_board:
+                if int(market) not in (0, 1):
+                    continue
+                if len(code) != 6 or not code.isdigit() or code.startswith("399"):
+                    continue
+                if self._etf_name_dropped(name):
+                    continue
+                if not name:
+                    continue
+            elif not self._is_etf_name_candidate(market, code, name):
                 continue
             try:
                 prefixed = self._stock_code_with_prefix(

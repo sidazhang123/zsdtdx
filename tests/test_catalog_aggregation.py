@@ -14,7 +14,6 @@ def _catalog_client() -> UnifiedTdxClient:
     client.output_cfg = {"return_df_default": False}
     client.market_rules = {
         "include_beijing_prefixes": ["92"],
-        "include_hk_market_names": ["香港主板"],
         "stock_prefix_sz": ["000", "001", "002", "003", "300"],
         "stock_prefix_sh": ["600", "601", "603", "605"],
         "future_market_names": ["上海期货", "大连商品"],
@@ -26,6 +25,7 @@ def _catalog_client() -> UnifiedTdxClient:
         31: "香港主板",
         47: "中金所期货",
         62: "中证指数",
+        71: "港股通",
     }
     client._catalog_cache_enabled = False
     client._catalog_cache_dir = None
@@ -40,6 +40,7 @@ def _catalog_client() -> UnifiedTdxClient:
     client._future_df = None
     client._future_route = {}
     client._future_zhulian_by_variety = {}
+    client.stock_scope_defaults = {}
     client.std_pool = MagicMock()
     client.ex_pool = MagicMock()
     return client
@@ -87,6 +88,8 @@ def test_stock_and_future_filter_at_use_not_download():
         {"market": 30, "code": "CUL8", "name": "沪铜主连"},
         {"market": 47, "code": "IFL8", "name": "沪深主连"},
         {"market": 31, "code": "00700", "name": "腾讯控股"},
+        {"market": 71, "code": "00700", "name": "腾讯控股"},
+        {"market": 71, "code": "SHGGT", "name": "沪港通"},
         {"market": 62, "code": "000905", "name": "中证500"},
     ]
 
@@ -160,3 +163,36 @@ def test_catalog_disk_hit_skips_download(tmp_path):
     other.ensure_code_catalog(need_std=True, need_ex=True)
     assert other._std_catalog_records[0]["code"] == "600000"
     assert other._ex_catalog_records[0]["code"] == "CUL8"
+
+
+def test_stock_list_keeps_hk_connect_not_main_board():
+    """输入：香港主板与港股通同码、港股通占位码；输出：仅港股通五位代码入股票清单。"""
+    client = _catalog_client()
+    client._download_std_security_catalog = lambda: [
+        {"market": 1, "code": "600000", "name": "浦发银行"},
+    ]
+    client._download_ex_instrument_catalog = lambda: [
+        {"market": 31, "code": "00700", "name": "腾讯控股"},
+        {"market": 71, "code": "00700", "name": "腾讯控股"},
+        {"market": 71, "code": "02800", "name": "盈富基金"},
+        {"market": 71, "code": "SHGGT", "name": "沪港通"},
+        {"market": 48, "code": "08328", "name": "信义储电"},
+    ]
+    client.stock_scope_defaults = {"get_stock_code_name": ["szsh", "hk"]}
+    stocks = client.get_all_stock_list(return_df=False, refresh=True)
+    by_code = {row["code"]: row for row in stocks}
+    assert set(by_code) == {"600000", "00700", "02800"}
+    assert by_code["00700"]["market"] == 71
+    assert by_code["00700"]["market_name"] == "港股通"
+    assert client._stock_code_with_prefix("ex", 71, "00700") == "hk.00700"
+    assert client._is_hk_stock_ex(31, "00700") is False
+    assert client._is_hk_stock_ex(71, "SHGGT") is False
+    assert client._is_hk_stock_ex(71, "0700") is False
+    assert client._is_hk_stock_ex(71, "000700") is False
+    assert client._route_scope({"source": "ex", "market": 71, "code": "00700"}) == "hk"
+    assert client._route_scope({"source": "ex", "market": 31, "code": "00700"}) is None
+    names = client.get_stock_code_name_map(use_cache=True)
+    assert "hk.00700" in names
+    assert names["hk.00700"] == "腾讯控股"
+    assert "hk.02800" in names
+    assert "hk.SHGGT" not in names

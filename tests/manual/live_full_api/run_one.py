@@ -230,7 +230,7 @@ def round_get_supported_markets() -> Dict[str, Any]:
         rows = get_supported_markets(return_df=False)
     names = sorted({str(r.get("name", "")) for r in rows})
     sources = sorted({str(r.get("source", "")) for r in rows})
-    need = {"深圳", "上海", "北京", "香港主板", "上海期货"}
+    need = {"深圳", "上海", "北京", "港股通", "上海期货"}
     missing = sorted(need - set(names))
     if missing:
         raise RuntimeError(f"市场名缺失: {missing}")
@@ -418,7 +418,7 @@ def round_kline_hk() -> Dict[str, Any]:
         rows = client.get_all_stock_list(return_df=False)
     codes = [str(r["code"]).strip() for r in rows if str(r.get("source")) == "ex"]
     if len(codes) < 1000:
-        raise RuntimeError(f"港股代码过少: {len(codes)}，检查 include_hk_market_names")
+        raise RuntimeError(f"港股通代码过少: {len(codes)}")
     return _run_stock_kline(codes, "hk")
 
 

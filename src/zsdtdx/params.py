@@ -55,5 +55,5 @@ class TDXParams:
     MAX_EXTENDED_KLINE_COUNT = 700
     # 标准行情码表 0x044D 单页条数
     MAX_SECURITY_LIST_COUNT = 1600
-    # 标准行情码表单条记录字节数
+    # 标准行情码表单条 37 字节（名称字段 16 字节 GBK）
     SECURITY_LIST_RECORD_SIZE = 37

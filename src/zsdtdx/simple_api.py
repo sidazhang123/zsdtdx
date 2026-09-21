@@ -378,10 +378,11 @@ def get_stock_code_name(use_cache: bool = True) -> Dict[str, str]:
     - use_cache: 是否使用股票缓存；为 False 时强制刷新股票缓存。
       本函数属于全量代码接口，返回范围由
       `config.yaml.stock_scope.defaults_when_codes_none.get_stock_code_name` 控制（默认 `szsh`）。
+      `hk` 范围为扩展行情港股通（五位代码），不含香港主板。
 
     输出:
     - 返回 `Dict[str, str]`：key 为带市场前缀的股票代码（`sh./sz./bj./hk.`），
-      value 为股票名称；不返回纯数字代码。
+      value 为股票名称；`hk.` 为港股通标的；不返回纯数字代码。
 
     调用示例:
     ```python
@@ -409,13 +410,18 @@ def get_etf_code_name(use_cache: bool = True) -> Dict[str, str]:
       一个 with 块内可连续调用多个 `get_*` 函数。
 
     输入:
-    - use_cache: 是否复用当日标准行情码表缓存；为 False 时强制刷新。
-      名称初筛固定为 etf/lof（代码写死，大小写不敏感）；剔除见
+    - use_cache: True 时复用当日磁盘/内存快照（`catalog_cache` 的
+      `etf_code_name.pkl`）；False 时强制重新下载命名文件。
+      成分来自 `spec/specetfdata.txt`/`spec/speclofdata.txt`，板块不要求名称含
+      etf/lof；名称优先 `infoharbor_ex.name`，缺名回退 `0x044D` 16 字节 GBK。
+      名称文件中额外命中 etf/lof 的代码一并纳入；剔除见
       `config.yaml.market_rules.etf_name_drop_substr`（默认债/货币等）。
+      内存解压拼接，不读银河安装目录。仅当本地没有当日缓存时才冷启动下载。
+      名称或任一块板块文件解析为空则不写盘、不把空列表当成当天成功。
 
     输出:
-    - 返回 `Dict[str, str]`：key 为 `sz.`/`sh.` 前缀代码，value 为名称；
-      仅来自 std 深/沪码表，不扩宽 `get_stock_code_name` 口径。
+    - 返回 `Dict[str, str]`：key 为 `sz.`/`sh.` 前缀代码，value 为名称
+      （infoharbor 完整名，否则 16 字节回退名）；不扩宽 `get_stock_code_name` 口径。
 
     调用示例:
     ```python
@@ -425,7 +431,7 @@ def get_etf_code_name(use_cache: bool = True) -> Dict[str, str]:
 
     返回示例:
     ```json
-    {"sz.159915": "创业板ETF", "sh.510300": "沪深300ETF"}
+    {"sz.159915": "创业板ETF易方达", "sh.510050": "上证50ETF华夏", "sz.159105": "恒生生物科技ETF易方达"}
     ```
     """
     return _call_with_client(

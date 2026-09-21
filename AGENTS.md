@@ -7,7 +7,7 @@
 `zsdtdx` 是一个面向 A 股/期货行情场景的 Python 封装库，参考 pytdx 生态提供统一 API、连接池、重试和并行抓取能力。部分请求组包与回包解析已按实盘抓包重新实现，并非对 `pytdx` 的直接二次封装或运行时依赖；归属说明见 `THIRD_PARTY_NOTICES.md`。
 
 - **名称**：`zsdtdx`
-- **版本**：`2.0.3`（同时定义在 `pyproject.toml` 与 `src/zsdtdx/__init__.py`）
+- **版本**：`2.0.6`（同时定义在 `pyproject.toml` 与 `src/zsdtdx/__init__.py`）
 - **许可证**：MIT（见 `LICENSE`）
 - **Python 要求**：`>=3.10`
 - **核心依赖**：`numpy`、`pandas`、`PyYAML`、`six`、`psutil`
@@ -43,7 +43,7 @@
 │   ├── params.py               # 市场/K线类型等协议常量
 │   ├── errors.py               # 异常类型
 │   ├── log.py                  # 包级日志，受 TDX_DEBUG 环境变量控制
-│   ├── catalog_disk_cache.py       # 标准/扩展码表日级磁盘缓存
+│   ├── catalog_disk_cache.py       # 标准/扩展码表与 ETF/LOF 日级磁盘缓存
 │   ├── config.yaml             # 包内默认配置
 │   └── parser/                 # 通达信协议解析器集合
 │       ├── base.py
@@ -83,7 +83,7 @@ python -m build
 py -m pytest tests/ -q
 ```
 
-- 当前共有 110 个用例，全部离线可跑。
+- 当前共有 211 个用例，全部离线可跑。
 - `pyproject.toml` 已配置 `pythonpath = ["src"]`、`testpaths = ["tests"]`、`norecursedirs = ["manual", ...]`。
 - 不要修改 `tests/` 下现有用例的语义，除非修复接口变更导致的编译/调用错误。
 
@@ -135,7 +135,7 @@ with get_client():
 
 - `get_supported_markets`
 - `get_stock_code_name`
-- `get_etf_code_name`
+- `get_etf_code_name`（ETF+LOF 并集：`spec/specetfdata.txt` + `spec/speclofdata.txt`；名称 `infoharbor_ex.name`；当日 `etf_code_name.pkl`；空列表不落盘；不读银河安装目录；不扩宽 `get_stock_code_name`）
 - `get_all_future_list`
 - `get_future_kline`
 - `get_company_info`
@@ -226,7 +226,7 @@ K 线数据契约：
 ## 8. 安全与部署注意事项
 
 - 配置文件 `config.yaml` 可能包含真实行情服务器地址，不要提交含敏感内网地址的自定义配置。
-- 码表磁盘缓存使用 pickle，std / ex 分文件按自然日保存未过滤原文，加载时会校验格式版本、kind 与记录结构。
+- 码表磁盘缓存使用 pickle，std / ex / etf 分文件按自然日保存；ETF 为名称与板块成分，加载时校验格式版本、kind 与非空记录。
 - 包内默认 `config.yaml` 中的 host 为公网行情节点，通常可直接使用。
 - 发布新版本时同步更新三处版本号：
   1. `pyproject.toml` 中的 `version`
@@ -241,6 +241,7 @@ K 线数据契约：
 | 连接池/重试/TCP 探测 | `src/zsdtdx/unified_client.py` |
 | 异步并行调度 | `src/zsdtdx/parallel_fetcher.py` |
 | 协议解析字段/数值刻度 | `src/zsdtdx/helper.py` + `src/zsdtdx/parser/*.py` |
-| 码表磁盘缓存 | `src/zsdtdx/catalog_disk_cache.py` |
+| ETF 完整名称（0x02C5/0x06B9） | `src/zsdtdx/parser/get_report_file.py` + `unified_client.get_etf_code_name_map` |
+| 码表磁盘缓存 | `src/zsdtdx/catalog_disk_cache.py`（含 `etf_code_name.pkl`） |
 | 默认配置项 | `src/zsdtdx/config.yaml` + `README.md` 中的示例 |
 | 版本号 | `pyproject.toml`、`src/zsdtdx/__init__.py`、`CHANGELOG.md` |

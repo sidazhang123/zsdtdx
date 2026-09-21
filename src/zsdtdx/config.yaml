@@ -225,12 +225,16 @@ pagination:
   # 公司信息正文单页上限（字节）。服务端硬上限 30720；请求的 length 填剩余总字节。
   # 取值: 正整数
   company_info_chunk_size: 30720
+  # 标准行情命名文件（0x06B9）单页字节。服务端与官方客户端均为 30000。
+  # 取值: 正整数
+  named_file_chunk_size: 30000
   # K线最大分页次数上限，防止异常场景下无限循环。
   # 取值: 正整数
   max_kline_pages: 400
 
 catalog_cache:
-  # 标准/扩展码表磁盘缓存：按自然日分别保存未过滤原文，使用时再过滤。
+  # 标准/扩展码表与 ETF/LOF 名称板块的磁盘缓存：按自然日分文件保存，使用时再过滤。
+  # ETF 文件为 etf_code_name.pkl；当日已有则 get_etf_code_name 不再下载 0x02C5/0x06B9。
   enabled: true
   # 刷新粒度：day 表示当天首次下载，日内内存与磁盘复用。
   refresh_granularity: day
@@ -242,9 +246,6 @@ market_rules:
   # 北京股票代码前缀集合（标准行情 market=2）。
   include_beijing_prefixes:
     - "92"
-  # 识别港股市场使用的扩展市场名称集合（港股通股票均在香港主板，不含创业板）。
-  include_hk_market_names:
-    - "香港主板"
   # 深圳 A 股前缀集合（标准市场）。
   stock_prefix_sz:
     - "000"
@@ -268,8 +269,16 @@ market_rules:
     - "大连商品"
     - "上海期货"
     - "广州期货"
+  # 场内 ETF/LOF 远程完整名称文件（标准行情 0x02C5/0x06B9）。
+  # 作用对象: get_etf_code_name；当日结果写入 catalog_cache，不读银河安装目录。
+  etf_name_remote_file: "infoharbor_ex.name"
+  # ETF/LOF 板块成分文件（远程路径带 spec/ 前缀；逗号分隔，首列市场 0/1、次列代码）。
+  # 板块成分不要求名称含 etf/lof；任一份解析为空则整次下载作废、不写当日缓存。
+  etf_board_remote_files:
+    - "spec/specetfdata.txt"
+    - "spec/speclofdata.txt"
   # 场内 ETF/LOF 名称二次剔除子串（去空白后命中任一即丢弃）。
-  # 作用对象: get_etf_code_name；初筛子串 etf/lof 写死在代码中（大小写不敏感）。
+  # 作用对象: get_etf_code_name。etf/lof 初筛只用于名称文件中的额外代码，板块成分不走初筛。
   etf_name_drop_substr:
     - "债"
     - "货币"
@@ -284,7 +293,7 @@ stock_scope:
     # 取值支持:
     # - szsh: 标准市场（深圳+上海）
     # - bj:   北京股票（标准行情 market=2 且命中北京前缀）
-    # - hk:   港股（扩展市场名命中 include_hk_market_names）
+    # - hk:   港股通（扩展行情市场名「港股通」，五位数字代码；不含香港主板）
     #
     # 推荐写法（列表）:
     # get_stock_kline:
@@ -300,11 +309,11 @@ stock_scope:
     # 2) 非法值会被忽略；若全非法会回退为 szsh。
     # 3) 显式传入 codes 时，不受这里配置影响。
     get_stock_code_name:
-      - "szsh"
+      - "szsh+bj"
     get_stock_latest_price:
-      - "szsh"
+      - "szsh+bj"
     get_stock_kline:
-      - "szsh"
+      - "szsh+bj"
 
 output:
   # 默认返回 DataFrame 还是 list[dict]。

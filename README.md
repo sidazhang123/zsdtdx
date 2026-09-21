@@ -132,12 +132,12 @@ with get_client():
 
 **输入:**
 - use_cache: 是否使用股票缓存；默认值为True，置为 False 时强制刷新股票缓存。
-- 本函数属于全量代码接口，返回范围由配置文件的stock_scope控制,默认szsh市场（可增配bj、hk）。
+- 本函数属于全量代码接口，返回范围由配置文件的stock_scope控制,默认szsh市场（可增配bj、hk；hk 为港股通）。
 
 
 **输出:**
 - 返回 `Dict[str, str]`：key 为带市场前缀的股票代码（`sh./sz./bj./hk.`），
-  value 为股票名称；不返回纯数字代码。
+  value 为股票名称；`hk.` 为港股通标的；不返回纯数字代码。
 
 **调用示例:**
 ```python
@@ -154,17 +154,18 @@ with get_client():
 
 #### get_etf_code_name
 
-获取场内 ETF/LOF（本语境统称 etf）代码名称字典。从标准行情深/沪码表按名称过滤，不改动 `get_stock_code_name` 口径。
+获取场内 ETF/LOF（本语境统称 etf）代码名称字典。成分来自标准行情 `7709` 板块文件（默认 `spec/specetfdata.txt` / `spec/speclofdata.txt`），名称优先 `infoharbor_ex.name`，缺名回退标准码表 `0x044D` 的 16 字节 GBK 名称。当日快照写入 `catalog_cache` 的 `etf_code_name.pkl`，仅本地没有当日文件时才下载。不改动 `get_stock_code_name` 口径，不读银河安装目录。
 
 **调用前置约定:**
 - 请先进入 `with get_client():`；
 
 **输入:**
-- use_cache: 是否复用当日 std 码表缓存；为 False 时强制刷新标准行情码表。
-- 初筛固定为名称含 etf/lof（大小写不敏感，代码写死）；剔除子串见 `market_rules.etf_name_drop_substr`。
+- use_cache: True 复用当日磁盘/内存快照；False 强制重新下载命名文件。
+- 板块成分跳过 etf/lof 初筛，仍排除 `399*` 与 `etf_name_drop_substr`；名称文件中额外命中 etf/lof 的代码一并纳入。
+- 远程文件名见 `market_rules.etf_name_remote_file`、`market_rules.etf_board_remote_files`；单页长度见 `pagination.named_file_chunk_size`。
 
 **输出:**
-- 返回 `Dict[str, str]`：key 为 `sz.`/`sh.` 前缀代码，value 为名称；排除深指 `399*` 与名称命中剔除子串的品种。
+- 返回 `Dict[str, str]`：key 为 `sz.`/`sh.` 前缀代码，value 为名称（infoharbor 完整名或 16 字节回退名）；排除深指 `399*` 与名称命中剔除子串的品种。
 
 **调用示例:**
 ```python
@@ -176,7 +177,7 @@ with get_client():
 
 **返回示例:**
 ```json
-{"sz.159915": "创业板ETF", "sh.510300": "沪深300ETF"}
+{"sz.159915": "创业板ETF易方达", "sh.510050": "上证50ETF华夏", "sz.159105": "恒生生物科技ETF易方达"}
 ```
 
 #### get_all_future_list
@@ -852,12 +853,15 @@ pagination:
   # 公司信息正文单页上限（字节）。服务端硬上限 30720；请求的 length 填剩余总字节。
   # 取值: 正整数
   company_info_chunk_size: 30720
+  # 标准行情命名文件（0x06B9）单页字节。服务端与官方客户端均为 30000。
+  named_file_chunk_size: 30000
   # K线最大分页次数上限，防止异常场景下无限循环。
   # 取值: 正整数
   max_kline_pages: 400
 
 catalog_cache:
-  # 标准/扩展码表磁盘缓存：按自然日分别保存未过滤原文，使用时再过滤。
+  # 标准/扩展码表与 ETF/LOF 名称板块的磁盘缓存：按自然日分文件保存，使用时再过滤。
+  # ETF 文件为 etf_code_name.pkl；当日已有则 get_etf_code_name 不再下载 0x02C5/0x06B9。
   enabled: true
   # 刷新粒度：day 表示当天首次下载，日内内存与磁盘复用。
   refresh_granularity: day
@@ -869,9 +873,6 @@ market_rules:
   # 北京股票代码前缀集合（标准行情 market=2）。
   include_beijing_prefixes:
     - "92"
-  # 识别港股市场使用的扩展市场名称集合（港股通股票均在香港主板，不含创业板）。
-  include_hk_market_names:
-    - "香港主板"
   # 深圳 A 股前缀集合（标准市场）。
   stock_prefix_sz:
     - "000"
@@ -895,8 +896,16 @@ market_rules:
     - "大连商品"
     - "上海期货"
     - "广州期货"
+  # 场内 ETF/LOF 远程完整名称文件（标准行情 0x02C5/0x06B9）。
+  # 作用对象: get_etf_code_name；当日结果写入 catalog_cache，不读银河安装目录。
+  etf_name_remote_file: "infoharbor_ex.name"
+  # ETF/LOF 板块成分文件（远程路径带 spec/ 前缀；逗号分隔，首列市场 0/1、次列代码）。
+  # 板块成分不要求名称含 etf/lof；任一份解析为空则整次下载作废、不写当日缓存。
+  etf_board_remote_files:
+    - "spec/specetfdata.txt"
+    - "spec/speclofdata.txt"
   # 场内 ETF/LOF 名称二次剔除子串（去空白后命中任一即丢弃）。
-  # 作用对象: get_etf_code_name；初筛子串 etf/lof 写死在代码中（大小写不敏感）。
+  # 作用对象: get_etf_code_name。etf/lof 初筛只用于名称文件中的额外代码，板块成分不走初筛。
   etf_name_drop_substr:
     - "债"
     - "货币"
@@ -911,7 +920,7 @@ stock_scope:
     # 取值支持:
     # - szsh: 标准市场（深圳+上海）
     # - bj:   北京股票（标准行情 market=2 且命中北京前缀）
-    # - hk:   港股（扩展市场名命中 include_hk_market_names）
+    # - hk:   港股通（扩展行情市场名「港股通」，五位数字代码；不含香港主板）
     #
     # 推荐写法（列表）:
     # get_stock_kline:
@@ -966,7 +975,8 @@ index_kline:
 ```
 
 - `catalog_cache` 说明：
-  - 标准行情（深沪京 `get_security_list`）与扩展行情（`get_instrument_info`）分文件按自然日缓存未过滤码表。
+  - 标准行情（深沪京 `get_security_list`）、扩展行情（`get_instrument_info`）与 ETF/LOF 名称板块分文件按自然日缓存。
+  - ETF/LOF 缓存文件为 `etf_code_name.pkl`；`get_etf_code_name` 仅在本地没有当日文件时下载 `0x02C5/0x06B9`。
   - 股票 / 期货 / 指数在使用时从对应侧过滤；指数会同时确保 std 与 ex 当日缓存最新。
   - 默认缓存位置会自动选择用户可写目录（Windows: `LOCALAPPDATA`，Linux: `XDG_CACHE_HOME` 或 `~/.cache`）。
   - 若目标目录不可写，会自动回退到系统临时目录；仍不可写时自动禁用磁盘缓存，不影响主流程。

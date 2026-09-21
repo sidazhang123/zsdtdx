@@ -1,9 +1,27 @@
 # Changelog
 
-## Unreleased
+## v2.0.6 - 2026-09-21
 
 ### Summary
-1. 配置加载：用户 `set_config_path` / 客户端读 YAML 时，以包内默认 `config.yaml` 为底深合并；仅覆盖内置已有键，丢弃未知字段；列表整段替换。允许传入不完整自定义配置。
+1. 港股路由改为扩展行情「港股通」（`0x2422` 市场名写死，五位数字代码）；不再识别香港主板，去掉 `market_rules.include_hk_market_names`。
+2. `get_etf_code_name` 当日快照与 std/ex 码表一样走 `catalog_cache` 落盘（`etf_code_name.pkl`）；仅本地没有当日文件时才下载命名文件。名称或任一块板块文件为空则不写盘、不把空列表当成当天成功。
+3. 命名文件下载只走 `TdxHq_API.get_report_file_by_size`（0x02C5 + 0x06B9），去掉客户端内第二套翻页循环。
+4. 配置加载：用户 YAML 以包内默认为底深合并；仅覆盖内置已有键，丢弃未知字段；列表整段替换。
+5. 版本号：`pyproject.toml` 与 `__init__.__version__` 对齐为 `2.0.6`。
+
+## v2.0.5 - 2026-09-21
+
+### Summary
+1. 标准行情 `0x044D` 码表按银河抓包解析：37 字节记录中名称为 **16 字节 GBK**。`get_stock_code_name` 使用该 16 字节名；更长的场内基金全名只在 `get_etf_code_name` 经 `infoharbor_ex.name` 提供。
+2. 码表磁盘缓存 `format_version` 升至 2，版本不符的旧缓存直接丢弃。
+3. 版本号：`pyproject.toml` 与 `__init__.__version__` 对齐为 `2.0.5`。
+
+## v2.0.4 - 2026-09-21
+
+### Summary
+1. `get_etf_code_name` 改为标准行情 `7709` 拉取命名文件：`infoharbor_ex.name` 提供完整名，`spec/specetfdata.txt`/`spec/speclofdata.txt` 提供板块成分（0x02C5 元数据 + 0x06B9 分页，内存 zlib 解压）；缺名回退 std 码表。不读银河安装目录。
+2. 配置：`market_rules.etf_name_remote_file`、`market_rules.etf_board_remote_files`、`pagination.named_file_chunk_size`（默认 30000）。
+3. 版本号：`pyproject.toml` 与 `__init__.__version__` 对齐为 `2.0.4`。
 
 ## v2.0.3 - 2026-09-20
 

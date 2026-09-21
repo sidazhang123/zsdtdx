@@ -4430,8 +4430,7 @@ def _iter_company_info_chunk_results(
     category_workers = max(1, int(fetcher.company_info_category_workers))
     max_inflight = max(
         1,
-        int(fetcher.num_processes)
-        * int(fetcher.company_info_max_inflight_multiplier),
+        int(fetcher.num_processes) * int(fetcher.company_info_max_inflight_multiplier),
     )
 
     _emit_log(

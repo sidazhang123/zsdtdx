@@ -26,7 +26,7 @@ from zsdtdx.parser.get_history_minute_time_data import GetHistoryMinuteTimeData
 from zsdtdx.parser.get_history_transaction_data import GetHistoryTransactionData
 from zsdtdx.parser.get_index_bars import GetIndexBarsCmd
 from zsdtdx.parser.get_minute_time_data import GetMinuteTimeData
-from zsdtdx.parser.get_report_file import GetReportFile
+from zsdtdx.parser.get_report_file import GetReportFile, GetReportFileMeta
 from zsdtdx.parser.get_security_bars import GetSecurityBarsCmd
 from zsdtdx.parser.get_security_count import GetSecurityCountCmd
 from zsdtdx.parser.get_security_list import GetSecurityList
@@ -342,48 +342,86 @@ class TdxHq_API(BaseSocketClient):
         return cmd.call_api()
 
     @update_last_ack_time
-    def get_report_file(self, filename, offset):
+    def get_report_file_meta(self, filename):
         """
         输入：
-        1. filename: 输入参数，约束以协议定义与函数实现为准。
-        2. offset: 输入参数，约束以协议定义与函数实现为准。
+        1. filename: 远程文件名（如 `infoharbor_ex.name`）。
         输出：
-        1. 返回值语义由函数实现定义；无返回时为 `None`。
+        1. `{"filesize": int, "checksum": str}`；失败时为 `None`。
         用途：
-        1. 执行 `get_report_file` 对应的协议处理、数据解析或调用适配逻辑。
+        1. 发送 0x02C5，查询命名文件总字节。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 仅元数据；正文由 `get_report_file` 分页拉取。
         """
-        cmd = GetReportFile(self.client, lock=self.lock)
-        cmd.setParams(filename, offset)
+        cmd = GetReportFileMeta(self.client, lock=self.lock)
+        cmd.setParams(filename)
         return cmd.call_api()
 
-    def get_report_file_by_size(self, filename, filesize=0, reporthook=None):
+    @update_last_ack_time
+    def get_report_file(self, filename, offset, chunk_size=None):
         """
-        Download file from proxy server
+        输入：
+        1. filename: 远程文件名。
+        2. offset: 本页起始字节偏移。
+        3. chunk_size: 请求页长，默认 30000。
+        输出：
+        1. `{"chunksize": int, "chunkdata": bytes}`；失败时为 `None`。
+        用途：
+        1. 发送 0x06B9，拉取命名文件一页原文。
+        边界条件：
+        1. 仅单页；完整文件由调用方按 chunksize 累加 offset。
+        """
+        cmd = GetReportFile(self.client, lock=self.lock)
+        cmd.setParams(filename, offset, chunk_size)
+        return cmd.call_api()
 
-        :param filename the filename to download
-        :param filesize the filesize to download , if you do not known the actually filesize, leave this value 0
+    def get_report_file_by_size(
+        self, filename, filesize=0, reporthook=None, chunk_size=None
+    ):
+        """
+        输入：
+        1. filename: 远程文件名。
+        2. filesize: 已知总字节；0 时先发 0x02C5 查询。
+        3. reporthook: 可选进度回调 `(downloaded, filesize)`。
+        4. chunk_size: 单页请求长度，默认 30000。
+        输出：
+        1. 拼接后的文件 bytes。
+        用途：
+        1. 内存中分页下载命名文件，不落盘。
+        边界条件：
+        1. 元数据失败或连续空页则停止；不解压到银河安装目录。
         """
         filecontent = bytearray()
         current_downloaded_size = 0
         get_zero_length_package_times = 0
-        while current_downloaded_size < filesize or filesize == 0:
-            response = self.get_report_file(filename, current_downloaded_size)
+        total = int(filesize or 0)
+        if total <= 0:
+            meta = self.get_report_file_meta(filename)
+            if isinstance(meta, dict):
+                total = int(meta.get("filesize") or 0)
+        if total <= 0:
+            return filecontent
+        while current_downloaded_size < total:
+            response = self.get_report_file(
+                filename, current_downloaded_size, chunk_size
+            )
             if not response or not isinstance(response, dict):
                 break
-            if response["chunksize"] > 0:
-                current_downloaded_size = (
-                    current_downloaded_size + response["chunksize"]
-                )
-                filecontent.extend(response["chunkdata"])
+            try:
+                page_len = int(response.get("chunksize") or 0)
+            except Exception:
+                page_len = 0
+            data = bytes(response.get("chunkdata") or b"")
+            if page_len > 0 and data:
+                chunk = data[:page_len] if len(data) > page_len else data
+                current_downloaded_size += page_len
+                filecontent.extend(chunk)
+                get_zero_length_package_times = 0
                 if reporthook is not None:
-                    reporthook(current_downloaded_size, filesize)
+                    reporthook(current_downloaded_size, total)
             else:
                 get_zero_length_package_times = get_zero_length_package_times + 1
-                if filesize == 0:
-                    break
-                elif get_zero_length_package_times > 2:
+                if get_zero_length_package_times > 2:
                     break
 
         return filecontent

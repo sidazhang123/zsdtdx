@@ -9,11 +9,10 @@ def _client() -> UnifiedTdxClient:
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
     client.market_rules = {
         "include_beijing_prefixes": ["92"],
-        "include_hk_market_names": ["香港主板"],
         "stock_prefix_sz": ["000", "001", "002", "003", "300"],
         "stock_prefix_sh": ["600", "601", "603", "605"],
     }
-    client._ex_market_name_map = {44: "股转系统", 31: "香港主板"}
+    client._ex_market_name_map = {44: "股转系统", 71: "港股通"}
     client._stock_route = {}
     return client
 

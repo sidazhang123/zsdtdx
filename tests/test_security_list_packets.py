@@ -10,9 +10,26 @@ from zsdtdx.parser.get_security_list import (
 )
 from zsdtdx.unified_client import UnifiedTdxClient
 
-# 首次安装抓包中 HQ market=2 首页第一条：899050 北证50。
+# 银河 0x044D 抓包：market=2 首页第一条 899050 北证50。
 _BJ_FIRST_RECORD = bytes.fromhex(
     "3839393035306400b1b1d6a43530000000000000000000003b43dd46023f09824400000000"
+)
+# 银河 0x044D 深圳页：000001 / 159915 / 159105。
+_SZ_000001_RECORD = bytes.fromhex(
+    "3030303030316400c6bdb0b2d2f8d0d0000000000000000085de4f450233333b4147321c26"
+)
+_SZ_159915_RECORD = bytes.fromhex(
+    "3135393931356400b4b4d2b5b0e5455446d2d7b7bdb4ef00d9eb814703250659408d32e312"
+)
+_SZ_159105_RECORD = bytes.fromhex(
+    "3135393130356400bae3c9fac9faceefbfc6bcbc455446d21c98824503d7a3703f8d320000"
+)
+# 银河 0x044D 上海页：510050 / 510300（16 字节名称到「柏」为止）。
+_SH_510050_RECORD = bytes.fromhex(
+    "3531303035306400c9cfd6a43530455446bbaacfc40000003279ac460366663e408d320325"
+)
+_SH_510300_RECORD = bytes.fromhex(
+    "3531303330306400bba6c9ee333030455446bbaacca9b0d81a79df4603be9f92408d322425"
 )
 
 
@@ -40,7 +57,7 @@ def test_get_security_list_cmd_uses_pack_helper():
 
 
 def test_parse_security_list_37_byte_beijing_index():
-    """输入：抓包 37 字节记录；输出：代码 899050、名称北证50。"""
+    """输入：抓包 37 字节记录；输出：代码 899050、名称北证50、小数位 2。"""
     assert len(_BJ_FIRST_RECORD) == TDXParams.SECURITY_LIST_RECORD_SIZE
     body = struct.pack("<H", 1) + _BJ_FIRST_RECORD
     rows = GetSecurityList(None).parseResponse(body)
@@ -48,6 +65,30 @@ def test_parse_security_list_37_byte_beijing_index():
     assert rows[0]["code"] == "899050"
     assert rows[0]["name"] == "北证50"
     assert rows[0]["volunit"] == 100
+    assert rows[0]["decimal_point"] == 2
+
+
+def test_parse_security_list_16_byte_gbk_name_from_galaxy_capture():
+    """输入：银河 0x044D 37 字节记录；输出：16 字节 GBK 名称与小数位。"""
+    body = struct.pack("<H", 5) + (
+        _SZ_000001_RECORD
+        + _SZ_159915_RECORD
+        + _SZ_159105_RECORD
+        + _SH_510050_RECORD
+        + _SH_510300_RECORD
+    )
+    rows = GetSecurityList(None).parseResponse(body)
+    by_code = {row["code"]: row for row in rows}
+    assert by_code["000001"]["name"] == "平安银行"
+    assert by_code["000001"]["decimal_point"] == 2
+    assert by_code["159915"]["name"] == "创业板ETF易方达"
+    assert by_code["159915"]["decimal_point"] == 3
+    assert by_code["159105"]["name"] == "恒生生物科技ETF"
+    assert by_code["159105"]["decimal_point"] == 3
+    assert by_code["510050"]["name"] == "上证50ETF华夏"
+    assert by_code["510050"]["decimal_point"] == 3
+    assert by_code["510050"]["volunit"] == 100
+    assert by_code["510300"]["name"] == "沪深300ETF华泰柏"
 
 
 def test_parse_security_list_empty_and_truncated():
@@ -82,11 +123,10 @@ def test_get_all_stock_list_takes_beijing_from_hq_market_2():
     }
     client.market_rules = {
         "include_beijing_prefixes": ["92"],
-        "include_hk_market_names": ["香港主板"],
         "stock_prefix_sz": ["000", "001", "002", "003", "300"],
         "stock_prefix_sh": ["600", "601", "603", "605"],
     }
-    client._ex_market_name_map = {44: "股转系统", 31: "香港主板"}
+    client._ex_market_name_map = {44: "股转系统", 71: "港股通"}
     client._catalog_cache_enabled = False
     client._catalog_cache_dir = None
     client._std_catalog_records = None
@@ -118,7 +158,7 @@ def test_get_all_stock_list_takes_beijing_from_hq_market_2():
     client.std_pool.call.side_effect = fake_call
     client._download_ex_instrument_catalog = lambda: [
         {"market": 44, "code": "920229", "name": "世纪数码"},
-        {"market": 31, "code": "00700", "name": "腾讯控股"},
+        {"market": 71, "code": "00700", "name": "腾讯控股"},
     ]
 
     rows = client.get_all_stock_list(return_df=False, refresh=True)

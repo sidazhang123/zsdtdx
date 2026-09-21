@@ -3,11 +3,11 @@
 
 职责：
 1. 组装标准行情证券码表请求（命令 0x044D）。
-2. 解析单页回包中的 37 字节记录，输出代码与名称等字段。
+2. 解析单页回包中的 37 字节记录，输出代码与 16 字节 GBK 名称等字段。
 
 边界：
 1. 仅负责单页组包与解析，不承担跨市场分页。
-2. 记录固定 37 字节；单页 count 与官方客户端一致为 1600。
+2. 记录固定 37 字节（6 代码 + 2 手数单位 + 16 GBK 名称 + 4 保留 + 1 小数位 + 4 昨收 + 4 尾部）；单页 count 为 1600。
 """
 
 # coding=utf-8
@@ -22,7 +22,8 @@ from zsdtdx.parser.base import BaseParser
 # 12 字节头：cmd=0x044D，声明后续 16 字节体（含 2 字节命令号）。
 _SECURITY_LIST_HEADER = bytes.fromhex("0c 01 18 6e 00 01 10 00 10 00 4d 04")
 _SECURITY_LIST_TAIL_PAD = bytes(6)
-_RECORD_STRUCT = struct.Struct("<6sH8s4sBI4s8s")
+# 银河 0x044D：名称 16 字节 GBK，其后 4 字节保留，decimal_point 在偏移 28。
+_RECORD_STRUCT = struct.Struct("<6sH16s4sBI4s")
 
 
 def pack_security_list_request(market, start, count=None) -> bytearray:
@@ -72,7 +73,7 @@ class GetSecurityList(BaseParser):
         输入：
         1. body_buf: 解压后的码表页，前 2 字节为条数。
         输出：
-        1. list[OrderedDict]：code/volunit/decimal_point/name/pre_close。
+        1. list[OrderedDict]：code/volunit/decimal_point/name（16 字节 GBK 去空）/pre_close。
         用途：
         1. 供标准行情深沪京码表与指数目录扫描使用。
         边界条件：
@@ -98,7 +99,6 @@ class GetSecurityList(BaseParser):
                 decimal_point,
                 pre_close_raw,
                 _reversed_bytes2,
-                _extra,
             ) = _RECORD_STRUCT.unpack(one_bytes)
             stocks.append(
                 OrderedDict(

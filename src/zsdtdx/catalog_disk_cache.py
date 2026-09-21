@@ -1,12 +1,12 @@
-"""码表磁盘缓存（标准行情证券列表 / 扩展行情合约列表）。
+"""码表磁盘缓存（标准/扩展码表与 ETF/LOF 名称板块）。
 
 用途：
-1. 按自然日将 std / ex 两侧未过滤码表持久化到用户可写目录。
+1. 按自然日将 std / ex 未过滤码表、以及 ETF/LOF 名称与板块成分持久化到用户可写目录。
 2. 通过原子替换写入与加载后校验，降低文件损坏导致崩溃的概率。
 
 边界：
 1. 不负责网络下载与业务过滤，仅做序列化/反序列化与路径解析。
-2. std 与 ex 分文件存储，可独立命中或过期。
+2. std、ex、etf 分文件存储，可独立命中或过期。
 3. 多进程并发写可能产生竞态；当前以最后一次写入为准，不引入额外依赖锁。
 """
 
@@ -19,12 +19,15 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-_CATALOG_CACHE_FORMAT_VERSION = 1
+# 与 0x044D 16 字节 GBK 名称记录对应；版本不符的磁盘缓存直接丢弃。
+_CATALOG_CACHE_FORMAT_VERSION = 2
 KIND_STD = "std"
 KIND_EX = "ex"
+KIND_ETF = "etf"
 _VALID_KINDS = {KIND_STD, KIND_EX}
 _STD_FILENAME = "std_security_list.pkl"
 _EX_FILENAME = "ex_instrument_info.pkl"
+_ETF_FILENAME = "etf_code_name.pkl"
 
 
 def default_zsdtdx_user_cache_dir() -> Path:
@@ -116,13 +119,84 @@ def resolve_catalog_cache_dir(config_path: Any = None) -> Optional[Path]:
 
 
 def catalog_cache_file_path(cache_dir: Path, kind: str) -> Path:
-    """输入缓存目录与 kind（std/ex），输出对应 pickle 文件路径。"""
+    """输入缓存目录与 kind（std/ex/etf），输出对应 pickle 文件路径。"""
     kind_key = str(kind or "").strip().lower()
     if kind_key == KIND_STD:
         return Path(cache_dir) / _STD_FILENAME
     if kind_key == KIND_EX:
         return Path(cache_dir) / _EX_FILENAME
+    if kind_key == KIND_ETF:
+        return Path(cache_dir) / _ETF_FILENAME
     raise ValueError(f"未知码表缓存 kind: {kind}")
+
+
+def _atomic_write_bytes(path: Path, data: bytes, tmp_prefix: str) -> None:
+    """
+    输入目标路径与字节，输出无。
+
+    输入：
+    1. path: 最终 pickle 路径。
+    2. data: 已序列化内容。
+    3. tmp_prefix: 临时文件前缀。
+    输出：无。
+    用途：先写临时文件再 os.replace。
+    边界：失败时尽量删除临时文件后原样抛出。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd: Optional[int] = None
+    tmp_path: Optional[Path] = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent),
+            prefix=tmp_prefix,
+            suffix=".tmp",
+        )
+        tmp_path = Path(tmp_name)
+        with os.fdopen(fd, "wb") as tmp_fp:
+            fd = None
+            tmp_fp.write(data)
+            tmp_fp.flush()
+            os.fsync(tmp_fp.fileno())
+        os.replace(str(tmp_path), str(path))
+    except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def _read_pickle_obj(path: Path) -> Optional[Any]:
+    """
+    输入路径，输出反序列化对象或 None。
+
+    输入：pickle 文件路径。
+    输出：对象；损坏或过短时删文件并返回 None。
+    用途：std/ex/etf 缓存共用读取。
+    边界：文件不存在返回 None。
+    """
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "rb") as fp:
+            raw = fp.read()
+        if len(raw) < 8:
+            raise ValueError("too_short")
+        return pickle.loads(raw)
+    except Exception:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
 
 
 def _is_valid_catalog_record(obj: Any) -> bool:
@@ -156,7 +230,7 @@ def validate_catalog_payload(
     用途:
     1. 避免损坏 pickle 污染内存。
     边界条件:
-    1. 结构、kind、日期不符时返回 None。
+    1. 结构、kind、日期或 format_version 不符时返回 None。
     """
     if not isinstance(obj, dict):
         return None
@@ -207,19 +281,8 @@ def load_catalog_cache(
     1. 文件不存在返回 None；校验失败会删除该文件（若可删）。
     """
     path = Path(path)
-    if not path.is_file():
-        return None
-    try:
-        with open(path, "rb") as fp:
-            raw = fp.read()
-        if len(raw) < 8:
-            raise ValueError("too_short")
-        obj = pickle.loads(raw)
-    except Exception:
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
+    obj = _read_pickle_obj(path)
+    if obj is None:
         return None
 
     validated = validate_catalog_payload(obj, expected_kind=expected_kind)
@@ -285,30 +348,148 @@ def save_catalog_cache(
         },
     }
     data = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
-    fd: Optional[int] = None
-    tmp_path: Optional[Path] = None
+    _atomic_write_bytes(path, data, tmp_prefix=f".zsdtdx_catalog_{kind_key}_")
+
+
+def _is_valid_etf_name_record(obj: Any) -> bool:
+    """输入名称记录，输出是否含 market/code。用途：ETF 名称缓存校验。边界：name 缺省视为空串。"""
+    if not _is_valid_catalog_record(obj):
+        return False
+    name = obj.get("name", "")
+    return name is None or isinstance(name, str)
+
+
+def _is_valid_etf_board_record(obj: Any) -> bool:
+    """输入板块记录，输出是否为深/沪 6 位代码。用途：ETF 板块缓存校验。边界：只要 market/code。"""
+    if not isinstance(obj, dict):
+        return False
+    code = str(obj.get("code", "")).strip()
+    if len(code) != 6 or not code.isdigit():
+        return False
     try:
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(path.parent),
-            prefix=f".zsdtdx_catalog_{kind_key}_",
-            suffix=".tmp",
-        )
-        tmp_path = Path(tmp_name)
-        with os.fdopen(fd, "wb") as tmp_fp:
-            fd = None
-            tmp_fp.write(data)
-            tmp_fp.flush()
-            os.fsync(tmp_fp.fileno())
-        os.replace(str(tmp_path), str(path))
+        market = int(obj.get("market", -1))
     except Exception:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        if tmp_path is not None:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        raise
+        return False
+    return market in (0, 1)
+
+
+def validate_etf_catalog_payload(
+    obj: Any,
+) -> Optional[Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]]:
+    """
+    输入 pickle 对象，输出 (日期, 名称记录, 板块记录) 或 None。
+
+    输入：反序列化根对象。
+    输出：三元组；结构不符返回 None。
+    用途：避免空列表或损坏 ETF 缓存进入内存。
+    边界：kind 必须为 etf；名称与板块均须非空且逐条合法。
+    """
+    if not isinstance(obj, dict):
+        return None
+    if int(obj.get("format_version", -1)) != _CATALOG_CACHE_FORMAT_VERSION:
+        return None
+    if str(obj.get("kind", "")).strip().lower() != KIND_ETF:
+        return None
+    cache_date = str(obj.get("cache_date", "")).strip()
+    if not _is_valid_cache_date(cache_date):
+        return None
+    names = obj.get("name_records")
+    boards = obj.get("board_records")
+    if not isinstance(names, list) or not names:
+        return None
+    if not isinstance(boards, list) or not boards:
+        return None
+    clean_names: List[Dict[str, Any]] = []
+    for item in names:
+        if not _is_valid_etf_name_record(item):
+            return None
+        clean_names.append(
+            {
+                "market": int(item["market"]),
+                "code": str(item["code"]).strip(),
+                "name": "" if item.get("name") is None else str(item.get("name")),
+            }
+        )
+    clean_boards: List[Dict[str, Any]] = []
+    for item in boards:
+        if not _is_valid_etf_board_record(item):
+            return None
+        clean_boards.append(
+            {"market": int(item["market"]), "code": str(item["code"]).strip()}
+        )
+    return cache_date, clean_names, clean_boards
+
+
+def load_etf_catalog_cache(
+    path: Path,
+    expected_cache_date: Optional[str] = None,
+) -> Optional[Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]]:
+    """
+    输入路径与期望日期，输出 ETF 名称/板块缓存或 None。
+
+    输入：
+    1. path: `etf_code_name.pkl`。
+    2. expected_cache_date: 自然日；不一致则未命中。
+    输出：(cache_date, name_records, board_records) 或 None。
+    用途：同日复用已下载的 ETF/LOF 名称与板块。
+    边界：空列表、损坏或日期不符会删除文件。
+    """
+    path = Path(path)
+    obj = _read_pickle_obj(path)
+    if obj is None:
+        return None
+    validated = validate_etf_catalog_payload(obj)
+    if validated is None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    cache_date, _, _ = validated
+    expected_date = str(expected_cache_date or "").strip()
+    if expected_date != "" and cache_date != expected_date:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    return validated
+
+
+def save_etf_catalog_cache(
+    path: Path,
+    *,
+    cache_date: str,
+    name_records: List[Dict[str, Any]],
+    board_records: List[Dict[str, Any]],
+) -> None:
+    """
+    输入日期与两份记录，输出无。
+
+    输入：路径、YYYY-MM-DD、名称列表、板块列表。
+    输出：无；失败抛错。
+    用途：当天首次 HQ 下载后供后续进程复用。
+    边界：任一侧为空或校验失败时抛 ValueError，不写盘。
+    """
+    payload = {
+        "format_version": _CATALOG_CACHE_FORMAT_VERSION,
+        "kind": KIND_ETF,
+        "cache_date": str(cache_date or "").strip(),
+        "name_records": [dict(item) for item in name_records],
+        "board_records": [dict(item) for item in board_records],
+    }
+    validated = validate_etf_catalog_payload(payload)
+    if validated is None:
+        raise ValueError("ETF 缓存记录非法或为空")
+    cache_date, clean_names, clean_boards = validated
+    data = pickle.dumps(
+        {
+            "format_version": _CATALOG_CACHE_FORMAT_VERSION,
+            "kind": KIND_ETF,
+            "cache_date": cache_date,
+            "name_records": clean_names,
+            "board_records": clean_boards,
+        },
+        protocol=pickle.HIGHEST_PROTOCOL,
+    )
+    _atomic_write_bytes(path, data, tmp_prefix=".zsdtdx_catalog_etf_")
