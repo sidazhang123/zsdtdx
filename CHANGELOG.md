@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Summary
+1. 配置加载：用户 `set_config_path` / 客户端读 YAML 时，以包内默认 `config.yaml` 为底深合并；仅覆盖内置已有键，丢弃未知字段；列表整段替换。允许传入不完整自定义配置。
+
 ## v2.0.3 - 2026-09-20
 
 ### Summary

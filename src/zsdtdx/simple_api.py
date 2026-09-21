@@ -12,6 +12,7 @@
 
 调用约定：
 1. 程序启动阶段先调用 `set_config_path()` 设置配置路径；后续各接口无需重复传参。
+   用户 YAML 可为不完整：以包内默认为底深合并覆盖同名键，丢弃未知字段，列表整段替换。
 2. 若未调用 `set_config_path()`，首次调用相关接口会打印提醒并回退到包内默认配置。
 3. `get_stock_kline` / `get_index_kline` 的 sync/async task 路径不要求前置 `with get_client()`（并行层自带连接）；进入 `with get_client():` 后仍可连续调用其它主进程 API（如 `get_supported_markets`）复用主进程连接。
 4. `get_stock_kline(mode="async")` 的数据抓取在并行 worker 进程内执行，worker 会独立创建并复用自己的连接，不复用 `with get_client()` 的主进程连接。
@@ -275,10 +276,12 @@ def set_config_path(config_path: str, async_background_probe: bool = True) -> st
 
     输入:
     - config_path: 配置文件路径（建议在程序启动阶段调用一次）。
+      可为不完整 YAML：以包内默认 `config.yaml` 为底深合并覆盖同名键，
+      丢弃内置不存在的字段；列表字段整段替换。
     - async_background_probe: 缓存不可用时是否在后台线程预热 TCP 可用地址缓存。
 
     输出:
-    - 解析后的绝对配置路径字符串。
+    - 解析后的绝对配置路径字符串（指向用户文件；内存中生效的是合并后的配置）。
 
     调用示例:
     ```python

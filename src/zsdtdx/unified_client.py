@@ -1,7 +1,18 @@
-"""统一封装 zsdtdx 的高层客户端，屏蔽分页、市场和连接细节。"""
+"""
+模块：`unified_client.py`。
+
+职责：
+1. 统一高层客户端、连接池、重试与 TCP 可用地址探测。
+2. 加载并合并配置：以包内 `config.yaml` 为底，用户 YAML 按键深合并覆盖。
+
+边界：
+1. 用户 YAML 中内置不存在的键会被丢弃；列表字段整段替换，不做元素并集。
+2. 未指定用户配置路径时仅使用包内默认配置。
+"""
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import ipaddress
 import json
@@ -91,6 +102,81 @@ def _resolve_zsdtdx_config_path(config_path: Optional[str]) -> Path:
     raise FileNotFoundError(
         f"配置文件不存在: {requested}；已尝试 {cwd_candidate.resolve()} 与 {package_candidate.resolve()}"
     )
+
+
+def _load_builtin_zsdtdx_config() -> Dict[str, Any]:
+    """
+    读取包内默认 config.yaml。
+
+    输入：无。
+    输出：内置配置字典（深拷贝无关，调用方可再 deepcopy）。
+    用途：作为用户配置深合并的底稿。
+    边界条件：文件缺失或根节点非 dict 时抛错。
+    """
+    if not _DEFAULT_CONFIG_PATH.exists():
+        raise FileNotFoundError(f"默认配置文件不存在: {_DEFAULT_CONFIG_PATH}")
+    with open(_DEFAULT_CONFIG_PATH, "r", encoding="utf-8") as fp:
+        loaded = yaml.safe_load(fp) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"内置配置无效（非字典）: {_DEFAULT_CONFIG_PATH}")
+    return loaded
+
+
+def _deep_merge_config_overlay(
+    base: Dict[str, Any],
+    overlay: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    将用户配置叠加到内置配置上。
+
+    输入：
+    1. base: 内置（或已合并）配置字典。
+    2. overlay: 用户配置字典。
+    输出：
+    1. 合并后的新字典（不修改入参）。
+    用途：
+    1. 仅覆盖内置已有键；dict 递归深合并；list/标量整值替换；丢弃未知键。
+    边界条件：
+    1. overlay 非 dict 时原样返回 base 的深拷贝。
+    2. 同键下 base 为 dict 且 overlay 为 dict 才递归；否则整值替换（含 list）。
+    """
+    result = copy.deepcopy(base)
+    if not isinstance(overlay, dict):
+        return result
+    for key, value in overlay.items():
+        if key not in result:
+            continue
+        base_val = result[key]
+        if isinstance(base_val, dict) and isinstance(value, dict):
+            result[key] = _deep_merge_config_overlay(base_val, value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def _load_merged_zsdtdx_config(config_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    加载生效配置：包内默认为底，用户路径存在且非内置文件时做深合并。
+
+    输入：
+    1. config_path: 配置路径；None/空串表示仅用包内默认。
+    输出：
+    1. 合并后的配置字典。
+    用途：
+    1. 供 set_config_path、UnifiedTdxClient、ParallelKlineFetcher、TCP ensure 统一读配置。
+    边界条件：
+    1. 解析路径等于包内默认时直接返回内置内容，不再二次合并。
+    2. 用户根节点非 dict 时抛 ValueError；未知键被丢弃。
+    """
+    builtin = _load_builtin_zsdtdx_config()
+    resolved = _resolve_zsdtdx_config_path(config_path)
+    if resolved.resolve() == _DEFAULT_CONFIG_PATH.resolve():
+        return copy.deepcopy(builtin)
+    with open(resolved, "r", encoding="utf-8") as fp:
+        user_cfg = yaml.safe_load(fp) or {}
+    if not isinstance(user_cfg, dict):
+        raise ValueError(f"配置无效（非字典）: {resolved}")
+    return _deep_merge_config_overlay(builtin, user_cfg)
 
 
 def normalize_hosts_entries(hosts: List[Any]) -> List[Tuple[str, int]]:
@@ -371,11 +457,12 @@ def _load_cfg_for_ensure(
 
     输入：
     1. config_path: YAML 路径；cfg 非空时可仅用于解析路径。
-    2. cfg: 已加载配置；非空时不再读盘。
+    2. cfg: 已加载（通常已合并）配置；非空时不再读盘。
     输出：
     1. (resolved_path, cfg_dict)。
     边界条件：
     1. cfg 与 config_path 均为空时使用包内默认 config.yaml。
+    2. 从磁盘加载时走 `_load_merged_zsdtdx_config`（内置底 + 用户覆盖）。
     """
     if cfg is not None:
         if config_path is not None and str(config_path).strip():
@@ -384,8 +471,7 @@ def _load_cfg_for_ensure(
             resolved = _DEFAULT_CONFIG_PATH.resolve()
         return resolved, cfg
     resolved = _resolve_zsdtdx_config_path(config_path)
-    with open(resolved, "r", encoding="utf-8") as fp:
-        loaded = yaml.safe_load(fp) or {}
+    loaded = _load_merged_zsdtdx_config(str(resolved))
     return resolved, loaded
 
 
@@ -1366,9 +1452,15 @@ class UnifiedTdxClient:
         return _resolve_zsdtdx_config_path(config_path)
 
     def _load_config(self, config_path: Path) -> Dict[str, Any]:
-        """输入配置路径，输出配置字典；用于参数集中管理；文件缺失会抛错。"""
-        with open(config_path, "r", encoding="utf-8") as fp:
-            return yaml.safe_load(fp) or {}
+        """
+        输入配置路径，输出合并后的配置字典。
+
+        输入：config_path 绝对路径。
+        输出：以包内默认为底、用户文件覆盖后的字典。
+        用途：参数集中管理。
+        边界：用户未知键丢弃；文件缺失抛错。
+        """
+        return _load_merged_zsdtdx_config(str(config_path))
 
     def _normalize_hosts(self, hosts: List[Any]) -> List[Tuple[str, int]]:
         """输入 host 配置，输出合法 host 列表；用于剔除脏地址；全无效会抛错。"""

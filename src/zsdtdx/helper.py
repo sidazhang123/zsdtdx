@@ -524,23 +524,23 @@ def _apply_active_config_path(
     解析并激活 simple_api 的全局配置路径，并按需预热 TCP 可用地址缓存。
 
     输入：
-    1. config_path: 待激活配置路径（支持相对/绝对路径）。
+    1. config_path: 待激活配置路径（支持相对/绝对路径）；允许不完整 YAML。
     2. async_background_probe: True 时后台线程调用 `_ensure_availability_hosts_cache`。
     输出：
-    1. 解析后的绝对配置路径字符串。
+    1. 解析后的绝对配置路径字符串（用户文件路径；内存 cfg 为与内置深合并结果）。
     边界条件：
-    1. 路径不存在、YAML 非法或 hosts 无效时抛出异常。
+    1. 路径不存在、YAML 非法或合并后 hosts 无效时抛出异常。
     2. 校验阶段不构造 UnifiedTdxClient，避免同步探测破坏异步语义。
     """
     global _ACTIVE_CONFIG_PATH
 
     import threading
 
-    import yaml
     from zsdtdx.parallel_fetcher import set_active_config_path
     from zsdtdx.unified_client import (
         _cache_usable_for_cfg,
         _ensure_availability_hosts_cache,
+        _load_merged_zsdtdx_config,
         _resolve_zsdtdx_config_path,
     )
 
@@ -550,8 +550,7 @@ def _apply_active_config_path(
 
     resolved = _resolve_zsdtdx_config_path(requested)
     resolved_str = str(resolved.resolve())
-    with open(resolved, "r", encoding="utf-8") as fp:
-        cfg = yaml.safe_load(fp) or {}
+    cfg = _load_merged_zsdtdx_config(resolved_str)
 
     _validate_config_or_raise(cfg, resolved_str)
 

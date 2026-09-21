@@ -116,6 +116,7 @@ set_config_path(r"D:\configs\zsdtdx.yaml")
 
 - 不调用时自动使用包内 `src/zsdtdx/config.yaml`。
 - `set_config_path(..., async_background_probe=True)` 默认后台探测 TCP host，不阻塞启动。
+- 用户 YAML 可为不完整：以包内默认为底深合并覆盖同名键，丢弃内置不存在的字段；列表（如 `hosts.standard`）整段替换。
 - 配置文件格式与完整示例见 `README.md`。
 
 ### 5.2 主进程连接上下文

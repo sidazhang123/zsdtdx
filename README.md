@@ -48,10 +48,12 @@ pip install zsdtdx
 
 设置全局配置路径（主进程与并行 worker 统一生效），如不调用则后续函数使用包内默认配置(见文档最后的示例)。
 
+用户侧 YAML **允许不完整**：运行时以包内默认 `config.yaml` 为底，对用户文件中与内置**同名的键**做深合并覆盖；内置不存在的键会被丢弃；列表字段（如 `hosts.standard`）整段替换，不做元素并集。
+
 TCP 可用地址探测在后台或首次建连前由 `_ensure_availability_hosts_cache` 统一写入进程内缓存；默认 `async_background_probe=True` 时函数立即返回，不阻塞启动。
 
 **输入:**
-- `config_path`: 配置文件路径。
+- `config_path`: 配置文件路径（可只写需要覆盖的字段）。
 - `async_background_probe`: 缓存不可用时是否在后台线程预热（默认 True）；设为 False 则同步探测后再返回。
 
 **调用示例:**
@@ -64,6 +66,12 @@ set_config_path(r"D:\\configs\\zsdtdx.yaml")
 call other functions...
 ```
 
+**不完整配置示例:**
+```yaml
+# 仅覆盖连接超时；hosts / parallel 等其余项沿用包内默认
+pool:
+  connect_timeout: 3.0
+```
 
 #### get_client
 
@@ -614,7 +622,7 @@ with get_client():
 
 ### 默认配置文件内容（可复制）
 
-以下内容与包内默认 `config.yaml` 一致，请直接复制保存为自有配置文件，再通过 `set_config_path()` 指定路径。
+以下内容与包内默认 `config.yaml` 一致，可整份复制后修改，也可只写需要覆盖的字段（见上文 `set_config_path` 合并说明）。
 
 ```yaml
 # ---------------------------------------------------------------------------

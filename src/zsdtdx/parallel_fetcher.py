@@ -36,7 +36,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
-import yaml
 from zsdtdx.helper import parse_future_symbol
 from zsdtdx.unified_client import UnifiedTdxClient
 
@@ -287,13 +286,9 @@ def _get_global_process_pool(max_workers: int) -> ProcessPoolExecutor:
 
             fingerprint: Tuple[Any, ...] = ((), ())
             try:
-                if _active_config_path:
-                    with open(_active_config_path, "r", encoding="utf-8") as fp:
-                        cfg_for_fp = yaml.safe_load(fp) or {}
-                else:
-                    pkg_cfg = Path(__file__).resolve().parent / "config.yaml"
-                    with open(pkg_cfg, "r", encoding="utf-8") as fp:
-                        cfg_for_fp = yaml.safe_load(fp) or {}
+                from zsdtdx.unified_client import _load_merged_zsdtdx_config
+
+                cfg_for_fp = _load_merged_zsdtdx_config(_active_config_path)
                 std_hosts, ex_hosts = _normalize_hosts_from_cfg(cfg_for_fp)
                 fingerprint = compute_hosts_fingerprint(std_hosts, ex_hosts)
             except Exception as exc:
@@ -2907,14 +2902,16 @@ class ParallelKlineFetcher:
         加载 YAML 配置并规范化 config_path 为绝对路径字符串。
 
         输入：无。
-        输出：配置字典；失败时返回空 dict。
-        边界条件：与 simple_api 全局 _active_config_path 对齐；无激活路径时用包内默认 config.yaml。
+        输出：合并后的配置字典；失败时返回空 dict。
+        边界条件：与 simple_api 全局 _active_config_path 对齐；无激活路径时用包内默认；
+        用户文件与内置深合并（未知键丢弃、列表整段替换）。
         """
         try:
+            from zsdtdx.unified_client import _load_merged_zsdtdx_config
+
             resolved = self._resolve_fetcher_config_path()
             self.config_path = str(resolved)
-            with open(resolved, "r", encoding="utf-8") as f:
-                return yaml.safe_load(f) or {}
+            return _load_merged_zsdtdx_config(str(resolved))
         except Exception as e:
             _emit_log(
                 "warning", f"[ParallelKlineFetcher] 配置加载失败: {e}, 使用默认值"
