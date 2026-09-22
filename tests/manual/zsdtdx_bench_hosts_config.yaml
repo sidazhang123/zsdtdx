@@ -19,54 +19,16 @@ pool:
 
 parallel:
   process_count_core_multiplier: 5
-  parallel_total_timeout_seconds: 300
-  parallel_result_timeout_seconds: 600
-  force_recycle_on_timeout: true
-  timeout_fallback_to_serial: true
-  task_chunk_cache_min_tasks: 2
-  task_chunk_inproc_coroutine_workers: 3
   task_chunk_max_inflight_multiplier: 2
-  chunk_reconnect_on_unavailable: true
+  adaptive_processes_per_host_std: 4
+  adaptive_processes_per_host_ex: 4
+  adaptive_decrease_factor: 0.75
+  adaptive_cooldown_seconds: 1.5
   chunk_timeout_seconds: 60
   chunk_retry_max_attempts: 2
-  bundle_watchdog_grace_seconds: 60
-  auto_prewarm_on_async: false
-  auto_prewarm_require_all_workers: false
-  auto_prewarm_timeout_seconds: 120
-  auto_prewarm_max_rounds: 3
 
 pagination:
-  standard_security_list_page_size: 800
-  extended_instrument_info_page_size: 800
-  standard_kline_page_size: 800
   standard_kline_qfq: true
-  extended_kline_page_size: 700
-  company_info_chunk_size: 30000
-  max_kline_pages: 400
-
-market_rules:
-  include_beijing_prefixes:
-    - "92"
-  stock_prefix_sz:
-    - "000"
-    - "001"
-    - "002"
-    - "003"
-    - "300"
-    - "301"
-    - "302"
-  stock_prefix_sh:
-    - "600"
-    - "601"
-    - "603"
-    - "605"
-    - "688"
-    - "689"
-  future_market_names:
-    - "郑州商品"
-    - "大连商品"
-    - "上海期货"
-    - "广州期货"
 
 stock_scope:
   defaults_when_codes_none:
@@ -85,17 +47,9 @@ output:
   default_batch_size: 100
   latest_quote_batch_size: 80
   filter_suspended_placeholder_bar: true
-  suspended_placeholder_eps: 1.0e-20
 
 index_kline:
   prefer_ex_markets:
     - 62
-  route_cache:
-    enabled: true
-    refresh_granularity: day
-    path: ""
   aliases:
     上证综指: 上证指数
-  lookup:
-    max_candidates: 10
-    normalize_whitespace: true

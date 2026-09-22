@@ -115,6 +115,10 @@ def update_last_ack_time(func):
     return wrapper
 
 
+# 由 unified_client 在导入后挂上。新建 socket 时登记到当前尝试，超时后可关闭它让阻塞读返回。
+_socket_created_hook = None
+
+
 class TrafficStatSocket(socket.socket):
     """
     流量统计Socket
@@ -206,6 +210,12 @@ class BaseSocketClient(object):
 
         self.client = TrafficStatSocket(socket.AF_INET, socket.SOCK_STREAM)
         self.client.settimeout(time_out)
+        hook = _socket_created_hook
+        if hook is not None:
+            try:
+                hook(self.client)
+            except Exception:
+                pass
         log.debug("connecting to server : %s on port :%d" % (ip, port))
         try:
             self.ip = ip

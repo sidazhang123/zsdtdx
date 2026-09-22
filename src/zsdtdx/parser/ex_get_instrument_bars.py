@@ -10,7 +10,7 @@
 边界：
 1. 仅负责单页解析；指数 ex 路由与期货共用本解析器。
 2. 时间：本层解析年月日时分，写入 datetime 为 `YYYY-MM-DD HH:MM:SS`（秒位固定 `:00`）与 `_ts`；上层只读 datetime/_ts。
-3. 默认页长为服务端硬上限 700，由 `extended_kline_page_size` 控制。
+3. 默认页长为服务端硬上限 700。
 """
 
 # coding=utf-8

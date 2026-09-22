@@ -8,7 +8,7 @@
 
 边界：
 1. 需通达信客户端已启动并登录。
-2. 并行参数对齐 config.yaml 的 process_count_core_multiplier=5。
+2. 并行参数读取配置里的 process_count_core_multiplier（建议 0.5~3.0）。
 3. 由主 Agent 单独启动，不与 zsdtdx 同进程串联。
 """
 
@@ -128,12 +128,22 @@ def _serialize_batch_rows(
                 rows.append(
                     {
                         "datetime": dt_text,
-                        "open": float(open_df.at[dt_idx, code]) if open_df is not None else 0.0,
-                        "high": float(high_df.at[dt_idx, code]) if high_df is not None else 0.0,
-                        "low": float(low_df.at[dt_idx, code]) if low_df is not None else 0.0,
+                        "open": float(open_df.at[dt_idx, code])
+                        if open_df is not None
+                        else 0.0,
+                        "high": float(high_df.at[dt_idx, code])
+                        if high_df is not None
+                        else 0.0,
+                        "low": float(low_df.at[dt_idx, code])
+                        if low_df is not None
+                        else 0.0,
                         "close": float(close_df.at[dt_idx, code]),
-                        "volume": int(vol_df.at[dt_idx, code]) if vol_df is not None else 0,
-                        "amount": int(amt_df.at[dt_idx, code]) if amt_df is not None else 0,
+                        "volume": int(vol_df.at[dt_idx, code])
+                        if vol_df is not None
+                        else 0,
+                        "amount": int(amt_df.at[dt_idx, code])
+                        if amt_df is not None
+                        else 0,
                     }
                 )
             except Exception:
@@ -150,14 +160,25 @@ def _serialize_batch_rows(
     return records
 
 
-def _worker_fetch_batch(args: Tuple[int, List[str], str, str, str, str]) -> Dict[str, Any]:
+def _worker_fetch_batch(
+    args: Tuple[int, List[str], str, str, str, str],
+) -> Dict[str, Any]:
     """
     子进程 worker：初始化 TdxQuant 并抓取一批股票周线日线。
 
     输入：batch_id、stock_list、tdx start/end、zsdtdx start/end。
     输出：批次统计与序列化记录。
     """
-    batch_id, stock_list, tdx_start, tdx_end, zsd_start, zsd_end, plugins_user, worker_script = args
+    (
+        batch_id,
+        stock_list,
+        tdx_start,
+        tdx_end,
+        zsd_start,
+        zsd_end,
+        plugins_user,
+        worker_script,
+    ) = args
     t0 = time.perf_counter()
     if plugins_user not in sys.path:
         sys.path.insert(0, plugins_user)
@@ -204,7 +225,9 @@ def _worker_fetch_batch(args: Tuple[int, List[str], str, str, str, str]) -> Dict
         }
 
 
-def _write_lifecycle(path: Path, status: str, extra: Optional[Dict[str, Any]] = None) -> None:
+def _write_lifecycle(
+    path: Path, status: str, extra: Optional[Dict[str, Any]] = None
+) -> None:
     """写入 lifecycle 状态。"""
     payload: Dict[str, Any] = {
         "lifecycle_status": status,
@@ -227,16 +250,18 @@ def main() -> int:
 
     multiplier = float(cfg.get("process_count_core_multiplier", 5))
     batch_size = int(cfg.get("default_batch_size", 100))
-    max_inflight = get_optimal_process_count(multiplier) * int(
-        cfg.get("task_chunk_max_inflight_multiplier", 2)
-    )
     num_processes = get_optimal_process_count(multiplier)
+    max_inflight = num_processes
     tdx_start = str(cfg.get("tdxquant_start", "")).strip()
     tdx_end = str(cfg.get("tdxquant_end", "")).strip()
     zsd_start = str(cfg.get("start_time", "")).strip()
     zsd_end = str(cfg.get("end_time", "")).strip()
 
-    out_dir = _MANUAL_DIR / str(cfg.get("artifacts_root", "artifacts/tdxquant_vs_zsdtdx_weekly_d")) / "tdxquant"
+    out_dir = (
+        _MANUAL_DIR
+        / str(cfg.get("artifacts_root", "artifacts/tdxquant_vs_zsdtdx_weekly_d"))
+        / "tdxquant"
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     lifecycle_path = out_dir / "lifecycle.json"
     records_path = out_dir / "task_records.jsonl"
@@ -265,7 +290,11 @@ def main() -> int:
         _write_lifecycle(
             lifecycle_path,
             LIFECYCLE_RUNNING,
-            {"phase": "fetch_parallel", "stock_count": len(stock_list), "batch_count": len(batches)},
+            {
+                "phase": "fetch_parallel",
+                "stock_count": len(stock_list),
+                "batch_count": len(batches),
+            },
         )
 
         t_fetch = time.perf_counter()
@@ -321,7 +350,9 @@ def main() -> int:
             "elapsed_seconds": elapsed,
             "errors_sample": errors[:10],
         }
-        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        meta_path.write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         _write_lifecycle(lifecycle_path, LIFECYCLE_COMPLETED, meta)
         print(json.dumps(meta, ensure_ascii=False))
         try:

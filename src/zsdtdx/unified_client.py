@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import copy
 import datetime as dt
 import ipaddress
@@ -29,6 +30,7 @@ from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple
 import pandas as pd
 import yaml
 
+import zsdtdx.base_socket_client as _base_socket_client
 from zsdtdx.exhq import TdxExHq_API
 from zsdtdx.hq import TdxHq_API
 from zsdtdx.params import TDXParams
@@ -48,7 +50,9 @@ from zsdtdx.log import log
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
 _DEFAULT_CONFIG_PATH = _PACKAGE_DIR / "config.yaml"
-_DEFAULT_MAX_KLINE_PAGES = 400
+_DEFAULT_MAX_KLINE_PAGES = TDXParams.MAX_KLINE_PAGES
+_SUSPENDED_PLACEHOLDER_EPS = 1.0e-20
+_INDEX_LOOKUP_MAX_CANDIDATES = 10
 
 
 def _future_variety_prefix_from_main_code(code: Any) -> str:
@@ -406,10 +410,42 @@ def _cache_usable_for_cfg(cfg: Dict[str, Any]) -> bool:
         return True
 
 
+def _cache_sources_usable_for_cfg(
+    cfg: Dict[str, Any], required_sources: set[str]
+) -> bool:
+    """输入配置与所需侧集合，输出对应可用地址缓存是否已就绪。"""
+    sources = {
+        str(item).strip().lower()
+        for item in required_sources
+        if str(item).strip().lower() in {"standard", "extended"}
+    }
+    if not sources:
+        return True
+    std_hosts, ex_hosts = _normalize_hosts_from_cfg(cfg)
+    fp_new = compute_hosts_fingerprint(std_hosts, ex_hosts)
+    with _probe_result_cache_lock:
+        if _last_tcp_probe_hosts_fingerprint != fp_new:
+            return False
+        if (
+            "standard" in sources
+            and std_hosts
+            and not _probe_result_cache.get("standard")
+        ):
+            return False
+        if (
+            "extended" in sources
+            and ex_hosts
+            and not _probe_result_cache.get("extended")
+        ):
+            return False
+        return True
+
+
 def _probe_trim_and_write_availability_cache(
     std_hosts: List[Tuple[str, int]],
     ex_hosts: List[Tuple[str, int]],
     probe_timeout: float,
+    required_sources: Optional[set[str]] = None,
 ) -> Dict[str, List[Tuple[str, int]]]:
     """
     对 std/ex 执行 TCP 探测裁剪并写入 `_probe_result_cache`。
@@ -424,25 +460,26 @@ def _probe_trim_and_write_availability_cache(
     """
     global _last_tcp_probe_hosts_fingerprint
 
+    sources = required_sources or {"standard", "extended"}
     std_trimmed: List[Tuple[str, int]] = []
     ex_trimmed: List[Tuple[str, int]] = []
-    if std_hosts:
+    if std_hosts and "standard" in sources:
         std_trimmed = _tcp_probe_and_trim_available_hosts(
             std_hosts, probe_timeout, std_hosts, "standard"
         )
-    if ex_hosts:
+    if ex_hosts and "extended" in sources:
         ex_trimmed = _tcp_probe_and_trim_available_hosts(
             ex_hosts, probe_timeout, ex_hosts, "extended"
         )
     fp_new = compute_hosts_fingerprint(std_hosts, ex_hosts)
     with _probe_result_cache_lock:
-        if std_trimmed:
+        if std_trimmed and "standard" in sources:
             _probe_result_cache["standard"] = list(std_trimmed)
-        elif not std_hosts:
+        elif not std_hosts and "standard" in sources:
             _probe_result_cache.pop("standard", None)
-        if ex_trimmed:
+        if ex_trimmed and "extended" in sources:
             _probe_result_cache["extended"] = list(ex_trimmed)
-        elif not ex_hosts:
+        elif not ex_hosts and "extended" in sources:
             _probe_result_cache.pop("extended", None)
         _last_tcp_probe_hosts_fingerprint = fp_new
     return {
@@ -484,6 +521,7 @@ def _ensure_availability_hosts_cache(
     cfg: Optional[Dict[str, Any]] = None,
     force: bool = False,
     wait_timeout: float = 120.0,
+    required_sources: Optional[set[str]] = None,
 ) -> Dict[str, Any]:
     """
     检查可用地址缓存；不可用时从配置读取 hosts 并探测写入缓存。
@@ -501,8 +539,13 @@ def _ensure_availability_hosts_cache(
     1. 并发调用时仅一次真实探测，其余等待完成后返回 skipped/结果。
     """
     resolved, loaded_cfg = _load_cfg_for_ensure(config_path=config_path, cfg=cfg)
+    sources = {
+        str(item).strip().lower()
+        for item in (required_sources or {"standard", "extended"})
+        if str(item).strip().lower() in {"standard", "extended"}
+    }
 
-    if not force and _cache_usable_for_cfg(loaded_cfg):
+    if not force and _cache_sources_usable_for_cfg(loaded_cfg, sources):
         return {
             "skipped": True,
             "config_path": str(resolved),
@@ -512,7 +555,7 @@ def _ensure_availability_hosts_cache(
     if not _ensure_inflight_event.is_set():
         if not _ensure_inflight_event.wait(timeout=max(1.0, float(wait_timeout))):
             raise TimeoutError("等待可用地址缓存探测完成超时")
-        if not force and _cache_usable_for_cfg(loaded_cfg):
+        if not force and _cache_sources_usable_for_cfg(loaded_cfg, sources):
             return {
                 "skipped": True,
                 "config_path": str(resolved),
@@ -520,7 +563,7 @@ def _ensure_availability_hosts_cache(
             }
 
     with _ensure_availability_lock:
-        if not force and _cache_usable_for_cfg(loaded_cfg):
+        if not force and _cache_sources_usable_for_cfg(loaded_cfg, sources):
             return {
                 "skipped": True,
                 "config_path": str(resolved),
@@ -528,7 +571,7 @@ def _ensure_availability_hosts_cache(
             }
         if not _ensure_inflight_event.is_set():
             _ensure_inflight_event.wait(timeout=max(1.0, float(wait_timeout)))
-            if not force and _cache_usable_for_cfg(loaded_cfg):
+            if not force and _cache_sources_usable_for_cfg(loaded_cfg, sources):
                 return {
                     "skipped": True,
                     "config_path": str(resolved),
@@ -541,7 +584,7 @@ def _ensure_availability_hosts_cache(
         probe_timeout = float(pool_cfg.get("probe_timeout", 0.8))
         std_hosts, ex_hosts = _normalize_hosts_from_cfg(loaded_cfg)
         trimmed = _probe_trim_and_write_availability_cache(
-            std_hosts, ex_hosts, probe_timeout
+            std_hosts, ex_hosts, probe_timeout, required_sources=sources
         )
         return {
             "skipped": False,
@@ -697,6 +740,81 @@ def _tcp_probe_one(
             pass
 
 
+class AttemptSocketCloser:
+    """
+    登记一次抓取尝试里新建的 socket，超时后关闭它们。
+
+    输入：无。
+    输出：bind 登记 socket；close 关闭已登记 socket。
+    边界：关闭失败被忽略；只影响本次登记的 socket。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sockets: List[Any] = []
+        self._closed = False
+
+    def aborted(self) -> bool:
+        """输入无，输出本次尝试是否已超时放弃。边界：只反映 close 是否已经调用。"""
+        with self._lock:
+            return self._closed
+
+    def bind(self, sock: Any) -> None:
+        """输入 socket，输出无。边界：已放弃的尝试会立刻关掉新 socket，不再进入下一次建连。"""
+        if sock is None:
+            return
+        reject = False
+        with self._lock:
+            if self._closed:
+                reject = True
+            elif all(existing is not sock for existing in self._sockets):
+                self._sockets.append(sock)
+        if reject:
+            _close_socket_quietly(sock)
+
+    def close(self) -> None:
+        """输入无，输出无。边界：关掉已登记 socket，并拒绝之后新建的 socket。"""
+        with self._lock:
+            self._closed = True
+            sockets = list(self._sockets)
+            self._sockets.clear()
+        for sock in sockets:
+            _close_socket_quietly(sock)
+
+
+_attempt_socket_closer: contextvars.ContextVar[Optional[AttemptSocketCloser]] = (
+    contextvars.ContextVar("zsdtdx_attempt_socket_closer", default=None)
+)
+
+
+def _close_socket_quietly(sock: Any) -> None:
+    """输入 socket，输出无。边界：关闭失败忽略。"""
+    try:
+        sock.shutdown(_socket_mod.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        sock.close()
+    except Exception:
+        pass
+
+
+def _attempt_aborted() -> bool:
+    """输入无，输出当前线程的抓取尝试是否已放弃。边界：没有登记器时为 False。"""
+    closer = _attempt_socket_closer.get()
+    return closer is not None and closer.aborted()
+
+
+def _bind_attempt_socket(sock: Any) -> None:
+    """输入新建或正在使用的 socket，输出无。边界：当前线程没有尝试登记器时不做任何事。"""
+    closer = _attempt_socket_closer.get()
+    if closer is not None:
+        closer.bind(sock)
+
+
+_base_socket_client._socket_created_hook = _bind_attempt_socket
+
+
 class PersistentFailoverPool:
     """连接池：P0改造，线程本地连接，消除锁竞争。"""
 
@@ -805,11 +923,13 @@ class PersistentFailoverPool:
             data = {
                 "api": None,
                 "active_index": -1,
+                "preferred_index": -1,
                 "socket_read_deadline": None,
                 "socket_read_timeout_override": None,
             }
             self._local.data = data
         else:
+            data.setdefault("preferred_index", -1)
             data.setdefault("socket_read_deadline", None)
             data.setdefault("socket_read_timeout_override", None)
 
@@ -873,9 +993,12 @@ class PersistentFailoverPool:
             sock_client.settimeout(timeout_seconds)
         except Exception:
             pass
+        _bind_attempt_socket(sock_client)
 
     def _connect_to_index(self, index: int) -> bool:
         """输入 host 索引，输出连接结果；用于切换连接；连接失败返回 False。"""
+        if _attempt_aborted():
+            return False
         host, port = self.hosts[index]
         api = self.api_cls(**self.api_kwargs)
         try:
@@ -917,11 +1040,19 @@ class PersistentFailoverPool:
         1. True 表示至少一个 host 连接成功。
         边界条件：
         1. 全部失败返回 False；不在池内做 TCP 探测。
+        2. 本次抓取尝试已放弃时不再连接下一台。
         """
         thread_data = self._get_thread_data()
         if thread_data["api"] is not None and thread_data["active_index"] >= 0:
             return True
-        for index in range(len(self.hosts)):
+        preferred_index = int(thread_data.get("preferred_index", -1) or -1)
+        indexes = list(range(len(self.hosts)))
+        if 0 <= preferred_index < len(indexes):
+            indexes.remove(preferred_index)
+            indexes.insert(0, preferred_index)
+        for index in indexes:
+            if _attempt_aborted():
+                return False
             if self._connect_to_index(index):
                 return True
         return False
@@ -929,6 +1060,23 @@ class PersistentFailoverPool:
     def ensure_connected(self) -> bool:
         """输入无，输出连接是否可用；用于外部预连接；失败返回 False。"""
         return self._ensure_connected()
+
+    def set_thread_preferred_host(self, host: str, port: int) -> bool:
+        """
+        设置当前线程首次建连的首选 host。
+
+        输入：host 与 port。
+        输出：命中当前地址池返回 True，否则 False。
+        边界：不会切断已有连接；首选站失败时仍按原有 failover 顺序尝试其它站。
+        """
+        target = (str(host or "").strip(), int(port))
+        try:
+            index = self.hosts.index(target)
+        except ValueError:
+            return False
+        thread_data = self._get_thread_data()
+        thread_data["preferred_index"] = int(index)
+        return True
 
     def set_thread_socket_read_timeout(self, timeout_seconds: float) -> None:
         """
@@ -951,12 +1099,12 @@ class PersistentFailoverPool:
 
     def restore_thread_socket_read_timeout(self) -> None:
         """
-        D3 优化：将当前线程活跃连接的 socket 读超时还原为 pool 默认。
+        将当前线程活跃连接的 socket 读超时还原为 pool 默认。
 
         输入：1. 无显式输入参数。
         输出：1. 无返回值。
         用途：
-        1. chunk 结束 finally 分支调用，避免短超时残留影响心跳/后续 chunk 读路径。
+        1. chunk 结束 finally 分支调用，避免短超时残留影响后续 chunk 读路径。
         边界条件：
         1. 无活跃连接时静默跳过；pool 没有显式 default 时使用 BaseSocketClient.CONNECT_TIMEOUT(5)。
         """
@@ -1364,18 +1512,11 @@ class UnifiedTdxClient:
         )
         self.index_kline_cfg = self.config.get("index_kline", {}) or {}
         self.index_kline_aliases_cfg = self.index_kline_cfg.get("aliases", {}) or {}
-        self.index_kline_lookup_cfg = self.index_kline_cfg.get("lookup", {}) or {}
         # 指数目录由码表聚合层在使用时过滤得到，仅保留进程内快照。
         self._index_catalog_records: List[Dict[str, Any]] = []
         self._index_name_route_map: Dict[str, Dict[str, Any]] = {}
         self.catalog_cache_cfg = self.config.get("catalog_cache", {}) or {}
         self._catalog_cache_enabled = bool(self.catalog_cache_cfg.get("enabled", True))
-        self._catalog_cache_refresh_granularity = (
-            str(self.catalog_cache_cfg.get("refresh_granularity", "day"))
-            .strip()
-            .lower()
-            or "day"
-        )
         self._catalog_cache_dir: Optional[Path] = None
         self._std_catalog_records: Optional[List[Dict[str, Any]]] = None
         self._ex_catalog_records: Optional[List[Dict[str, Any]]] = None
@@ -1384,10 +1525,7 @@ class UnifiedTdxClient:
         self._etf_name_records: Optional[List[Dict[str, Any]]] = None
         self._etf_name_date = ""
         self._etf_board_records: Optional[List[Dict[str, Any]]] = None
-        if (
-            self._catalog_cache_enabled
-            and self._catalog_cache_refresh_granularity == "day"
-        ):
+        if self._catalog_cache_enabled:
             self._catalog_cache_dir = resolve_catalog_cache_dir(
                 config_path=self.catalog_cache_cfg.get("path")
             )
@@ -1488,9 +1626,14 @@ class UnifiedTdxClient:
         return self.PERIOD_MAP[p]
 
     def _standard_kline_page_size(self) -> int:
-        """输入无，输出标准行情 K 线单页条数；配置缺省时用服务端上限 800。"""
-        pagination = getattr(self, "pagination", None) or {}
-        return int(pagination.get("standard_kline_page_size", 800))
+        """输入无，输出标准行情 K 线单页条数。边界：固定为服务端上限 800。"""
+        return int(TDXParams.MAX_KLINE_COUNT)
+
+    def _kline_page_size(self, source: str) -> int:
+        """输入行情侧 std/ex，输出该侧 K 线单页条数。边界：未知侧按标准行情。"""
+        if str(source or "").strip().lower() == "ex":
+            return int(TDXParams.MAX_EXTENDED_KLINE_COUNT)
+        return int(TDXParams.MAX_KLINE_COUNT)
 
     def _standard_kline_qfq(self, qfq: Optional[bool] = None) -> bool:
         """
@@ -1624,12 +1767,16 @@ class UnifiedTdxClient:
         if end_time == "":
             raise ValueError("task.end_time 不能为空")
         self._freq_to_category(freq)
-        return {
+        normalized = {
             "code": code,
             "freq": self._normalize_freq(freq),
             "start_time": start_time,
             "end_time": end_time,
         }
+        route_source = str(task.get("_route_source", "")).strip().lower()
+        if route_source in {"std", "ex"}:
+            normalized["_route_source"] = route_source
+        return normalized
 
     def _normalize_index_task_payload_no_df(
         self, task: Dict[str, Any]
@@ -1675,6 +1822,7 @@ class UnifiedTdxClient:
             and pre_route_code != ""
             and pre_route_market >= 0
         ):
+            normalized["_route_source"] = pre_route_source
             normalized["_index_route_source"] = pre_route_source
             normalized["_index_route_code"] = pre_route_code
             normalized["_index_route_market"] = pre_route_market
@@ -1705,16 +1853,7 @@ class UnifiedTdxClient:
             code = str(current_route.get("code", "")).strip()
             if market < 0 or code == "":
                 raise ValueError(f"指数路由配置非法: {current_route}")
-            page_size = int(
-                self.pagination.get(
-                    "standard_kline_page_size"
-                    if source == "std"
-                    else "extended_kline_page_size",
-                    TDXParams.MAX_KLINE_COUNT
-                    if source == "std"
-                    else TDXParams.MAX_EXTENDED_KLINE_COUNT,
-                )
-            )
+            page_size = self._kline_page_size(source)
 
             def _fetch_index_page(start: int) -> Any:
                 if source == "std":
@@ -1838,25 +1977,73 @@ class UnifiedTdxClient:
                 return f"hk.{c}"
         return c
 
-    def _ensure_stock_route_cache_no_df(self, refresh: bool = False):
-        """输入刷新开关，输出无；用于无 DataFrame 股票路由；码表过滤在使用时完成。"""
+    def _ensure_stock_route_cache_no_df(
+        self, refresh: bool = False, route_source: Optional[str] = None
+    ):
+        """
+        按需保证股票路由缓存可用。
+
+        输入：刷新开关与可选 std/ex 路由侧。
+        输出：无。
+        边界：未指定侧时加载两侧；指定侧时只加载对应码表，避免无关行情连接。
+        """
+        source = str(route_source or "").strip().lower()
+        if source not in {"std", "ex"}:
+            source = ""
         if self._stock_route and not refresh:
-            return
-        self.ensure_code_catalog(need_std=True, need_ex=True, refresh=refresh)
+            if source == "" or any(
+                str(item.get("source", "")).strip().lower() == source
+                for item in self._stock_route.values()
+            ):
+                return
+        self.ensure_code_catalog(
+            need_std=source in {"", "std"},
+            need_ex=source in {"", "ex"},
+            refresh=refresh,
+        )
         self._rebuild_stock_views_from_catalogs()
 
     def _resolve_stock_route_no_df(
-        self, code: str, freq: str
+        self, code: str, freq: str, route_source: Optional[str] = None
     ) -> Tuple[str, Dict[str, Any]]:
-        """输入代码和频率，输出标准化代码与路由；用于无 DataFrame 查询；未找到抛错。"""
+        """
+        输入代码、频率与可选行情侧，输出标准化代码和路由。
+
+        边界：指定 std/ex 时仅加载对应侧码表；未找到时最多刷新该侧一次。
+        """
+        source = str(route_source or "").strip().lower()
+        if source not in {"std", "ex"}:
+            source = ""
         normalized_code = self._normalize_stock_query_code(code)
         route = self._lookup_stock_route(normalized_code)
+        if (
+            route is not None
+            and source
+            and str(route.get("source", "")).lower() != source
+        ):
+            route = None
         if route is None:
-            self._ensure_stock_route_cache_no_df(refresh=False)
+            self._ensure_stock_route_cache_no_df(
+                refresh=False, route_source=source or None
+            )
             route = self._lookup_stock_route(normalized_code)
+        if (
+            route is not None
+            and source
+            and str(route.get("source", "")).lower() != source
+        ):
+            route = None
         if route is None:
-            self._ensure_stock_route_cache_no_df(refresh=True)
+            self._ensure_stock_route_cache_no_df(
+                refresh=True, route_source=source or None
+            )
             route = self._lookup_stock_route(normalized_code)
+        if (
+            route is not None
+            and source
+            and str(route.get("source", "")).lower() != source
+        ):
+            route = None
         if route is None:
             self._record_failure(
                 "stock_kline", str(code), "code_not_found", "route_missing", freq
@@ -1887,7 +2074,7 @@ class UnifiedTdxClient:
             return False
         if not isinstance(row, dict):
             return False
-        eps = float(self.output_cfg.get("suspended_placeholder_eps", 1e-20))
+        eps = _SUSPENDED_PLACEHOLDER_EPS
         open_v = self._safe_float_no_df(row.get("open"))
         close_v = self._safe_float_no_df(row.get("close"))
         high_v = self._safe_float_no_df(row.get("high"))
@@ -1945,16 +2132,14 @@ class UnifiedTdxClient:
         3. boundary_mode: `no_df` 用 `_to_datetime_no_df`；`pandas` 用 `pd.to_datetime`。
         4. fetch_page: `(start) -> page | None`，由调用方封装 pool/API/参数差异。
         5. rows: 可选已有列表；为 None 时新建。
-        6. max_pages: 最大页数；None 时读 `pagination.max_kline_pages`。
+        6. max_pages: 最大页数；None 时用 `TDXParams.MAX_KLINE_PAGES`。
         输出：
         1. 追加后的原始 K 线 dict 列表（未做 normalize/DataFrame）。
         边界条件：
         1. 空页、达左边界、末页不足 `page_size` 时结束；`fetch_page` 差异由调用方保证。
         """
         effective_max_pages = int(
-            max_pages
-            if max_pages is not None
-            else self.pagination.get("max_kline_pages", _DEFAULT_MAX_KLINE_PAGES)
+            max_pages if max_pages is not None else _DEFAULT_MAX_KLINE_PAGES
         )
         out_rows: List[Dict[str, Any]] = list(rows) if rows is not None else []
         start = 0
@@ -2321,11 +2506,7 @@ class UnifiedTdxClient:
         qfq: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """输入扩展行情参数，输出标准化K线列表；用于无 DataFrame 路径；空页即结束。"""
-        page_size = int(
-            self.pagination.get(
-                "extended_kline_page_size", TDXParams.MAX_EXTENDED_KLINE_COUNT
-            )
-        )
+        page_size = int(TDXParams.MAX_EXTENDED_KLINE_COUNT)
         qfq_flag = self._standard_kline_qfq(qfq)
 
         def _fetch_page(start: int) -> Any:
@@ -2596,7 +2777,20 @@ class UnifiedTdxClient:
         )
         task_items = [dict(item[1]) for item in ordered_tasks]
 
-        normalized_code, route = self._resolve_stock_route_no_df(base_code, base_freq)
+        route_source = str(task_items[0].get("_route_source", "")).strip().lower()
+        try:
+            normalized_code, route = self._resolve_stock_route_no_df(
+                base_code,
+                base_freq,
+                route_source=route_source if route_source in {"std", "ex"} else None,
+            )
+        except TypeError as exc:
+            if "route_source" not in str(exc):
+                raise
+            # 兼容外部子类/测试仍覆盖历史二参数解析钩子。
+            normalized_code, route = self._resolve_stock_route_no_df(
+                base_code, base_freq
+            )
         if not bool(enable_cache):
             results: List[Dict[str, Any]] = []
             for task in task_items:
@@ -2622,19 +2816,8 @@ class UnifiedTdxClient:
 
         category = self._freq_to_category(base_freq)
         source = str(route.get("source", "std")).strip().lower()
-        page_size = int(
-            self.pagination.get(
-                "standard_kline_page_size"
-                if source == "std"
-                else "extended_kline_page_size",
-                TDXParams.MAX_KLINE_COUNT
-                if source == "std"
-                else TDXParams.MAX_EXTENDED_KLINE_COUNT,
-            )
-        )
-        max_pages = int(
-            self.pagination.get("max_kline_pages", _DEFAULT_MAX_KLINE_PAGES)
-        )
+        page_size = self._kline_page_size(source)
+        max_pages = int(_DEFAULT_MAX_KLINE_PAGES)
         market = int(route.get("market", 0))
 
         chunk_hit_tasks = 0
@@ -2883,19 +3066,8 @@ class UnifiedTdxClient:
         source = str(route.get("source", "std")).strip().lower()
         route_code = str(route.get("code", "")).strip()
         route_name = str(route.get("name", base_index_name)).strip() or base_index_name
-        page_size = int(
-            self.pagination.get(
-                "standard_kline_page_size"
-                if source == "std"
-                else "extended_kline_page_size",
-                TDXParams.MAX_KLINE_COUNT
-                if source == "std"
-                else TDXParams.MAX_EXTENDED_KLINE_COUNT,
-            )
-        )
-        max_pages = int(
-            self.pagination.get("max_kline_pages", _DEFAULT_MAX_KLINE_PAGES)
-        )
+        page_size = self._kline_page_size(source)
+        max_pages = int(_DEFAULT_MAX_KLINE_PAGES)
 
         chunk_hit_tasks = 0
         chunk_network_page_calls = 0
@@ -3147,7 +3319,7 @@ class UnifiedTdxClient:
 
     def _is_beijing_stock_code(self, code: str) -> bool:
         """输入代码，输出是否北交所股票；按 92 前缀且 6 位过滤。"""
-        prefixes = self.market_rules.get("include_beijing_prefixes", ["92"])
+        prefixes = TDXParams.BEIJING_CODE_PREFIXES
         code = str(code)
         return any(code.startswith(prefix) and len(code) == 6 for prefix in prefixes)
 
@@ -3211,9 +3383,9 @@ class UnifiedTdxClient:
         """输入标准市场与代码，输出是否 A 股；用于股票口径过滤；未配置前缀则不纳入。"""
         code = str(code)
         if market == 0:
-            prefixes = self.market_rules.get("stock_prefix_sz", [])
+            prefixes = TDXParams.STOCK_PREFIX_SZ
         elif market == 1:
-            prefixes = self.market_rules.get("stock_prefix_sh", [])
+            prefixes = TDXParams.STOCK_PREFIX_SH
         else:
             return False
         return any(code.startswith(prefix) for prefix in prefixes)
@@ -3436,9 +3608,7 @@ class UnifiedTdxClient:
         text = str(name or "").strip()
         if text == "":
             return ""
-        if bool(self.index_kline_lookup_cfg.get("normalize_whitespace", True)):
-            text = re.sub(r"\s+", "", text)
-        return text
+        return re.sub(r"\s+", "", text)
 
     def _index_route_priority(
         self, source: str, market: int, code: str, market_name: str
@@ -3674,10 +3844,7 @@ class UnifiedTdxClient:
                 self._index_name_route_map[canonical_key] = dict(picked)
             return picked
 
-        max_candidates = int(
-            self.index_kline_lookup_cfg.get("max_candidates", 10) or 10
-        )
-        max_candidates = max(1, max_candidates)
+        max_candidates = _INDEX_LOOKUP_MAX_CANDIDATES
         candidates: List[str] = []
         for record in records:
             record_name = str(record["name"])
@@ -3964,11 +4131,7 @@ class UnifiedTdxClient:
 
     def _download_std_security_catalog(self) -> List[Dict[str, Any]]:
         """分页下载标准行情未过滤码表；空页视为该市场结束。"""
-        security_page = int(
-            self.pagination.get(
-                "standard_security_list_page_size", TDXParams.MAX_SECURITY_LIST_COUNT
-            )
-        )
+        security_page = int(TDXParams.MAX_SECURITY_LIST_COUNT)
         records: List[Dict[str, Any]] = []
         for market in self._std_catalog_markets():
             start = 0
@@ -4003,7 +4166,7 @@ class UnifiedTdxClient:
                 self.get_supported_markets(return_df=True)
             except Exception:
                 pass
-        page_size = int(self.pagination.get("extended_instrument_info_page_size", 800))
+        page_size = int(TDXParams.EXTENDED_INSTRUMENT_INFO_PAGE_SIZE)
         start = 0
         rows: List[Dict[str, Any]] = []
         while True:
@@ -4220,12 +4383,8 @@ class UnifiedTdxClient:
         return result
 
     def _named_hq_file_chunk_size(self) -> int:
-        """输入：无。输出：命名文件单页字节。用途：0x06B9 翻页。边界：非法时回退 30000。"""
-        try:
-            size = int(self.pagination.get("named_file_chunk_size", 30000))
-        except Exception:
-            size = 30000
-        return size if size > 0 else 30000
+        """输入：无。输出：命名文件单页字节。用途：0x06B9 翻页。边界：固定 30000。"""
+        return int(TDXParams.NAMED_FILE_CHUNK_SIZE)
 
     def _download_named_hq_file(self, filename: str) -> bytes:
         """
@@ -4259,20 +4418,8 @@ class UnifiedTdxClient:
         return bytes(raw)
 
     def _etf_board_remote_files(self) -> List[str]:
-        """输入：无。输出：配置的板块远程路径列表。用途：下载与校验。边界：去掉空串。"""
-        items = self.market_rules.get("etf_board_remote_files") or [
-            "spec/specetfdata.txt",
-            "spec/speclofdata.txt",
-        ]
-        out: List[str] = []
-        seen: set[str] = set()
-        for item in items:
-            name = str(item or "").strip()
-            if not name or name in seen:
-                continue
-            seen.add(name)
-            out.append(name)
-        return out
+        """输入：无。输出：板块远程路径列表。用途：下载与校验。边界：固定两份板块文件。"""
+        return list(TDXParams.ETF_BOARD_REMOTE_FILES)
 
     def _etf_catalog_records_ok(
         self,
@@ -4468,12 +4615,7 @@ class UnifiedTdxClient:
             return
         if (not bool(refresh)) and self._try_load_etf_catalog_from_disk():
             return
-        filename = (
-            str(
-                self.market_rules.get("etf_name_remote_file") or "infoharbor_ex.name"
-            ).strip()
-            or "infoharbor_ex.name"
-        )
+        filename = TDXParams.ETF_NAME_REMOTE_FILE
         board_files = self._etf_board_remote_files()
         if not board_files:
             self._clear_etf_name_catalog()
@@ -4593,7 +4735,7 @@ class UnifiedTdxClient:
             return self._future_df.to_dict(orient="records")
 
         self.ensure_code_catalog(need_ex=True, refresh=not bool(use_cache))
-        target_market_names = set(self.market_rules.get("future_market_names", []))
+        target_market_names = set(TDXParams.FUTURE_MARKET_NAMES)
         records = []
         for item in self._ex_catalog_records or []:
             market = int(item.get("market", -1))
@@ -4909,11 +5051,7 @@ class UnifiedTdxClient:
         qfq: bool = False,
     ) -> pd.DataFrame:
         """输入扩展参数，输出区间 K 线；用于自动分页；None/空页即结束。"""
-        page_size = int(
-            self.pagination.get(
-                "extended_kline_page_size", TDXParams.MAX_EXTENDED_KLINE_COUNT
-            )
-        )
+        page_size = int(TDXParams.MAX_EXTENDED_KLINE_COUNT)
 
         def _fetch_page(start: int) -> Any:
             return self._pool_call_allow_none(
@@ -5077,7 +5215,7 @@ class UnifiedTdxClient:
         if vol_col is None or "amount" not in result.columns:
             return result.reset_index(drop=True)
 
-        eps = float(self.output_cfg.get("suspended_placeholder_eps", 1e-20))
+        eps = _SUSPENDED_PLACEHOLDER_EPS
         vol_v = pd.to_numeric(result[vol_col], errors="coerce").abs()
         amount_v = pd.to_numeric(result["amount"], errors="coerce").abs()
         tiny_turnover = vol_v.le(eps) & amount_v.le(eps)
@@ -5381,13 +5519,11 @@ class UnifiedTdxClient:
         用途：
         1. 按官方客户端分页拉取各页原始字节，拼完整包后再做 GBK 解码。
         边界条件：
-        1. 单页上限取 pagination.company_info_chunk_size，缺省 30720。
+        1. 单页上限为 `TDXParams.COMPANY_INFO_CHUNK_SIZE`（30720）。
         2. 某一页返回 None 或空 bytes 时停止后续页。
         3. 严格 GBK 失败时 ignore 兜底，并由调用方记入运行态失败。
         """
-        chunk_size = int(self.pagination.get("company_info_chunk_size", 30720))
-        if chunk_size <= 0:
-            chunk_size = 30720
+        chunk_size = int(TDXParams.COMPANY_INFO_CHUNK_SIZE)
         offset = 0
         chunks: List[bytes] = []
         status = "success"
@@ -5669,7 +5805,11 @@ class UnifiedTdxClient:
             presorted_hosts=dict(self._presorted_hosts_snapshot),
             worker_client=self._worker_client_flag,
         )
-        if context_client.preconnect_on_enter:
+        # worker 由 route-homogeneous bundle 按实际行情侧懒建连，禁止进入上下文时双边扇出。
+        if (
+            context_client.preconnect_on_enter
+            and not context_client._worker_client_flag
+        ):
             context_client._warmup_connections()
         self._entered_client = context_client
         self._push_context_client(context_client)

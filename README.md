@@ -8,7 +8,6 @@
 pip install zsdtdx
 ```
 
-
 ## API 概览
 
 - `set_config_path`
@@ -42,7 +41,10 @@ pip install zsdtdx
 - 第三方归属：见 `THIRD_PARTY_NOTICES.md`（声明上游参考 `pytdx`；同时说明部分协议请求/解析已重新实现，非直接二次封装）
 
 
+
 ## 快速开始
+
+
 
 #### set_config_path
 
@@ -53,10 +55,12 @@ pip install zsdtdx
 TCP 可用地址探测在后台或首次建连前由 `_ensure_availability_hosts_cache` 统一写入进程内缓存；默认 `async_background_probe=True` 时函数立即返回，不阻塞启动。
 
 **输入:**
+
 - `config_path`: 配置文件路径（可只写需要覆盖的字段）。
 - `async_background_probe`: 缓存不可用时是否在后台线程预热（默认 True）；设为 False 则同步探测后再返回。
 
 **调用示例:**
+
 ```python
 from zsdtdx import set_config_path
 
@@ -67,21 +71,25 @@ call other functions...
 ```
 
 **不完整配置示例:**
+
 ```yaml
 # 仅覆盖连接超时；hosts / parallel 等其余项沿用包内默认
 pool:
   connect_timeout: 3.0
 ```
 
+
+
 #### get_client
 
 获取客户端实例。
 
 **输入:**
+
 - separate_instance: 是否强制新建独立客户端实例；为 True 时忽略当前 with 上下文并创建新实例。默认False。
 
-
 **调用示例:**
+
 ```python
 from zsdtdx import get_client
 
@@ -92,10 +100,11 @@ with get_client():
     prices = get_stock_latest_price(["600000", "000001"])
 ```
 
-
 **作用边界:**
+
 - 该 client 仅管理"当前主进程"上下文中的连接生命周期（进入 with 预连接，退出 with 自动 close）。
 - `get_stock_kline(mode="async")` 的 worker 连接由并行抓取器在 worker 进程内独立维护，不与此处返回的主进程 client 共用连接对象。
+
 
 
 #### get_supported_markets
@@ -103,13 +112,15 @@ with get_client():
 获取标准+扩展行情支持的市场列表。
 
 **调用前置约定:**
+
 - 请先进入 `with get_client():`；
 
-
 **输入:**
+
 - return_df: 可选，是否返回 pandas.DataFrame；默认 True。
 
 **调用示例:**
+
 ```python
 from zsdtdx import get_client, get_supported_markets
 
@@ -118,28 +129,33 @@ with get_client():
 ```
 
 **返回示例:**
+
 ```json
 [{"market": 0, "name": "深圳", "source": "std"}, {"market": 1, "name": "上海", "source": "std"}]
 ```
+
+
 
 #### get_stock_code_name
 
 获取统一股票代码名称字典。
 
 **调用前置约定:**
+
 - 请先进入 `with get_client():`；
 
-
 **输入:**
+
 - use_cache: 是否使用股票缓存；默认值为True，置为 False 时强制刷新股票缓存。
 - 本函数属于全量代码接口，返回范围由配置文件的stock_scope控制,默认szsh市场（可增配bj、hk；hk 为港股通）。
 
-
 **输出:**
+
 - 返回 `Dict[str, str]`：key 为带市场前缀的股票代码（`sh./sz./bj./hk.`），
-  value 为股票名称；`hk.` 为港股通标的；不返回纯数字代码。
+value 为股票名称；`hk.` 为港股通标的；不返回纯数字代码。
 
 **调用示例:**
+
 ```python
 from zsdtdx import get_client, get_stock_code_name
 
@@ -148,26 +164,33 @@ with get_client():
 ```
 
 **返回示例:**
+
 ```json
 {"sh.600000": "浦发银行", "sz.000001": "平安银行"}
 ```
+
+
 
 #### get_etf_code_name
 
 获取场内 ETF/LOF（本语境统称 etf）代码名称字典。成分来自标准行情 `7709` 板块文件（默认 `spec/specetfdata.txt` / `spec/speclofdata.txt`），名称优先 `infoharbor_ex.name`，缺名回退标准码表 `0x044D` 的 16 字节 GBK 名称。当日快照写入 `catalog_cache` 的 `etf_code_name.pkl`，仅本地没有当日文件时才下载。不改动 `get_stock_code_name` 口径，不读银河安装目录。
 
 **调用前置约定:**
+
 - 请先进入 `with get_client():`；
 
 **输入:**
+
 - use_cache: True 复用当日磁盘/内存快照；False 强制重新下载命名文件。
 - 板块成分跳过 etf/lof 初筛，仍排除 `399*` 与 `etf_name_drop_substr`；名称文件中额外命中 etf/lof 的代码一并纳入。
-- 远程文件名见 `market_rules.etf_name_remote_file`、`market_rules.etf_board_remote_files`；单页长度见 `pagination.named_file_chunk_size`。
+- 远程文件为 `infoharbor_ex.name` 与 `spec/specetfdata.txt`、`spec/speclofdata.txt`；单页 30000 字节。名称剔除子串仍由 `market_rules.etf_name_drop_substr` 配置。
 
 **输出:**
+
 - 返回 `Dict[str, str]`：key 为 `sz.`/`sh.` 前缀代码，value 为名称（infoharbor 完整名或 16 字节回退名）；排除深指 `399*` 与名称命中剔除子串的品种。
 
 **调用示例:**
+
 ```python
 from zsdtdx import get_client, get_etf_code_name
 
@@ -176,23 +199,28 @@ with get_client():
 ```
 
 **返回示例:**
+
 ```json
 {"sz.159915": "创业板ETF易方达", "sh.510050": "上证50ETF华夏", "sz.159105": "恒生生物科技ETF易方达"}
 ```
+
+
 
 #### get_all_future_list
 
 获取统一商品期货列表（郑州/大连/上海/广州）。
 
 **调用前置约定:**
+
 - 请先进入 `with get_client():`；
 
-
 **输入:**
+
 - return_df: 可选，是否返回 pandas.DataFrame；默认 True。
 - use_cache: 是否使用期货清单缓存；为 False 时强制刷新期货清单缓存。
 
 **调用示例:**
+
 ```python
 from zsdtdx import get_client, get_all_future_list
 
@@ -201,42 +229,50 @@ with get_client():
 ```
 
 **返回示例:**
+
 ```json
 [{"code": "CU2603", "name": "沪铜2603", "market_name": "上海期货", "source": "ex"}]
 ```
+
+
 
 #### get_stock_kline
 
 获取股票 K 线任务结果（任务化输入，支持同步/异步与队列实时回传）。
 
 **调用前置约定:**
+
 - `mode="sync"`：可进入 `with get_client():` 在主进程复用连接并统一资源释放。
 - `mode="async"`：可直接调用；async 抓取使用 worker 进程内独立连接。
-  若同一流程还要连续调用主进程 `get_*` 接口，可把这些主进程调用放在 with 块内执行。
+若同一流程还要连续调用主进程 `get_*` 接口，可把这些主进程调用放在 with 块内执行。
 
 **输入:**
+
 - task: 任务列表，元素是 `StockKlineTask` 或 dict，模板字段:
-  `{code, freq, start_time, end_time}`。
+`{code, freq, start_time, end_time}`。
 - queue: 可选队列，需支持 `put()`。
   - `mode="sync"` 且不传 queue：仅通过返回值拿到结果。
   - `mode="sync"` 且传 queue：返回值仍是完整结果列表，同时会向 queue 增量写入 data/done 事件。
   - `mode="async"` 且不传 queue：函数会自动创建 queue 并挂到返回的 `job.queue`。
   - `mode="async"` 且传 queue：返回的 `job.queue` 即该 queue。
 - preprocessor_operator: 可选钩子，签名 `f(payload)->dict|None`；
-  返回 None 或空 dict 时该条结果不入队也不进入返回值（默认 OHLC 两位小数、成交额/量为整数由协议解析层统一）。
+返回 None 或空 dict 时该条结果不入队也不进入返回值（默认 OHLC 两位小数、成交额/量为整数由协议解析层统一）。
 - mode: `"sync"` 或 `"async"`，默认 `"async"`。sync 阻塞直到完成；async 立即返回句柄。
 - start_time/end_time: 支持字符串/date/datetime。若仅传入日期（无时分秒），自动补齐为 `start_time="… 09:30:00"`、`end_time="… 16:00:00"`（股票/指数任务共用，与 `get_future_kline` 的 09:00/15:00 不同）。
 
-**K 线 `datetime` 输出契约:**
+**K 线** `datetime` **输出契约:**
+
 - `rows` 中每条 K 线的 `datetime` 为 `YYYY-MM-DD HH:MM:SS`，秒位固定 `:00`（例如 `"2026-02-02 15:00:00"`）。
 
 **复权:**
+
 - `get_stock_kline` 增加参数 `qfq`（默认 `True`=前复权，`False`=不复权），接在原有参数之后；A 股与港股共用该开关。
 - `get_index_kline` 不提供 `qfq`：指数无复权语义，标准行情 reserved0 固定为 0。
 - `get_future_kline` 不提供 `qfq`：期货无复权，扩展行情 extra 固定为 0。
 - task 字段与返回结构不变。
 
 **调用示例（写法一：with 主进程上下文 + sync + 其它接口）:**
+
 ```python
 import queue as py_queue
 from zsdtdx import (
@@ -268,6 +304,7 @@ with get_client():
 ```
 
 **调用示例（写法二：async 独立进程池调用 + prewarm/restart/destroy）:**
+
 ```python
 from zsdtdx import (
     destroy_parallel_fetcher,
@@ -302,10 +339,14 @@ finally:
 ```
 
 **连接生命周期说明:**
+
 - `mode="sync"`：主要使用主进程连接；with 结束会关闭主进程 client 连接。
-- `mode="async"`：主要使用 worker 连接；with 结束不会直接关闭 worker 连接，worker 连接由并行抓取器按进程池生命周期管理。
+- `mode="async"`：父进程先固化每个股票/指数任务的 std/ex 路由；worker 只为当前 bundle 对应侧懒建连接，纯 std 不建立 ex 业务连接，纯 ex 不建立 std 业务连接。
+- CPU 推导的进程数只是硬上限。某一侧同时在飞进程数按可达地址数 H 与总进程数 C 计算：地址不少于进程时用满 C；进程多于地址时上限为 `min(C, H × per_host)`。标准/扩展的 `per_host` 分开配置。父进程提交窗口为进程数 × `task_chunk_max_inflight_multiplier`，标准侧地址配额按该倍率放大以填满进程池队列；扩展侧不放大。
+- 重试耗尽后的连接不可用、超时或 watchdog 降低对应地址配额并冷却；chunk 重试成功或成功切到其他地址不降配额。冷却结束后成功时每次 +1 回到拥塞前上限，不向外探测更高上限。多个同时运行的 async job 共用该容量状态。纯单侧任务不占另一侧连接；混合任务按两侧各自预算并行。
 
 **返回:**
+
 - mode="sync": 始终返回 `list[task_payload]`（无论是否传 queue）。
   - 未传 queue：结果仅在返回值中。
   - 传了 queue：结果既在返回值中，也会同步推送到 queue。
@@ -313,8 +354,9 @@ finally:
   - 未传 queue：可从自动创建的 `job.queue` 消费事件。
   - 传了 queue：可从传入的 queue（即 `job.queue`）消费事件。
 - task_payload 结构:
-  `{"event":"data","task":{...},"rows":[...],"error":str|None,"worker_pid":int}`。
+`{"event":"data","task":{...},"rows":[...],"error":str|None,"worker_pid":int}`。
   > 示例：
+  >
   > ```json
   > {"event": "data",
   >  "task": {"code": "600000", "freq": "d", "start_time": "2026-02-01 09:30:00", "end_time": "2026-02-02 16:00:00"},
@@ -322,29 +364,35 @@ finally:
   >  "error": null, "worker_pid": 7200}
   > ```
 - 队列最终会额外推送 done 事件:
-  `{"event":"done","total_tasks":...,"success_tasks":...,"failed_tasks":...}`。
+`{"event":"done","total_tasks":...,"success_tasks":...,"failed_tasks":...}`。
+
+
 
 #### get_index_kline
 
 获取指数 K 线任务结果（按指数名称输入，支持同步/异步与队列实时回传）。
 
 **调用前置约定:**
+
 - `mode="sync"`：走 `ParallelFetcher` 的主进程 inproc chunk 路径；若当前已进入 `with get_client():`，其它主进程 API 仍可继续复用该上下文连接。
 - `mode="async"`：走 `ParallelFetcher` 的进程池 chunk 路径，worker 会独立创建并复用自己的连接，不依赖 with 上下文。
 
 **输入:**
+
 - task: 任务列表，元素是 `IndexKlineTask` 或 dict，字段:
-  `{index_name, freq, start_time, end_time}`。
+`{index_name, freq, start_time, end_time}`。
 - queue: 可选队列，需支持 `put()`。
 - preprocessor_operator: 可选钩子，签名 `f(payload)->dict|None`（默认数值刻度由协议解析层统一）。
 - mode: `"sync"` 或 `"async"`，默认 `"async"`。
 - start_time/end_time: 规则与 `get_stock_kline` 相同（仅日期时补齐为 09:30:00 / 16:00:00）。
 - task 缺省行为：`mode="async"` 且 `task` 为 `None` 或空列表时，自动构建默认任务（全量指数目录 × 日线 × 近 7 天）；`mode="sync"` 必须显式传入非空 task。
 
-**K 线 `datetime` 输出契约:**
+**K 线** `datetime` **输出契约:**
+
 - 与 `get_stock_kline` 相同：`YYYY-MM-DD HH:MM:SS`，秒位固定 `:00`。
 
 **调用示例:**
+
 ```python
 import queue as py_queue
 from zsdtdx import IndexKlineTask, get_index_kline
@@ -362,43 +410,57 @@ print(result)
 ```
 
 **名称匹配与报错:**
+
 - 先做精确匹配（支持别名标准化），例如 `上证综指 -> 上证指数`。
 - 未命中时抛错并返回“名称片段候选”。
 - 路由由后台动态发现：标准行情 `get_security_list`（深沪京）+ 扩展 `get_instrument_info`（中证等）。
 - 抓取失败时，会自动刷新路由后重试一次。
 
+
+
 #### （一般无需手动调用）prewarm_parallel_fetcher
 
-手动预热 async 并行抓取进程池与 worker 常驻连接。使用 config 中的 `parallel.auto_prewarm_*` 参数（config 来源：用户 `set_config_path()` 后使用用户提供的配置文件，如果没有调用则使用包内默认配置文件 `config.yaml`）。若 config 读取失败，则使用内部兜底值。
+手动预热 async 并行抓取进程池。预热只拉起 worker 进程，不建立 std/ex 行情连接；实际连接由 route-homogeneous bundle 按任务侧懒建。预热超时固定 60 秒、最多 3 轮，不从 YAML 读取。
 
 **输出:**
+
 - 预热摘要字典（目标进程数、已预热进程数、pid 列表、耗时等）。
 
 **什么时候调用:**
+
 - 服务启动阶段：希望把 async 首次冷启动成本前移。
-- 压测/批跑前：希望先确认 worker 建连健康再开始任务。
+- 压测/批跑前：希望先完成 Windows spawn 与模块加载成本。
 
 **边界条件:**
-- 默认 `require_all_workers=True`；若预热不足会抛 RuntimeError。
+
+- `require_all_workers=True` 时只校验目标 worker 进程是否已启动，不再要求 std/ex 同时建连成功。
+
+
 
 #### （一般无需手动调用）restart_parallel_fetcher
 
 强制重启 async 并行抓取进程池（终止旧 worker 并按需预热）。
 
 **输入:**
+
 - prewarm: 重启后是否立即预热新池。
 - prewarm_timeout_seconds: 重启后预热总超时（秒）。
 - max_rounds: 重启后预热轮次上限。
 
 **输出:**
+
 - 重启摘要字典（旧 pid、终止结果、预热摘要、耗时等）。
 
 **什么时候调用:**
+
 - 出现连续 timeout/连接异常，怀疑 worker 状态异常时。
 - 需要快速回收并重建 worker 连接状态时。
 
 **边界条件:**
+
 - 即便旧池不存在也会返回摘要，不抛错。
+
+
 
 #### （一般无需手动调用）destroy_parallel_fetcher
 
@@ -406,38 +468,46 @@ print(result)
 主进程正常退出时进程池会自行销毁。
 
 **输入:**
+
 - 无显式输入参数。
 
 **输出:**
+
 - 销毁摘要字典（是否存在旧池、旧 worker 数、销毁后版本号、耗时）。
 
 **什么时候调用:**
+
 - 长驻服务优雅停机前，主动释放 worker 与连接资源。
 - 短脚本结束前，避免保留并行进程池到解释器退出阶段。
 
 **边界条件:**
+
 - 进程池不存在时安全返回，不抛错。
+
+
 
 #### get_future_kline
 
 获取商品期货 K 线（支持多周期并行获取，返回合并后的 DataFrame）。
 
 **调用前置约定:**
+
 - 请先进入 `with get_client():`；
 
-
 **输入:**
+
 - codes: 期货代码，支持 str/list/tuple/set；纯品种代码按码表名称含「主连」的合约补全（如 `AL` -> `ALL8`，`CU` -> `CUL8`）。
-  为空时获取全部商品期货。带 3~4 位合约月份或 `L7/L8/L9` 连续合约原样查询（如 `CU2603`、`CUL9` 加权）。
-  该品种码表中无主连时抛错。
+为空时获取全部商品期货。带 3~4 位合约月份或 `L7/L8/L9` 连续合约原样查询（如 `CU2603`、`CUL9` 加权）。
+该品种码表中无主连时抛错。
 - freq: 周期，支持 str 或列表，如 `"d"` / `["d", "60", "30"]`。
-  支持周期: d/w/m/60min/30min/15min/5min 与 60/30/15/5。
+支持周期: d/w/m/60min/30min/15min/5min 与 60/30/15/5。
 - start_time/end_time: 支持字符串/date/datetime，底层过滤按闭区间 `[start_time, end_time]` 执行。
-  若传入不带时分秒的日期字符串，自动补齐为 start=09:00:00、end=15:00:00。
-  例如 `2026-02-13` 等价于 `start_time="2026-02-13 09:00:00"`、`end_time="2026-02-13 15:00:00"`。
+若传入不带时分秒的日期字符串，自动补齐为 start=09:00:00、end=15:00:00。
+例如 `2026-02-13` 等价于 `start_time="2026-02-13 09:00:00"`、`end_time="2026-02-13 15:00:00"`。
 - 期货无复权，不提供 `qfq`。
 
 **调用示例:**
+
 ```python
 from zsdtdx import get_client, get_future_kline
 
@@ -454,8 +524,10 @@ with get_client():
 ```
 
 **返回:**
+
 - pd.DataFrame: 包含所有获取的数据，字段:
-  code, freq, open, close, high, low, settlement_price, volume, datetime
+code, freq, open, close, high, low, settlement_price, volume, datetime
+
 
 
 #### get_company_info
@@ -463,10 +535,12 @@ with get_client():
 获取股票公司信息；默认并行，可选顺序。
 
 **调用前置约定:**
+
 - `mode="sync"`：请先进入 `with get_client():`，主进程按 codes 顺序拉取。
 - `mode="async"`（默认）：走进程池并行，不依赖主进程 with 连接；退出前建议 `destroy_parallel_fetcher()`。
 
 **输入:**
+
 - codes: 股票代码列表（一只也须写成 `["600000"]`）。
 - category: 中文分类名列表；**sync/async 共用同一语义**——传入则只拉这些分类，为 None/空则拉全部分类。
 - mode: `async`（默认）或 `sync`（无论 codes 长短均顺序跑）。
@@ -474,10 +548,12 @@ with get_client():
 - return_df: **仅 sync 最终返回**时生效（None 跟随 `output.return_df_default`）；中间传递始终为 `list[dict]`，不用 DataFrame。
 
 **返回:**
+
 - `mode="sync"`: `list[dict]` 或 DataFrame。
 - `mode="async"`: `StockKlineJob`；从 `job.queue` 消费至 `event="done"`；`job.result()` 为全部行 list[dict]。
 
 **调用示例:**
+
 ```python
 from zsdtdx import destroy_parallel_fetcher, get_client, get_company_info
 
@@ -501,93 +577,117 @@ with get_client():
 ```
 
 **返回示例（sync list / 队列 data.rows 元素）:**
+
 ```json
 [{"code": "689009", "category": "公司概况", "content": "......"}]
 ```
+
+
 
 #### get_stock_latest_price
 
 获取股票实时最新价字典。
 
 **调用前置约定:**
+
 - 请先进入 `with get_client():`；
 
-
 **输入:**
+
 - codes: 可选股票代码列表；支持 `sh./sz./bj./hk.` 前缀；
-  为空时按 `config.yaml.stock_scope.defaults_when_codes_none.get_stock_latest_price`
-  拉取默认范围全量股票；显式传入代码时不受该范围开关影响。
-  停牌时回退昨收；未上市占位（现价与昨收都非正）为 None，随整批一次解析，不额外重试。
-  单票无有效报价不会把同批其它代码打成 None。
+为空时按 `config.yaml.stock_scope.defaults_when_codes_none.get_stock_latest_price`
+拉取默认范围全量股票；显式传入代码时不受该范围开关影响。
+停牌时回退昨收；未上市占位（现价与昨收都非正）为 None，随整批一次解析，不额外重试。
+单票无有效报价不会把同批其它代码打成 None。
 
 **调用示例:**
+
 - 1个code:
+
 ```python
 from zsdtdx import get_client, get_stock_latest_price
 
 with get_client():
     one = get_stock_latest_price("600000")
 ```
+
 - 2个code:
+
 ```python
 with get_client():
     two = get_stock_latest_price(["600000", "09988"])
 ```
+
 - 全部code:
+
 ```python
 with get_client():
     all_prices = get_stock_latest_price()
 ```
 
 **返回示例:**
+
 ```json
 {"600000": 9.98, "09988": 158.5}
 ```
+
+
 
 #### get_future_latest_price
 
 获取商品期货实时最新价字典。
 
 **调用前置约定:**
+
 - 请先进入 `with get_client():`；
 
-
 **输入:**
+
 - codes: 可选期货代码列表；纯品种代码按码表主连合约补全；为空时拉取全部商品期货。
 
 **调用示例:**
+
 - 1个code:
+
 ```python
 from zsdtdx import get_client, get_future_latest_price
 
 with get_client():
     one = get_future_latest_price("CU2603")
 ```
+
 - 2个code:
+
 ```python
 with get_client():
     two = get_future_latest_price(["AL", "CU2603"])
 ```
+
 - 全部code:
+
 ```python
 with get_client():
     all_prices = get_future_latest_price()
 ```
 
 **返回示例:**
+
 ```json
 {"ALL8": 23610.0, "CU2603": 102330.0}
 ```
+
+
 
 #### get_runtime_failures
 
 获取运行期失败/无数据明细。
 
 **调用前置约定:**
+
 - 请先进入 `with get_client():`；
 
-
 **调用示例:**
+
 ```python
 from zsdtdx import get_client, get_runtime_failures
 
@@ -596,19 +696,23 @@ with get_client():
 ```
 
 **返回示例:**
+
 ```json
 [{"task": "stock_kline", "code": "999999", "freq": "d", "reason": "code_not_found"}]
 ```
+
+
 
 #### get_runtime_metadata
 
 获取运行元数据快照。
 
 **调用前置约定:**
+
 - 请先进入 `with get_client():`；
 
-
 **调用示例:**
+
 ```python
 from zsdtdx import get_client, get_runtime_metadata
 
@@ -617,9 +721,12 @@ with get_client():
 ```
 
 **返回示例:**
+
 ```json
 {"config_path": "<auto>", "std_active_host": "114.117.72.207:7709"}
 ```
+
+
 
 ### 默认配置文件内容（可复制）
 
@@ -661,78 +768,12 @@ hosts:
     - "1.202.143.37:7709"  # 银河证券富丰电信
     - "111.203.134.118:7709"  # 银河证券富丰联通
     - "117.133.128.226:7709"  # 银河证券富丰移动
-  # 通达信官方（已停用，保留备查）：来源通达信安装目录 connect.cfg [HQHOST] 48 站，端口均为 7709。
-  #    - "110.41.147.114:7709"
-  #    - "110.41.2.72:7709"
-  #    - "101.33.225.16:7709"
-  #    - "175.178.112.197:7709"
-  #    - "175.178.128.227:7709"
-  #    - "43.139.95.83:7709"
-  #    - "124.223.163.242:7709"
-  #    - "122.51.120.217:7709"
-  #    - "150.158.160.2:7709"
-  #    - "123.60.164.122:7709"
-  #    - "111.229.247.189:7709"
-  #    - "124.70.199.56:7709"
-  #    - "62.234.50.143:7709"
-  #    - "81.70.151.186:7709"
-  #    - "82.156.214.79:7709"
-  #    - "159.75.29.111:7709"
-  #    - "43.139.18.171:7709"
-  #    - "81.71.32.47:7709"
-  #    - "122.51.232.182:7709"
-  #    - "118.25.98.114:7709"
-  #    - "121.36.225.169:7709"
-  #    - "123.60.70.228:7709"
-  #    - "123.60.73.44:7709"
-  #    - "124.70.133.119:7709"
-  #    - "124.71.187.72:7709"
-  #    - "124.71.187.122:7709"
-  #    - "119.97.185.59:7709"
-  #    - "129.204.230.128:7709"
-  #    - "101.42.240.54:7709"
-  #    - "124.71.9.153:7709"
-  #    - "123.60.84.66:7709"
-  #    - "111.230.186.52:7709"
-  #    - "101.43.159.194:7709"
-  #    - "120.53.8.251:7709"
-  #    - "152.136.191.169:7709"
-  #    - "116.205.163.254:7709"
-  #    - "116.205.171.132:7709"
-  #    - "116.205.183.150:7709"
-  #    - "49.232.15.141:7709"
-  #    - "82.156.174.84:7709"
-  #    - "101.42.164.241:7709"
-  #    - "101.35.121.35:7709"
-  #    - "111.231.113.208:7709"
-  #    - "43.136.95.205:7709"
-  #    - "43.136.96.138:7709"
-  #    - "101.33.244.209:7709"
-  #    - "106.53.63.234:7709"
-  #    - "119.91.226.89:7709"
   # 扩展行情 IP 池（港股/期货）。
   # 来源：银河证券海王星金融终端 connect.cfg [DSHOST]，端口 7720/7730（已去掉 IPv6）。
   # 格式: "ip:port" 字符串列表
   extended:
     - "114.117.72.207:7720"  # 银河腾讯云扩展行情
     - "118.31.28.30:7730"  # 银河阿里云扩展行情
-  # 通达信官方（已停用，保留备查）：来源通达信安装目录 connect.cfg [DSHOST] 16 站，端口均为 7727。
-  #    - "112.74.214.43:7727"
-  #    - "120.25.218.6:7727"
-  #    - "43.139.173.246:7727"
-  #    - "159.75.90.107:7727"
-  #    - "106.52.170.195:7727"
-  #    - "139.9.191.175:7727"
-  #    - "175.24.47.69:7727"
-  #    - "150.158.9.199:7727"
-  #    - "150.158.20.127:7727"
-  #    - "49.235.119.116:7727"
-  #    - "49.234.13.160:7727"
-  #    - "116.205.143.214:7727"
-  #    - "124.71.223.19:7727"
-  #    - "113.45.175.47:7727"
-  #    - "123.60.173.210:7727"
-  #    - "118.89.69.202:7727"
 
 pool:
   # 连接超时（秒）。
@@ -752,158 +793,52 @@ parallel:
   # 并行进程数倍率：推荐进程数 = max(2, int(物理核心数 * 该倍率))。
   # 取值: 正浮点数（建议 0.5~3.0）
   # 影响: 倍率越大并发越高，吞吐可能提升，但 CPU/内存占用也会上升。
-  process_count_core_multiplier: 1
-  # [DEPRECATED-E5] 以下 4 项仅用于尚未迁移的 get_future_kline → ParallelKlineFetcher.fetch_stock
-  # → _fetch_parallel DataFrame 批处理路径；该路径预计在后续 release 中迁移到 task/chunk/bundle 链路，
-  # 届时本组配置将整体删除。新工程不要在 task 链路上读取这些字段。
-  # 单次并行抓取的总超时（秒）。
-  # 取值: 正浮点数
-  # 影响: 超时后会回收未完成 future，并按策略触发强制回收与串行补拉。
-  parallel_total_timeout_seconds: 300
-  # [DEPRECATED-E5] 单个 future.result 的超时（秒）。
-  # 取值: 正浮点数
-  # 影响: 防止 worker 返回阶段异常阻塞。
-  parallel_result_timeout_seconds: 600
-  # [DEPRECATED-E5] 总超时后是否触发并行进程强制回收。
-  # 取值: true/false
-  force_recycle_on_timeout: true
-  # [DEPRECATED-E5] 总超时后是否对未完成任务回退串行补拉。
-  # 取值: true/false
-  timeout_fallback_to_serial: true
-  # chunk 级缓存启用阈值（适用于 get_stock_kline(task) / get_index_kline(task) 并行链路）。
+  process_count_core_multiplier: 5
+  # 父进程同时提交的 bundle 窗口 = 进程数 × 本值。
   # 取值: 正整数
-  # 影响: 当同一 chunk 任务数达到阈值时启用轻量缓存（stock 按 code+freq；index 按 index_name+freq）。
-  task_chunk_cache_min_tasks: 2
-  # worker/主进程内 chunk 协程并发上限（Semaphore）。
-  # 取值: 正整数
-  # 影响: 每个进程一次最多并发执行的 chunk 数（阻塞 IO 并行度）。
-  task_chunk_inproc_coroutine_workers: 3
-  # 父进程提交 chunk 批次的在飞窗口倍率。
-  # 取值: 正整数
-  # 影响: 在飞 future 上限 = 进程数 × 该倍率。
+  # 影响: 标准侧地址配额按本值放大，用来把下一批 bundle 放进进程池队列；扩展侧不放大。
   task_chunk_max_inflight_multiplier: 2
-  # chunk 重试时，若错误匹配"连接不可用"关键词，是否在重试前重建标准连接。
-  # 取值: true/false
-  # 影响: true 时可降低长任务尾部因连接失效导致的批量失败。
-  chunk_reconnect_on_unavailable: true
+  # 标准行情每个可达地址允许同时摊到的进程数。
+  # 取值: 正整数
+  # 影响: 地址不少于总进程时该侧用满总进程；进程多于地址时该侧上限 = min(总进程数, 地址数 × 本值)。
+  adaptive_processes_per_host_std: 4
+  # 扩展行情每个可达地址允许同时摊到的进程数；与标准侧分开配置。
+  # 取值: 正整数
+  # 影响: 扩展地址很少时把同时在飞进程压在 地址数 × 本值，避免 40 个进程打两个站。
+  adaptive_processes_per_host_ex: 4
+  # 重试耗尽后的连接不可用、超时或 watchdog 后保留的该地址进程配额比例。
+  # 取值: 0~1 浮点数（建议 0.3~0.8）
+  # 影响: chunk 重试成功或成功切到其他地址不降配额；只在最终仍失败时退避。
+  adaptive_decrease_factor: 0.75
+  # host 触发拥塞后的冷却秒数。
+  # 取值: 非负浮点数
+  # 影响: 冷却期间不向该 host 分配新 bundle；结束后保持降后的配额，成功时每次 +1 直到回到拥塞前上限。
+  adaptive_cooldown_seconds: 1.5
   # 单次 chunk 抓取尝试墙钟上限（秒）：仅约束每一次 get_*_kline_rows_for_chunk_tasks（含该次建连与网络 IO）。
   # 不含入口归一化失败；不含 bundle 级预热建连；不含重试累计（重试由 chunk_retry_max_attempts 单独控制，每次尝试各算本上限）。
   # 取值: 正浮点数
-  # 影响: 单次尝试超时/失败可触发重试；最坏墙钟约 chunk_timeout_seconds × (1 + chunk_retry_max_attempts)。
+  # 影响: 到点关闭本次尝试的 socket，阻塞中的 connect/recv 返回并按失败结束；重连同样受本上限约束。最坏墙钟约 chunk_timeout_seconds × (1 + chunk_retry_max_attempts)。
   # 调优指南（D4）: 5s 适合超低延迟内网；公网/弱网建议 15s+，避免短超时频繁触发重连放大尾延迟。
   chunk_timeout_seconds: 15
   # chunk 超时或报错后的最大重试次数。
   # 取值: 非负整数
   # 影响: 每个 chunk 最多重试 N 次（超时、连接不可用、其他异常均触发），避免无限重试拖慢整体吞吐。
   chunk_retry_max_attempts: 2
-  # bundle watchdog 额外宽限时间（秒）：父进程按 chunk_timeout_seconds × (1 + chunk_retry_max_attempts)
-  # 推导单个 bundle 理论上限，再额外增加该宽限；超出后视为 worker 内线程/协程超时失效。
-  # 取值: 非负浮点数
-  # 影响: 值越小越快回收卡死 worker，但弱网下误判概率增加。
-  bundle_watchdog_grace_seconds: 10
-  # async 调用时是否自动预热进程池与 worker 常驻连接（适用于 stock/index）。
-  # 取值: true/false
-  # 影响: true 时 async 首次调用会自动触发 prewarm，降低冷启动抖动。
-  auto_prewarm_on_async: true
-  # 自动预热时是否要求所有 worker 都完成预热。
-  # 取值: true/false
-  # 影响: true 时只要有 worker 预热不足会直接失败并抛错。
-  auto_prewarm_require_all_workers: true
-  # 自动预热总超时（秒）。
-  # 取值: 正浮点数
-  # 影响: 控制 async 自动预热最多等待时长。
-  auto_prewarm_timeout_seconds: 60
-  # 自动预热最大轮次。
-  # 取值: 正整数
-  # 影响: 每轮会向进程池提交探针任务以拉齐 worker 预热状态。
-  auto_prewarm_max_rounds: 3
-  # 公司信息并行：每个进程内同时处理的股票数。
-  # 取值: 正整数
-  # 影响: 进程内股票级 ThreadPool 并发度；过大易触发行情站限流。
-  company_info_stock_inproc_workers: 3
-  # 公司信息并行：单股内标签正文并发线程数。
-  # 取值: 正整数
-  # 影响: 目录拉完后并发抓各标签；过大时连接数≈进程数×股票并发×标签并发。
-  company_info_category_workers: 3
-  # 公司信息并行：提交到单个 worker future 的股票数。
-  # 取值: 正整数
-  # 影响: chunk 越大调度开销越低，但单 future 失败影响面越大。
-  company_info_codes_per_chunk: 40
-  # 公司信息并行：父进程在飞 chunk 窗口倍率。
-  # 取值: 正整数
-  # 影响: 在飞 future 上限 = 进程数 × 该倍率。
-  company_info_max_inflight_multiplier: 2
 
 pagination:
-  # 标准行情 get_security_list 单页数量（命令 0x044D）。
-  # 取值: 正整数；官方客户端单页 1600
-  standard_security_list_page_size: 1600
-  # 扩展行情 get_instrument_info 短页结束阈值。
-  # 服务端决定本页条数；返回条数小于本值则结束翻页。
-  extended_instrument_info_page_size: 800
-  # 标准行情 K线单页数量（get_security_bars / get_index_bars）。
-  # 取值: 正整数；服务端硬上限 800
-  standard_kline_page_size: 800
   # 个股 K 线是否请求服务器前复权（A 股 reserved0；港股 extra）。
   # 取值: true=前复权，false=不复权。期货无复权，get_future_kline 不使用本项。
   standard_kline_qfq: true
-  # 扩展行情 K线单页数量（get_instrument_bars）。
-  # 取值: 正整数；服务端硬上限 700
-  extended_kline_page_size: 700
-  # 公司信息正文单页上限（字节）。服务端硬上限 30720；请求的 length 填剩余总字节。
-  # 取值: 正整数
-  company_info_chunk_size: 30720
-  # 标准行情命名文件（0x06B9）单页字节。服务端与官方客户端均为 30000。
-  named_file_chunk_size: 30000
-  # K线最大分页次数上限，防止异常场景下无限循环。
-  # 取值: 正整数
-  max_kline_pages: 400
 
 catalog_cache:
   # 标准/扩展码表与 ETF/LOF 名称板块的磁盘缓存：按自然日分文件保存，使用时再过滤。
   # ETF 文件为 etf_code_name.pkl；当日已有则 get_etf_code_name 不再下载 0x02C5/0x06B9。
   enabled: true
-  # 刷新粒度：day 表示当天首次下载，日内内存与磁盘复用。
-  refresh_granularity: day
   # 可选：手动指定缓存目录（文件路径则取其父目录）。
   # 留空时自动选择用户可写目录；不可写会回退系统临时目录。
   path: ""
 
 market_rules:
-  # 北京股票代码前缀集合（标准行情 market=2）。
-  include_beijing_prefixes:
-    - "92"
-  # 深圳 A 股前缀集合（标准市场）。
-  stock_prefix_sz:
-    - "000"
-    - "001"
-    - "002"
-    - "003"
-    - "300"
-    - "301"
-    - "302"
-  # 上海 A 股前缀集合（标准市场）。
-  stock_prefix_sh:
-    - "600"
-    - "601"
-    - "603"
-    - "605"
-    - "688"
-    - "689"
-  # 纳入“商品期货”集合的扩展市场名称。
-  future_market_names:
-    - "郑州商品"
-    - "大连商品"
-    - "上海期货"
-    - "广州期货"
-  # 场内 ETF/LOF 远程完整名称文件（标准行情 0x02C5/0x06B9）。
-  # 作用对象: get_etf_code_name；当日结果写入 catalog_cache，不读银河安装目录。
-  etf_name_remote_file: "infoharbor_ex.name"
-  # ETF/LOF 板块成分文件（远程路径带 spec/ 前缀；逗号分隔，首列市场 0/1、次列代码）。
-  # 板块成分不要求名称含 etf/lof；任一份解析为空则整次下载作废、不写当日缓存。
-  etf_board_remote_files:
-    - "spec/specetfdata.txt"
-    - "spec/speclofdata.txt"
   # 场内 ETF/LOF 名称二次剔除子串（去空白后命中任一即丢弃）。
   # 作用对象: get_etf_code_name。etf/lof 初筛只用于名称文件中的额外代码，板块成分不走初筛。
   etf_name_drop_substr:
@@ -936,11 +871,11 @@ stock_scope:
     # 2) 非法值会被忽略；若全非法会回退为 szsh。
     # 3) 显式传入 codes 时，不受这里配置影响。
     get_stock_code_name:
-      - "szsh"
+      - "szsh+bj"
     get_stock_latest_price:
-      - "szsh"
+      - "szsh+bj"
     get_stock_kline:
-      - "szsh"
+      - "szsh+bj"
 
 output:
   # 默认返回 DataFrame 还是 list[dict]。
@@ -955,9 +890,6 @@ output:
   # 是否过滤停牌/占位K线。
   # 取值: true/false
   filter_suspended_placeholder_bar: true
-  # 占位K线成交量/成交额“极小值”阈值。
-  # 取值: 非负浮点数（科学计数法可用）
-  suspended_placeholder_eps: 1.0e-20
 
 index_kline:
   # 运行时动态发现 ex 指数市场的优先候选列表（用于名称->路由解析）。
@@ -967,11 +899,6 @@ index_kline:
   # 指数别名：先将用户输入转换为标准名称，再执行精确匹配。
   aliases:
     上证综指: 上证指数
-  lookup:
-    # 名称未命中时，错误中最多返回多少个候选名称。
-    max_candidates: 10
-    # 名称匹配前是否移除空白字符（半角/全角空格等）。
-    normalize_whitespace: true
 ```
 
 - `catalog_cache` 说明：
@@ -980,21 +907,13 @@ index_kline:
   - 股票 / 期货 / 指数在使用时从对应侧过滤；指数会同时确保 std 与 ex 当日缓存最新。
   - 默认缓存位置会自动选择用户可写目录（Windows: `LOCALAPPDATA`，Linux: `XDG_CACHE_HOME` 或 `~/.cache`）。
   - 若目标目录不可写，会自动回退到系统临时目录；仍不可写时自动禁用磁盘缓存，不影响主流程。
-
 - 常用并行配置位于 `parallel` 段：
   - `process_count_core_multiplier`
-  - `task_chunk_cache_min_tasks`
-  - `task_chunk_inproc_coroutine_workers`
   - `task_chunk_max_inflight_multiplier`
-  - `chunk_reconnect_on_unavailable`
+  - `adaptive_processes_per_host_std`
+  - `adaptive_processes_per_host_ex`
+  - `adaptive_decrease_factor`
+  - `adaptive_cooldown_seconds`
   - `chunk_timeout_seconds`
   - `chunk_retry_max_attempts`
-  - `bundle_watchdog_grace_seconds`
-  - `auto_prewarm_on_async`
-  - `auto_prewarm_require_all_workers`
-  - `auto_prewarm_timeout_seconds`
-  - `auto_prewarm_max_rounds`
-  - `company_info_stock_inproc_workers`
-  - `company_info_category_workers`
-  - `company_info_codes_per_chunk`
-  - `company_info_max_inflight_multiplier`
+

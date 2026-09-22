@@ -55,5 +55,24 @@ class TDXParams:
     MAX_EXTENDED_KLINE_COUNT = 700
     # 标准行情码表 0x044D 单页条数
     MAX_SECURITY_LIST_COUNT = 1600
+    # 扩展行情码表短页结束阈值
+    EXTENDED_INSTRUMENT_INFO_PAGE_SIZE = 800
+    # K 线向更早历史翻页的次数上限
+    MAX_KLINE_PAGES = 400
+    # 公司信息正文单页字节，服务端上限 30720
+    COMPANY_INFO_CHUNK_SIZE = 30720
+    # 标准行情命名文件 0x06B9 单页字节
+    NAMED_FILE_CHUNK_SIZE = 30000
     # 标准行情码表单条 37 字节（名称字段 16 字节 GBK）
     SECURITY_LIST_RECORD_SIZE = 37
+
+    # 北京股票代码前缀（标准行情 market=2）
+    BEIJING_CODE_PREFIXES = ("92",)
+    # 深圳 / 上海 A 股代码前缀
+    STOCK_PREFIX_SZ = ("000", "001", "002", "003", "300", "301", "302")
+    STOCK_PREFIX_SH = ("600", "601", "603", "605", "688", "689")
+    # 纳入商品期货的扩展市场名称
+    FUTURE_MARKET_NAMES = ("郑州商品", "大连商品", "上海期货", "广州期货")
+    # 场内 ETF/LOF 远程名称文件与板块成分文件
+    ETF_NAME_REMOTE_FILE = "infoharbor_ex.name"
+    ETF_BOARD_REMOTE_FILES = ("spec/specetfdata.txt", "spec/speclofdata.txt")

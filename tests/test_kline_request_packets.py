@@ -102,17 +102,10 @@ def test_pack_standard_kline_request_count_800_first_page():
 
 
 def test_default_standard_kline_page_size_is_800():
-    """输入：包内 config 与客户端缺省；输出：标准 K 线单页默认 800。"""
-    from pathlib import Path
-
-    import yaml
-
+    """输入：协议常量与客户端缺省；输出：标准 K 线单页 800。"""
     from zsdtdx.params import TDXParams
     from zsdtdx.unified_client import UnifiedTdxClient
 
-    cfg_path = Path(__file__).resolve().parents[1] / "src" / "zsdtdx" / "config.yaml"
-    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-    assert cfg["pagination"]["standard_kline_page_size"] == 800
     assert TDXParams.MAX_KLINE_COUNT == 800
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
     client.pagination = {}

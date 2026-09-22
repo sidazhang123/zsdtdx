@@ -123,17 +123,7 @@ def test_pack_extended_kline_request_count_700_first_page():
 
 
 def test_default_extended_kline_page_size_is_700():
-    """输入：包内 config 与协议常量；输出：扩展 K 线单页默认 700（服务端硬上限）。"""
-    from pathlib import Path
-
-    import yaml
-
+    """输入：协议常量；输出：扩展 K 线单页 700（服务端硬上限）。"""
     from zsdtdx.params import TDXParams
 
-    cfg = yaml.safe_load(
-        (
-            Path(__file__).resolve().parents[1] / "src" / "zsdtdx" / "config.yaml"
-        ).read_text(encoding="utf-8")
-    )
-    assert cfg["pagination"]["extended_kline_page_size"] == 700
     assert TDXParams.MAX_EXTENDED_KLINE_COUNT == 700

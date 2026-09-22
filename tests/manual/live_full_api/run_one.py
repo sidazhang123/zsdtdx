@@ -41,9 +41,6 @@ def _ensure_test_config() -> Path:
     dst = _ART / "live_test_config.yaml"
     text = src.read_text(encoding="utf-8")
     repl = {
-        "parallel_total_timeout_seconds: 300": "parallel_total_timeout_seconds: 7200",
-        "parallel_result_timeout_seconds: 600": "parallel_result_timeout_seconds: 7200",
-        "auto_prewarm_timeout_seconds: 60": "auto_prewarm_timeout_seconds: 180",
         "chunk_timeout_seconds: 15": "chunk_timeout_seconds: 30",
     }
     for old, new in repl.items():

@@ -288,8 +288,8 @@ def test_parallel_fetcher_load_config_uses_resolve_and_active_path(tmp_path):
     set_active_config_path(str(custom_cfg.resolve()))
     fetcher = ParallelKlineFetcher(config_path=None)
     assert fetcher.config_path == str(custom_cfg.resolve())
-    assert float(fetcher.auto_prewarm_timeout_seconds) == 42.5
-    assert int(fetcher.auto_prewarm_max_rounds) == 7
+    assert float(fetcher.auto_prewarm_timeout_seconds) == 60.0
+    assert int(fetcher.auto_prewarm_max_rounds) == 3
 
 
 def test_restart_parallel_fetcher_reads_config_defaults(monkeypatch):
@@ -394,7 +394,7 @@ def test_parallel_fetcher_loads_coroutine_workers_from_config(tmp_path):
 
     set_active_config_path(str(custom_cfg.resolve()))
     fetcher = ParallelKlineFetcher(config_path=None)
-    assert int(fetcher.task_chunk_inproc_coroutine_workers) == 9
+    assert int(fetcher.task_chunk_inproc_coroutine_workers) == 3
 
 
 def test_fetch_one_task_chunk_async_timeout_marks_all_tasks_failed():
@@ -443,6 +443,7 @@ def test_fetch_one_task_chunk_async_timeout_marks_all_tasks_failed():
     assert all(
         "attempt timeout" in str(item.get("error") or "").lower() for item in payloads
     )
+    assert report.get("congested") is True
 
 
 def test_index_chunk_partition_refresh_at_most_once():

@@ -534,7 +534,7 @@ def get_stock_kline(
         restart_parallel_fetcher,
     )
 
-    # 预热参数由 config.yaml 的 parallel.auto_prewarm_* 控制
+    # 预热固定为开启、不要求全部 worker 成功、超时 60 秒、最多 3 轮。
     prewarm_parallel_fetcher()
     job = get_stock_kline(
         task=[{"code": "600000", "freq": "d", "start_time": "2026-02-13", "end_time": "2026-02-13"}],
@@ -767,25 +767,24 @@ def get_index_kline(
 
 def prewarm_parallel_fetcher() -> Dict[str, Any]:
     """
-    手动预热 async 并行抓取进程池与 worker 常驻连接。
+    手动预热 async 并行抓取进程池。
 
-    使用 config 中的 parallel.auto_prewarm_* 参数（config 来源：用户 set_config_path() 后使用用户提供的配置文件，如果没有调用则使用包内默认配置文件 config.yaml）。
-    若 config 读取失败，则使用内部兜底值。
+    预热固定开启，不要求全部 worker 成功，超时 60 秒，最多 3 轮。这些值写死在抓取器里，不从 YAML 读取。
 
     输出:
     - 预热摘要字典（目标进程数、已预热进程数、pid 列表、耗时等）。
 
     什么时候调用:
     - 服务启动阶段：希望把 async 首次冷启动成本前移。
-    - 压测/批跑前：希望先确认 worker 建连健康再开始任务。
+    - 压测/批跑前：希望先承担 Windows spawn 与模块加载成本。
 
     边界条件:
-    - 默认从 config 读取参数；若 config 读取失败则使用兜底值。
+    - 仅拉起 worker 进程，不建立 std/ex 行情连接；业务连接按实际任务路由懒建。
     - 若预热不足会抛 RuntimeError。
     """
     _ensure_active_config_ready(caller_name="prewarm_parallel_fetcher")
     fetcher = get_fetcher()
-    # 从 config 读取参数，兜底到内部默认值
+    # 预热超时与轮次是抓取器常数，不是 YAML 项。
     require_all_workers = getattr(fetcher, "auto_prewarm_require_all_workers", True)
     timeout_seconds = getattr(fetcher, "auto_prewarm_timeout_seconds", 60.0)
     max_rounds = getattr(fetcher, "auto_prewarm_max_rounds", 3)
@@ -809,8 +808,8 @@ def restart_parallel_fetcher(
 
     输入:
     - prewarm: 重启后是否立即预热新池；None 时默认 True。
-    - prewarm_timeout_seconds: 重启后预热总超时（秒）；None 时从 config 的 parallel.auto_prewarm_timeout_seconds 读取。
-    - max_rounds: 重启后预热轮次上限；None 时从 config 的 parallel.auto_prewarm_max_rounds 读取。
+    - prewarm_timeout_seconds: 重启后预热总超时（秒）；None 时用抓取器常数 60。
+    - max_rounds: 重启后预热轮次上限；None 时用抓取器常数 3。
 
     输出:
     - 重启摘要字典（旧 pid、终止结果、预热摘要、耗时等）。
@@ -821,7 +820,7 @@ def restart_parallel_fetcher(
 
     边界条件:
     - 即便旧池不存在也会返回摘要，不抛错。
-    - 未传预热参数时与 prewarm_parallel_fetcher 一样从当前 fetcher 配置读取。
+    - 未传预热参数时使用抓取器上的固定预热常数。
     """
     _ensure_active_config_ready(caller_name="restart_parallel_fetcher")
     fetcher = get_fetcher()
@@ -873,7 +872,7 @@ def get_future_kline(
 
     调用前置约定:
     - 本接口走主进程 `ParallelKlineFetcher.fetch_stock` → `_fetch_parallel`（DataFrame 批处理），与 `get_stock_kline` task 路径不同。
-    - 建议在 `with get_client():` 内调用以复用主进程连接；超时回收受 `parallel_total_timeout_seconds` 等配置约束。
+    - 建议在 `with get_client():` 内调用以复用主进程连接。批处理总超时固定 300 秒，单 future 超时固定 600 秒，不从 YAML 读取。
 
     输入:
     - codes: 期货代码，支持 str/list/tuple/set；纯品种代码按码表名称含「主连」的合约补全（如 `AL` -> `ALL8`，`CU` -> `CUL8`）。
@@ -907,8 +906,8 @@ def get_future_kline(
 
     并行模式说明:
     - 入口策略: 进程数 > 1 时默认并行；进程数不足时自动串行
-    - 进程数: 自动计算 = int(CPU物理核心数 × process_count_core_multiplier)，至少2个进程
-      （`process_count_core_multiplier` 位于 `config.yaml.parallel`，默认 1）
+    - 进程数: 自动计算 = max(2, int(CPU物理核心数 × process_count_core_multiplier))
+      （`process_count_core_multiplier` 位于 `config.yaml.parallel`，建议 0.5~3.0，具体数值以配置文件为准）
     - 全局进程池: 首次并行调用时创建（约2-3秒开销），后续调用复用，程序退出时统一关闭
     - 建议分批: 100个期货×5周期=500任务/批
 

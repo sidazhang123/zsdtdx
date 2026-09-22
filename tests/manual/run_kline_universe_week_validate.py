@@ -59,8 +59,8 @@ def _prepare_runtime_config(run: Dict[str, Any], art_dir: Path) -> Path:
     """
     输入：run 配置与产物目录。
     输出：可 set_config_path 的 yaml 路径。
-    用途：复制包内配置并拉长超时、写入股票 scope。
-    边界：覆盖 stock_scope 与 parallel 超时字段。
+    用途：复制包内配置并拉长 chunk 超时、写入股票 scope。
+    边界：只覆盖仍存在的 parallel 键；预热与期货批处理超时是代码常数。
     """
     base_rel = str(run.get("base_config") or "../../src/zsdtdx/config.yaml")
     base = (_MANUAL_DIR / base_rel).resolve()
@@ -77,11 +77,6 @@ def _prepare_runtime_config(run: Dict[str, Any], art_dir: Path) -> Path:
     cfg["stock_scope"] = stock_scope
 
     parallel = dict(cfg.get("parallel") or {})
-    parallel["parallel_total_timeout_seconds"] = 7200
-    parallel["parallel_result_timeout_seconds"] = 7200
-    parallel["auto_prewarm_timeout_seconds"] = 300
-    parallel["auto_prewarm_require_all_workers"] = False
-    parallel["auto_prewarm_max_rounds"] = 5
     parallel["chunk_timeout_seconds"] = 30
     parallel["chunk_retry_max_attempts"] = 3
     cfg["parallel"] = parallel

@@ -33,78 +33,12 @@ hosts:
     - "1.202.143.37:7709"  # 银河证券富丰电信
     - "111.203.134.118:7709"  # 银河证券富丰联通
     - "117.133.128.226:7709"  # 银河证券富丰移动
-  # 通达信官方（已停用，保留备查）：来源通达信安装目录 connect.cfg [HQHOST] 48 站，端口均为 7709。
-  #    - "110.41.147.114:7709"
-  #    - "110.41.2.72:7709"
-  #    - "101.33.225.16:7709"
-  #    - "175.178.112.197:7709"
-  #    - "175.178.128.227:7709"
-  #    - "43.139.95.83:7709"
-  #    - "124.223.163.242:7709"
-  #    - "122.51.120.217:7709"
-  #    - "150.158.160.2:7709"
-  #    - "123.60.164.122:7709"
-  #    - "111.229.247.189:7709"
-  #    - "124.70.199.56:7709"
-  #    - "62.234.50.143:7709"
-  #    - "81.70.151.186:7709"
-  #    - "82.156.214.79:7709"
-  #    - "159.75.29.111:7709"
-  #    - "43.139.18.171:7709"
-  #    - "81.71.32.47:7709"
-  #    - "122.51.232.182:7709"
-  #    - "118.25.98.114:7709"
-  #    - "121.36.225.169:7709"
-  #    - "123.60.70.228:7709"
-  #    - "123.60.73.44:7709"
-  #    - "124.70.133.119:7709"
-  #    - "124.71.187.72:7709"
-  #    - "124.71.187.122:7709"
-  #    - "119.97.185.59:7709"
-  #    - "129.204.230.128:7709"
-  #    - "101.42.240.54:7709"
-  #    - "124.71.9.153:7709"
-  #    - "123.60.84.66:7709"
-  #    - "111.230.186.52:7709"
-  #    - "101.43.159.194:7709"
-  #    - "120.53.8.251:7709"
-  #    - "152.136.191.169:7709"
-  #    - "116.205.163.254:7709"
-  #    - "116.205.171.132:7709"
-  #    - "116.205.183.150:7709"
-  #    - "49.232.15.141:7709"
-  #    - "82.156.174.84:7709"
-  #    - "101.42.164.241:7709"
-  #    - "101.35.121.35:7709"
-  #    - "111.231.113.208:7709"
-  #    - "43.136.95.205:7709"
-  #    - "43.136.96.138:7709"
-  #    - "101.33.244.209:7709"
-  #    - "106.53.63.234:7709"
-  #    - "119.91.226.89:7709"
   # 扩展行情 IP 池（港股/期货）。
   # 来源：银河证券海王星金融终端 connect.cfg [DSHOST]，端口 7720/7730（已去掉 IPv6）。
   # 格式: "ip:port" 字符串列表
   extended:
     - "114.117.72.207:7720"  # 银河腾讯云扩展行情
     - "118.31.28.30:7730"  # 银河阿里云扩展行情
-  # 通达信官方（已停用，保留备查）：来源通达信安装目录 connect.cfg [DSHOST] 16 站，端口均为 7727。
-  #    - "112.74.214.43:7727"
-  #    - "120.25.218.6:7727"
-  #    - "43.139.173.246:7727"
-  #    - "159.75.90.107:7727"
-  #    - "106.52.170.195:7727"
-  #    - "139.9.191.175:7727"
-  #    - "175.24.47.69:7727"
-  #    - "150.158.9.199:7727"
-  #    - "150.158.20.127:7727"
-  #    - "49.235.119.116:7727"
-  #    - "49.234.13.160:7727"
-  #    - "116.205.143.214:7727"
-  #    - "124.71.223.19:7727"
-  #    - "113.45.175.47:7727"
-  #    - "123.60.173.210:7727"
-  #    - "118.89.69.202:7727"
 
 pool:
   # 连接超时（秒）。
@@ -124,159 +58,52 @@ parallel:
   # 并行进程数倍率：推荐进程数 = max(2, int(物理核心数 * 该倍率))。
   # 取值: 正浮点数（建议 0.5~3.0）
   # 影响: 倍率越大并发越高，吞吐可能提升，但 CPU/内存占用也会上升。
-  process_count_core_multiplier: 1
-  # [DEPRECATED-E5] 以下 4 项仅用于尚未迁移的 get_future_kline → ParallelKlineFetcher.fetch_stock
-  # → _fetch_parallel DataFrame 批处理路径；该路径预计在后续 release 中迁移到 task/chunk/bundle 链路，
-  # 届时本组配置将整体删除。新工程不要在 task 链路上读取这些字段。
-  # 单次并行抓取的总超时（秒）。
-  # 取值: 正浮点数
-  # 影响: 超时后会回收未完成 future，并按策略触发强制回收与串行补拉。
-  parallel_total_timeout_seconds: 300
-  # [DEPRECATED-E5] 单个 future.result 的超时（秒）。
-  # 取值: 正浮点数
-  # 影响: 防止 worker 返回阶段异常阻塞。
-  parallel_result_timeout_seconds: 600
-  # [DEPRECATED-E5] 总超时后是否触发并行进程强制回收。
-  # 取值: true/false
-  force_recycle_on_timeout: true
-  # [DEPRECATED-E5] 总超时后是否对未完成任务回退串行补拉。
-  # 取值: true/false
-  timeout_fallback_to_serial: true
-  # chunk 级缓存启用阈值（适用于 get_stock_kline(task) / get_index_kline(task) 并行链路）。
+  process_count_core_multiplier: 5
+  # 父进程同时提交的 bundle 窗口 = 进程数 × 本值。
   # 取值: 正整数
-  # 影响: 当同一 chunk 任务数达到阈值时启用轻量缓存（stock 按 code+freq；index 按 index_name+freq）。
-  task_chunk_cache_min_tasks: 2
-  # worker/主进程内 chunk 协程并发上限（Semaphore）。
-  # 取值: 正整数
-  # 影响: 每个进程一次最多并发执行的 chunk 数（阻塞 IO 并行度）。
-  task_chunk_inproc_coroutine_workers: 3
-  # 父进程提交 chunk 批次的在飞窗口倍率。
-  # 取值: 正整数
-  # 影响: 在飞 future 上限 = 进程数 × 该倍率。
+  # 影响: 标准侧地址配额按本值放大，用来把下一批 bundle 放进进程池队列；扩展侧不放大。
   task_chunk_max_inflight_multiplier: 2
-  # chunk 重试时，若错误匹配"连接不可用"关键词，是否在重试前重建标准连接。
-  # 取值: true/false
-  # 影响: true 时可降低长任务尾部因连接失效导致的批量失败。
-  chunk_reconnect_on_unavailable: true
+  # 标准行情每个可达地址允许同时摊到的进程数。
+  # 取值: 正整数
+  # 影响: 地址不少于总进程时该侧用满总进程；进程多于地址时该侧上限 = min(总进程数, 地址数 × 本值)。
+  adaptive_processes_per_host_std: 4
+  # 扩展行情每个可达地址允许同时摊到的进程数；与标准侧分开配置。
+  # 取值: 正整数
+  # 影响: 扩展地址很少时把同时在飞进程压在 地址数 × 本值，避免 40 个进程打两个站。
+  adaptive_processes_per_host_ex: 4
+  # 重试耗尽后的连接不可用、超时或 watchdog 后保留的该地址进程配额比例。
+  # 取值: 0~1 浮点数（建议 0.3~0.8）
+  # 影响: chunk 重试成功或成功切到其他地址不降配额；只在最终仍失败时退避。
+  adaptive_decrease_factor: 0.75
+  # host 触发拥塞后的冷却秒数。
+  # 取值: 非负浮点数
+  # 影响: 冷却期间不向该 host 分配新 bundle；结束后保持降后的配额，成功时每次 +1 直到回到拥塞前上限。
+  adaptive_cooldown_seconds: 1.5
   # 单次 chunk 抓取尝试墙钟上限（秒）：仅约束每一次 get_*_kline_rows_for_chunk_tasks（含该次建连与网络 IO）。
   # 不含入口归一化失败；不含 bundle 级预热建连；不含重试累计（重试由 chunk_retry_max_attempts 单独控制，每次尝试各算本上限）。
   # 取值: 正浮点数
-  # 影响: 单次尝试超时/失败可触发重试；最坏墙钟约 chunk_timeout_seconds × (1 + chunk_retry_max_attempts)。
+  # 影响: 到点关闭本次尝试的 socket，阻塞中的 connect/recv 返回并按失败结束；重连同样受本上限约束。最坏墙钟约 chunk_timeout_seconds × (1 + chunk_retry_max_attempts)。
   # 调优指南（D4）: 5s 适合超低延迟内网；公网/弱网建议 15s+，避免短超时频繁触发重连放大尾延迟。
   chunk_timeout_seconds: 15
   # chunk 超时或报错后的最大重试次数。
   # 取值: 非负整数
   # 影响: 每个 chunk 最多重试 N 次（超时、连接不可用、其他异常均触发），避免无限重试拖慢整体吞吐。
   chunk_retry_max_attempts: 2
-  # bundle watchdog 额外宽限时间（秒）：父进程按 chunk_timeout_seconds × (1 + chunk_retry_max_attempts)
-  # 推导单个 bundle 理论上限，再额外增加该宽限；超出后视为 worker 内线程/协程超时失效。
-  # 取值: 非负浮点数
-  # 影响: 值越小越快回收卡死 worker，但弱网下误判概率增加。
-  bundle_watchdog_grace_seconds: 10
-  # async 调用时是否自动预热进程池与 worker 常驻连接（适用于 stock/index）。
-  # 取值: true/false
-  # 影响: true 时 async 首次调用会自动触发 prewarm，降低冷启动抖动。
-  auto_prewarm_on_async: true
-  # 自动预热时是否要求所有 worker 都完成预热。
-  # 取值: true/false
-  # 影响: true 时只要有 worker 预热不足会直接失败并抛错。
-  auto_prewarm_require_all_workers: false
-  # 自动预热总超时（秒）。
-  # 取值: 正浮点数
-  # 影响: 控制 async 自动预热最多等待时长。
-  auto_prewarm_timeout_seconds: 60
-  # 自动预热最大轮次。
-  # 取值: 正整数
-  # 影响: 每轮会向进程池提交探针任务以拉齐 worker 预热状态。
-  auto_prewarm_max_rounds: 3
-  # 公司信息并行：每个进程内同时处理的股票数。
-  # 取值: 正整数
-  # 影响: 进程内股票级 ThreadPool 并发度；过大易触发行情站限流。
-  company_info_stock_inproc_workers: 3
-  # 公司信息并行：单股内标签正文并发线程数。
-  # 取值: 正整数
-  # 影响: 目录拉完后并发抓各标签；过大时连接数≈进程数×股票并发×标签并发。
-  company_info_category_workers: 3
-  # 公司信息并行：提交到单个 worker future 的股票数。
-  # 取值: 正整数
-  # 影响: chunk 越大调度开销越低，但单 future 失败影响面越大。
-  company_info_codes_per_chunk: 40
-  # 公司信息并行：父进程在飞 chunk 窗口倍率。
-  # 取值: 正整数
-  # 影响: 在飞 future 上限 = 进程数 × 该倍率。
-  company_info_max_inflight_multiplier: 2
 
 pagination:
-  # 标准行情 get_security_list 单页数量（命令 0x044D）。
-  # 取值: 正整数；官方客户端单页 1600
-  standard_security_list_page_size: 1600
-  # 扩展行情 get_instrument_info 短页结束阈值。
-  # 服务端决定本页条数；返回条数小于本值则结束翻页。
-  extended_instrument_info_page_size: 800
-  # 标准行情 K线单页数量（get_security_bars / get_index_bars）。
-  # 取值: 正整数；服务端硬上限 800
-  standard_kline_page_size: 800
   # 个股 K 线是否请求服务器前复权（A 股 reserved0；港股 extra）。
   # 取值: true=前复权，false=不复权。期货无复权，get_future_kline 不使用本项。
   standard_kline_qfq: true
-  # 扩展行情 K线单页数量（get_instrument_bars）。
-  # 取值: 正整数；服务端硬上限 700
-  extended_kline_page_size: 700
-  # 公司信息正文单页上限（字节）。服务端硬上限 30720；请求的 length 填剩余总字节。
-  # 取值: 正整数
-  company_info_chunk_size: 30720
-  # 标准行情命名文件（0x06B9）单页字节。服务端与官方客户端均为 30000。
-  # 取值: 正整数
-  named_file_chunk_size: 30000
-  # K线最大分页次数上限，防止异常场景下无限循环。
-  # 取值: 正整数
-  max_kline_pages: 400
 
 catalog_cache:
   # 标准/扩展码表与 ETF/LOF 名称板块的磁盘缓存：按自然日分文件保存，使用时再过滤。
   # ETF 文件为 etf_code_name.pkl；当日已有则 get_etf_code_name 不再下载 0x02C5/0x06B9。
   enabled: true
-  # 刷新粒度：day 表示当天首次下载，日内内存与磁盘复用。
-  refresh_granularity: day
   # 可选：手动指定缓存目录（文件路径则取其父目录）。
   # 留空时自动选择用户可写目录；不可写会回退系统临时目录。
   path: ""
 
 market_rules:
-  # 北京股票代码前缀集合（标准行情 market=2）。
-  include_beijing_prefixes:
-    - "92"
-  # 深圳 A 股前缀集合（标准市场）。
-  stock_prefix_sz:
-    - "000"
-    - "001"
-    - "002"
-    - "003"
-    - "300"
-    - "301"
-    - "302"
-  # 上海 A 股前缀集合（标准市场）。
-  stock_prefix_sh:
-    - "600"
-    - "601"
-    - "603"
-    - "605"
-    - "688"
-    - "689"
-  # 纳入“商品期货”集合的扩展市场名称。
-  future_market_names:
-    - "郑州商品"
-    - "大连商品"
-    - "上海期货"
-    - "广州期货"
-  # 场内 ETF/LOF 远程完整名称文件（标准行情 0x02C5/0x06B9）。
-  # 作用对象: get_etf_code_name；当日结果写入 catalog_cache，不读银河安装目录。
-  etf_name_remote_file: "infoharbor_ex.name"
-  # ETF/LOF 板块成分文件（远程路径带 spec/ 前缀；逗号分隔，首列市场 0/1、次列代码）。
-  # 板块成分不要求名称含 etf/lof；任一份解析为空则整次下载作废、不写当日缓存。
-  etf_board_remote_files:
-    - "spec/specetfdata.txt"
-    - "spec/speclofdata.txt"
   # 场内 ETF/LOF 名称二次剔除子串（去空白后命中任一即丢弃）。
   # 作用对象: get_etf_code_name。etf/lof 初筛只用于名称文件中的额外代码，板块成分不走初筛。
   etf_name_drop_substr:
@@ -328,9 +155,6 @@ output:
   # 是否过滤停牌/占位K线。
   # 取值: true/false
   filter_suspended_placeholder_bar: true
-  # 占位K线成交量/成交额“极小值”阈值。
-  # 取值: 非负浮点数（科学计数法可用）
-  suspended_placeholder_eps: 1.0e-20
 
 index_kline:
   # 运行时动态发现 ex 指数市场的优先候选列表（用于名称->路由解析）。
@@ -340,8 +164,3 @@ index_kline:
   # 指数别名：先将用户输入转换为标准名称，再执行精确匹配。
   aliases:
     上证综指: 上证指数
-  lookup:
-    # 名称未命中时，错误中最多返回多少个候选名称。
-    max_candidates: 10
-    # 名称匹配前是否移除空白字符（半角/全角空格等）。
-    normalize_whitespace: true

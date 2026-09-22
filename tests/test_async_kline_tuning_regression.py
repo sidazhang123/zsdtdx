@@ -32,6 +32,7 @@ if _SRC_DIR not in sys.path:
 # F1: ChunkLocalRowCache 行为锁定
 # =============================================================================
 
+
 class TestChunkLocalRowCache:
     """
     阶段二改造点 B4：用 ChunkLocalRowCache 取代 SharedChunkCache。
@@ -46,6 +47,7 @@ class TestChunkLocalRowCache:
 
     def _new_cache(self):
         from zsdtdx.unified_client import ChunkLocalRowCache
+
         return ChunkLocalRowCache()
 
     def test_acquire_idempotent_within_chunk(self):
@@ -96,6 +98,7 @@ class TestChunkLocalRowCache:
     def test_shared_chunk_cache_alias(self):
         """SharedChunkCache 仍可作为兼容别名引用（外部测试与遗留代码可继续用）。"""
         from zsdtdx.unified_client import ChunkLocalRowCache, SharedChunkCache
+
         assert SharedChunkCache is ChunkLocalRowCache
 
     def test_get_partition_equivalent_to_acquire(self):
@@ -109,6 +112,7 @@ class TestChunkLocalRowCache:
 # =============================================================================
 # F2: 按路由单边重置连接（C2）
 # =============================================================================
+
 
 class TestRecoverWorkerPoolsTarget:
     """
@@ -125,6 +129,7 @@ class TestRecoverWorkerPoolsTarget:
     def test_target_std_skips_ex(self, monkeypatch):
         """target="std" 时不触碰 ex pool；std 走真正的恢复路径。"""
         import zsdtdx.parallel_fetcher as pf
+
         std_calls: List[str] = []
 
         def _fake_std(reason: str = ""):
@@ -136,13 +141,17 @@ class TestRecoverWorkerPoolsTarget:
 
         def _fake_ensure_ctx():
             ex_calls.append("ensure_ctx")
+
             class _Ctx:
                 ex_pool = mock.Mock()
+
             ctx = _Ctx()
             ctx.ex_pool.reset_thread_connection = mock.Mock(return_value=True)
             return ctx
 
-        monkeypatch.setattr(pf, "_recover_worker_standard_connection_current_thread", _fake_std)
+        monkeypatch.setattr(
+            pf, "_recover_worker_standard_connection_current_thread", _fake_std
+        )
         monkeypatch.setattr(pf, "_ensure_worker_client_context", _fake_ensure_ctx)
 
         result = pf._recover_worker_pools_current_thread(reason="x", target="std")
@@ -156,6 +165,7 @@ class TestRecoverWorkerPoolsTarget:
     def test_target_ex_skips_std(self, monkeypatch):
         """target="ex" 时不触碰 std；ex 走真正的恢复路径。"""
         import zsdtdx.parallel_fetcher as pf
+
         std_called = {"n": 0}
 
         def _fake_std(reason: str = ""):
@@ -166,9 +176,12 @@ class TestRecoverWorkerPoolsTarget:
             def __init__(self):
                 self.ex_pool = mock.Mock()
                 self.ex_pool.reset_thread_connection = mock.Mock(return_value=True)
+
         ctx = _Ctx()
 
-        monkeypatch.setattr(pf, "_recover_worker_standard_connection_current_thread", _fake_std)
+        monkeypatch.setattr(
+            pf, "_recover_worker_standard_connection_current_thread", _fake_std
+        )
         monkeypatch.setattr(pf, "_ensure_worker_client_context", lambda: ctx)
 
         result = pf._recover_worker_pools_current_thread(reason="x", target="ex")
@@ -180,6 +193,7 @@ class TestRecoverWorkerPoolsTarget:
     def test_target_both_runs_both_sides(self, monkeypatch):
         """target="both"（默认）触发 std + ex 同时重置。"""
         import zsdtdx.parallel_fetcher as pf
+
         std_called = {"n": 0}
 
         def _fake_std(reason: str = ""):
@@ -190,9 +204,12 @@ class TestRecoverWorkerPoolsTarget:
             def __init__(self):
                 self.ex_pool = mock.Mock()
                 self.ex_pool.reset_thread_connection = mock.Mock(return_value=True)
+
         ctx = _Ctx()
 
-        monkeypatch.setattr(pf, "_recover_worker_standard_connection_current_thread", _fake_std)
+        monkeypatch.setattr(
+            pf, "_recover_worker_standard_connection_current_thread", _fake_std
+        )
         monkeypatch.setattr(pf, "_ensure_worker_client_context", lambda: ctx)
 
         result = pf._recover_worker_pools_current_thread(reason="x", target="both")
@@ -203,15 +220,18 @@ class TestRecoverWorkerPoolsTarget:
     def test_invalid_target_falls_back_to_both(self, monkeypatch):
         """非法 target 值退化为 both。"""
         import zsdtdx.parallel_fetcher as pf
+
         monkeypatch.setattr(
             pf,
             "_recover_worker_standard_connection_current_thread",
             lambda reason="": {"ok": True, "error": ""},
         )
+
         class _Ctx:
             def __init__(self):
                 self.ex_pool = mock.Mock()
                 self.ex_pool.reset_thread_connection = mock.Mock(return_value=True)
+
         monkeypatch.setattr(pf, "_ensure_worker_client_context", lambda: _Ctx())
 
         result = pf._recover_worker_pools_current_thread(reason="x", target="garbage")
@@ -227,11 +247,16 @@ class TestInferRecoverTargetFromChunk:
 
     def test_stock_chunk_returns_std(self):
         from zsdtdx.parallel_fetcher import _infer_recover_target_from_chunk
-        prep = {"task_kind": "stock", "normalized_tasks": [{"code": "000001", "freq": "d"}]}
+
+        prep = {
+            "task_kind": "stock",
+            "normalized_tasks": [{"code": "000001", "freq": "d"}],
+        }
         assert _infer_recover_target_from_chunk(prep) == "std"
 
     def test_index_chunk_all_std_source(self):
         from zsdtdx.parallel_fetcher import _infer_recover_target_from_chunk
+
         prep = {
             "task_kind": "index",
             "normalized_tasks": [
@@ -243,6 +268,7 @@ class TestInferRecoverTargetFromChunk:
 
     def test_index_chunk_all_ex_source(self):
         from zsdtdx.parallel_fetcher import _infer_recover_target_from_chunk
+
         prep = {
             "task_kind": "index",
             "normalized_tasks": [{"index_name": "X", "_index_route_source": "ex"}],
@@ -251,6 +277,7 @@ class TestInferRecoverTargetFromChunk:
 
     def test_index_chunk_mixed_falls_back_to_both(self):
         from zsdtdx.parallel_fetcher import _infer_recover_target_from_chunk
+
         prep = {
             "task_kind": "index",
             "normalized_tasks": [
@@ -263,6 +290,7 @@ class TestInferRecoverTargetFromChunk:
     def test_unknown_task_kind_falls_back_to_both(self):
         """非 stock/index 的 task_kind 退化为 both；空 dict 等价于 task_kind="stock"（代码默认值）。"""
         from zsdtdx.parallel_fetcher import _infer_recover_target_from_chunk
+
         assert _infer_recover_target_from_chunk({"task_kind": "future"}) == "both"
         # 空 dict 默认 task_kind="stock" → "std"（与函数签名默认值一致）。
         assert _infer_recover_target_from_chunk({}) == "std"
@@ -272,10 +300,11 @@ class TestInferRecoverTargetFromChunk:
 # F3: _log_chunk_retry 简化路径（不再二次 recover）
 # =============================================================================
 
+
 class TestLogChunkRetryNoSecondRecover:
     """
-    阶段三 C2：_log_chunk_retry 仅记录日志，不再二次调用 _recover_worker_pools_current_thread。
-    超时分支的连接重置已由 _fetch_one_task_chunk_async/_fetch_one_task_chunk_timed_body 在前置完成。
+    _log_chunk_retry 仅记录日志，不再二次调用 _recover_worker_pools_current_thread。
+    超时分支的连接重置已由 _fetch_one_task_chunk_async 在前置完成。
     """
 
     def _base_prep(self):
@@ -290,11 +319,13 @@ class TestLogChunkRetryNoSecondRecover:
     def test_connection_unavailable_only_logs(self, monkeypatch):
         """连接不可用关键字命中时只记 log，不调 _recover_*。"""
         import zsdtdx.parallel_fetcher as pf
+
         recover_calls = {"n": 0}
         monkeypatch.setattr(
             pf,
             "_recover_worker_pools_current_thread",
-            lambda *a, **kw: recover_calls.__setitem__("n", recover_calls["n"] + 1) or {},
+            lambda *a, **kw: recover_calls.__setitem__("n", recover_calls["n"] + 1)
+            or {},
         )
         # 强制让 _is_connection_unavailable_error 命中
         monkeypatch.setattr(pf, "_is_connection_unavailable_error", lambda txt: True)
@@ -302,10 +333,14 @@ class TestLogChunkRetryNoSecondRecover:
         monkeypatch.setattr(
             pf,
             "_emit_log",
-            lambda level, msg, detail=None: emit_calls.append({"level": level, "msg": msg, "detail": detail}),
+            lambda level, msg, detail=None: emit_calls.append(
+                {"level": level, "msg": msg, "detail": detail}
+            ),
         )
 
-        pf._log_chunk_retry(self._base_prep(), retry_count=1, error_text="connection lost")
+        pf._log_chunk_retry(
+            self._base_prep(), retry_count=1, error_text="connection lost"
+        )
 
         assert recover_calls["n"] == 0, "C2 简化路径不应再触发二次 recover"
         assert len(emit_calls) == 1
@@ -314,18 +349,22 @@ class TestLogChunkRetryNoSecondRecover:
     def test_generic_error_only_logs(self, monkeypatch):
         """普通异常（非连接不可用）也只记 log。"""
         import zsdtdx.parallel_fetcher as pf
+
         recover_calls = {"n": 0}
         monkeypatch.setattr(
             pf,
             "_recover_worker_pools_current_thread",
-            lambda *a, **kw: recover_calls.__setitem__("n", recover_calls["n"] + 1) or {},
+            lambda *a, **kw: recover_calls.__setitem__("n", recover_calls["n"] + 1)
+            or {},
         )
         monkeypatch.setattr(pf, "_is_connection_unavailable_error", lambda txt: False)
         emit_calls: List[Dict[str, Any]] = []
         monkeypatch.setattr(
             pf,
             "_emit_log",
-            lambda level, msg, detail=None: emit_calls.append({"level": level, "msg": msg, "detail": detail}),
+            lambda level, msg, detail=None: emit_calls.append(
+                {"level": level, "msg": msg, "detail": detail}
+            ),
         )
 
         pf._log_chunk_retry(self._base_prep(), retry_count=2, error_text="parse error")
@@ -340,6 +379,7 @@ class TestLogChunkRetryNoSecondRecover:
 # F4: _fetch_chunk_bundle_async 返回 schema（IPC 双份 payload 删除）
 # =============================================================================
 
+
 class TestFetchChunkBundleAsyncSchema:
     """
     阶段三 C1：_fetch_chunk_bundle_async 返回字典不再有 bundle-level "payloads" 字段；
@@ -350,6 +390,7 @@ class TestFetchChunkBundleAsyncSchema:
         """空 chunks 返回字典不含 payloads key。"""
         import asyncio
         from zsdtdx.parallel_fetcher import _fetch_chunk_bundle_async
+
         result = asyncio.run(_fetch_chunk_bundle_async({"chunks": [], "bundle_id": 7}))
         assert "payloads" not in result, "bundle 级 payloads 字段应被删除"
         assert result["bundle_id"] == 7
@@ -371,17 +412,33 @@ class TestFetchChunkBundleAsyncSchema:
                 "chunk_task_count": 1,
                 "chunk_hit_tasks": 1,
                 "chunk_network_page_calls": 0,
-                "payloads": [{"event": "data", "task": payload.get("tasks", [{}])[0], "rows": [], "error": None}],
+                "payloads": [
+                    {
+                        "event": "data",
+                        "task": payload.get("tasks", [{}])[0],
+                        "rows": [],
+                        "error": None,
+                    }
+                ],
                 "failures": [],
                 "worker_pid": os.getpid(),
             }
+
         monkeypatch.setattr(pf, "_fetch_one_task_chunk_async", _fake_chunk)
 
         bundle = {
             "bundle_id": 1,
             "chunks": [
-                {"chunk_id": "c1", "task_kind": "stock", "tasks": [{"code": "000001", "freq": "d"}]},
-                {"chunk_id": "c2", "task_kind": "stock", "tasks": [{"code": "000002", "freq": "d"}]},
+                {
+                    "chunk_id": "c1",
+                    "task_kind": "stock",
+                    "tasks": [{"code": "000001", "freq": "d"}],
+                },
+                {
+                    "chunk_id": "c2",
+                    "task_kind": "stock",
+                    "tasks": [{"code": "000002", "freq": "d"}],
+                },
             ],
             "inproc_coroutine_workers": 2,
             "chunk_timeout_seconds": 30,
@@ -403,6 +460,7 @@ class TestFetchChunkBundleAsyncSchema:
 # F5: BaseSocketClient.connect 启用 TCP_NODELAY
 # =============================================================================
 
+
 class TestTcpNoDelayEnabled:
     """
     阶段四 D1：BaseSocketClient.connect 成功后立即 setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)。
@@ -419,18 +477,25 @@ class TestTcpNoDelayEnabled:
         class _FakeSock:
             def __init__(self, *_a, **_kw):
                 pass
+
             def settimeout(self, _t):
                 pass
+
             def bind(self, _addr):
                 pass
+
             def connect(self, _addr):
                 pass
+
             def close(self):
                 pass
+
             def setsockopt(self, level, optname, value):
                 recorded.append((level, optname, value))
+
             def shutdown(self, _how):
                 pass
+
             # 流量统计相关属性
             send_pkg_num = 0
             recv_pkg_num = 0
@@ -455,14 +520,14 @@ class TestTcpNoDelayEnabled:
 
         # 应当至少包含一次 (IPPROTO_TCP, TCP_NODELAY, 1)
         assert any(
-            tup == (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            for tup in recorded
+            tup == (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) for tup in recorded
         ), f"TCP_NODELAY 未启用；setsockopt 调用记录: {recorded}"
 
 
 # =============================================================================
 # F6: socket 读超时还原（D3）
 # =============================================================================
+
 
 class TestSocketReadTimeoutRestore:
     """
@@ -478,6 +543,7 @@ class TestSocketReadTimeoutRestore:
         class _Pool:
             def __init__(self, name):
                 self.name = name
+
             def restore_thread_socket_read_timeout(self):
                 restored.append(self.name)
 
@@ -491,9 +557,11 @@ class TestSocketReadTimeoutRestore:
     def test_restore_safe_when_pool_missing(self):
         """池不存在/无 restorer 方法时静默跳过，不抛错。"""
         from zsdtdx.parallel_fetcher import _restore_chunk_socket_read_timeout
+
         class _Ctx:
             std_pool = None
             ex_pool = object()  # 无 restore_thread_socket_read_timeout 属性
+
         _restore_chunk_socket_read_timeout(_Ctx())  # 不抛即通过
 
 
@@ -513,9 +581,11 @@ class TestPoolRestoreDefaultTimeout:
 
         # 构造线程数据
         timeouts_set: List[Any] = []
+
         class _Sock:
             def settimeout(self, v):
                 timeouts_set.append(v)
+
         class _Api:
             client = _Sock()
 
@@ -529,6 +599,7 @@ class TestPoolRestoreDefaultTimeout:
 # =============================================================================
 # F6b: chunk deadline 覆盖首次建连与底层请求
 # =============================================================================
+
 
 class TestPoolChunkDeadline:
     """
@@ -609,6 +680,7 @@ class TestPoolChunkDeadline:
 # F6c: 父级 bundle watchdog 兜底并保持 done 事件
 # =============================================================================
 
+
 class TestBundleWatchdog:
     """
     父级 watchdog：
@@ -626,8 +698,12 @@ class TestBundleWatchdog:
             def submit(self, *_args, **_kwargs):
                 return Future()
 
-        monkeypatch.setattr(pf, "_get_global_process_pool", lambda _workers: _NeverDoneExecutor())
-        monkeypatch.setattr(pf, "force_restart_parallel_fetcher", lambda **_kwargs: {"ok": True})
+        monkeypatch.setattr(
+            pf, "_get_global_process_pool", lambda _workers: _NeverDoneExecutor()
+        )
+        monkeypatch.setattr(
+            pf, "force_restart_parallel_fetcher", lambda **_kwargs: {"ok": True}
+        )
 
         fetcher = pf.ParallelKlineFetcher.__new__(pf.ParallelKlineFetcher)
         fetcher.num_processes = 1
@@ -651,7 +727,9 @@ class TestBundleWatchdog:
         chunk = pf.TaskChunk(chunk_id="c1", code="000001", freq="d", tasks=[task])
         fetcher._build_task_chunks = lambda _tasks: [chunk]
         fetcher._build_index_task_chunks = lambda _tasks: []
-        fetcher._build_chunk_bundles = lambda chunks, _workers: [pf.ChunkBundle(bundle_id=1, chunks=chunks)]
+        fetcher._build_chunk_bundles = lambda chunks, _workers: [
+            pf.ChunkBundle(bundle_id=1, chunks=chunks)
+        ]
 
         q = py_queue.Queue()
         job = fetcher.fetch_stock_tasks_async(tasks=[task], queue=q)
@@ -670,6 +748,7 @@ class TestBundleWatchdog:
 # F7: 日志选项 RCU 写入
 # =============================================================================
 
+
 class TestLogDetailOptionsRCU:
     """
     阶段三 C5：set_log_detail_options 整体替换全局快照对象（RCU），读路径不加锁。
@@ -684,6 +763,7 @@ class TestLogDetailOptionsRCU:
     def test_write_replaces_snapshot_object(self):
         """set 后全局 dict 引用应是新对象。"""
         import zsdtdx.parallel_fetcher as pf
+
         before = pf._read_log_detail_options()
         before_id = id(before)
         prev = pf.set_log_detail_options(sample_size=15)
@@ -699,6 +779,7 @@ class TestLogDetailOptionsRCU:
     def test_read_returns_snapshot_reference(self):
         """_read_log_detail_options 直接返回当前全局快照（不拷贝）。"""
         import zsdtdx.parallel_fetcher as pf
+
         snap1 = pf._read_log_detail_options()
         snap2 = pf._read_log_detail_options()
         assert snap1 is snap2, "读路径应直接返回全局引用（零拷贝）"
@@ -706,6 +787,7 @@ class TestLogDetailOptionsRCU:
     def test_concurrent_read_write_no_crash(self):
         """并发读 + 写不抛异常、不死锁。"""
         import zsdtdx.parallel_fetcher as pf
+
         stop = threading.Event()
         errors: List[Exception] = []
 
@@ -744,6 +826,7 @@ class TestLogDetailOptionsRCU:
     def test_invalid_sample_size_clamped(self):
         """sample_size 越界会被收敛到 [1, 200]。"""
         import zsdtdx.parallel_fetcher as pf
+
         prev = pf.set_log_detail_options(sample_size=0)
         try:
             assert pf._read_log_detail_options().get("sample_size") == 1
@@ -756,6 +839,7 @@ class TestLogDetailOptionsRCU:
 # =============================================================================
 # F8: get_volume 与 pytdx 原版 fuzz 等价（覆盖 hleax=0x80 / dwEdx<0 边界）
 # =============================================================================
+
 
 class TestGetVolumeParityFuzz:
     """
@@ -770,10 +854,12 @@ class TestGetVolumeParityFuzz:
 
     def _pytdx_get_volume(self):
         from pytdx.helper import get_volume as pytdx_get_volume
+
         return pytdx_get_volume
 
     def _zs_get_volume(self):
         from zsdtdx.helper import get_volume as zs_get_volume
+
         return zs_get_volume
 
     def test_explicit_boundary_hleax_eq_0x80(self):
@@ -808,6 +894,7 @@ class TestGetVolumeParityFuzz:
     def test_fuzz_random_2k_samples(self):
         """随机 fuzz 2000 个 ivol 做按位等价比对。"""
         import random
+
         rng = random.Random(20260522)
         zs = self._zs_get_volume()
         pt = self._pytdx_get_volume()
@@ -818,7 +905,11 @@ class TestGetVolumeParityFuzz:
             p = pt(ivol)
             if z != p:
                 # 浮点对比允许 ULP 1 内（双方都是同 pow 链路应当严格相等，但极端 IEEE-754 误差兜底）
-                if not (isinstance(z, float) and isinstance(p, float) and abs(z - p) < 1e-12 * max(1.0, abs(p))):
+                if not (
+                    isinstance(z, float)
+                    and isinstance(p, float)
+                    and abs(z - p) < 1e-12 * max(1.0, abs(p))
+                ):
                     mismatches.append((ivol, z, p))
         assert not mismatches, f"get_volume fuzz mismatch (sample 5): {mismatches[:5]}"
 
@@ -826,6 +917,7 @@ class TestGetVolumeParityFuzz:
 # =============================================================================
 # F-aux: 离线快速回归 — Stock & Index parser → normalize → 占位过滤端到端
 # =============================================================================
+
 
 class TestParseToNormalizeOffline:
     """
@@ -871,18 +963,30 @@ class TestParseToNormalizeOffline:
 
         body = bytearray()
         body.extend(struct.pack("<H", 1))
-        body.extend(self._build_bar(20260102, 12340, 10, 200, -10, 0x42801000, 0x44A00000))
+        body.extend(
+            self._build_bar(20260102, 12340, 10, 200, -10, 0x42801000, 0x44A00000)
+        )
 
         rows = parse_diff_encoded_kline_page(bytes(body), 9, with_index_counts=False)
         assert len(rows) == 1
         keys = set(rows[0].keys())
         # parser 输出必须包含的字段
-        assert {"open", "close", "high", "low", "vol", "amount", "datetime", "_ts"} <= keys
+        assert {
+            "open",
+            "close",
+            "high",
+            "low",
+            "vol",
+            "amount",
+            "datetime",
+            "_ts",
+        } <= keys
 
 
 # =============================================================================
 # F-aux: parser → ChunkLocalRowCache 行管理 sanity（无 socket）
 # =============================================================================
+
 
 class TestChunkLocalRowCacheRowAccumulate:
     """
@@ -891,6 +995,7 @@ class TestChunkLocalRowCacheRowAccumulate:
 
     def test_n_monotonic_within_chunk(self):
         from zsdtdx.unified_client import ChunkLocalRowCache
+
         cache = ChunkLocalRowCache()
         partition = cache.acquire_partition("000001", "d")
         rows = partition["cache_rows"]

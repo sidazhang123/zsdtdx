@@ -64,6 +64,42 @@ class ResponseRecvFails(Exception):
 RSP_HEADER_LEN = 0x10
 
 
+def _note_recv(sock, size: int) -> None:
+    """输入套接字和本次读到的字节数，输出无。边界：没有计数字段时跳过。"""
+    if not hasattr(sock, "recv_pkg_num"):
+        return
+    sock.recv_pkg_num += 1
+    sock.recv_pkg_bytes += int(size)
+
+
+def _recv_exact(sock, size: int, *, header: bool = False) -> bytes:
+    """
+    输入套接字和要读的字节数。
+    输出恰好 size 字节。
+    用途：响应头和包体都按长度读满，避免短读把后半段留给下一次请求。
+    边界：size 为 0 返回空字节；对端关闭时包头抛 ResponseHeaderRecvFails，包体抛 ResponseRecvFails；超时原样抛出。
+    """
+    if size < 0:
+        raise ResponseRecvFails("接收数据体失败服务器断开连接")
+    if size == 0:
+        return b""
+    parts = []
+    got = 0
+    while got < size:
+        buf = sock.recv(size - got)
+        if not buf:
+            if header:
+                partial = b"".join(parts)
+                raise ResponseHeaderRecvFails("head_buf is not 0x10 : " + str(partial))
+            raise ResponseRecvFails("接收数据体失败服务器断开连接")
+        _note_recv(sock, len(buf))
+        parts.append(buf)
+        got += len(buf)
+    if len(parts) == 1:
+        return parts[0]
+    return b"".join(parts)
+
+
 class BaseParser(object):
     def __init__(self, client, lock=None):
         """
@@ -161,66 +197,40 @@ class BaseParser(object):
         if not (self.send_pkg):
             raise SendPkgNotReady("send pkg not ready")
 
-        nsended = self.client.send(self.send_pkg)
-
+        self.client.sendall(self.send_pkg)
+        sent = len(self.send_pkg)
         self.client.send_pkg_num += 1
-        self.client.send_pkg_bytes += nsended
-        self.client.last_api_send_bytes = nsended
+        self.client.send_pkg_bytes += sent
+        self.client.last_api_send_bytes = sent
 
         if self.client.first_pkg_send_time is None:
             self.client.first_pkg_send_time = datetime.datetime.now()
 
         if DEBUG:
             log.debug("send package:" + str(self.send_pkg))
-        if nsended != len(self.send_pkg):
-            log.debug("send bytes error")
-            raise SendRequestPkgFails("send fails")
+
+        head_buf = _recv_exact(self.client, self.rsp_header_len, header=True)
+        if DEBUG:
+            log.debug(
+                "recv head_buf:" + str(head_buf) + " |len is :" + str(len(head_buf))
+            )
+        _, _, _, zipsize, unzipsize = struct.unpack("<IIIHH", head_buf)
+        if DEBUG:
+            log.debug("zip size is: " + str(zipsize))
+        if zipsize <= 0:
+            log.debug("接收数据体失败服务器断开连接")
+            raise ResponseRecvFails("接收数据体失败服务器断开连接")
+        body_buf = _recv_exact(self.client, int(zipsize))
+        self.client.last_api_recv_bytes = int(self.rsp_header_len) + int(zipsize)
+        if zipsize == unzipsize:
+            log.debug("不需要解压")
         else:
-            head_buf = self.client.recv(self.rsp_header_len)
-            if DEBUG:
-                log.debug(
-                    "recv head_buf:" + str(head_buf) + " |len is :" + str(len(head_buf))
-                )
-            if len(head_buf) == self.rsp_header_len:
-                self.client.recv_pkg_num += 1
-                self.client.recv_pkg_bytes += self.rsp_header_len
-                _, _, _, zipsize, unzipsize = struct.unpack("<IIIHH", head_buf)
-                if DEBUG:
-                    log.debug("zip size is: " + str(zipsize))
-                body_buf = bytearray()
-
-                last_api_recv_bytes = self.rsp_header_len
-                while True:
-                    buf = self.client.recv(zipsize)
-                    len_buf = len(buf)
-                    self.client.recv_pkg_num += 1
-                    self.client.recv_pkg_bytes += len_buf
-                    last_api_recv_bytes += len_buf
-                    body_buf.extend(buf)
-                    if not (buf) or len_buf == 0 or len(body_buf) == zipsize:
-                        break
-
-                self.client.last_api_recv_bytes = last_api_recv_bytes
-
-                if len(buf) == 0:
-                    log.debug("接收数据体失败服务器断开连接")
-                    raise ResponseRecvFails("接收数据体失败服务器断开连接")
-                if zipsize == unzipsize:
-                    log.debug("不需要解压")
-                else:
-                    log.debug("需要解压")
-                    if sys.version_info[0] == 2:
-                        unziped_data = zlib.decompress(buffer(body_buf))
-                    else:
-                        unziped_data = zlib.decompress(body_buf)
-                    body_buf = unziped_data
-                    ## 解压
-                if DEBUG:
-                    log.debug("recv body: ")
-                    log.debug(body_buf)
-
-                return self.parseResponse(body_buf)
-
+            log.debug("需要解压")
+            if sys.version_info[0] == 2:
+                body_buf = zlib.decompress(buffer(body_buf))
             else:
-                log.debug("head_buf is not 0x10")
-                raise ResponseHeaderRecvFails("head_buf is not 0x10 : " + str(head_buf))
+                body_buf = zlib.decompress(body_buf)
+        if DEBUG:
+            log.debug("recv body: ")
+            log.debug(body_buf)
+        return self.parseResponse(body_buf)

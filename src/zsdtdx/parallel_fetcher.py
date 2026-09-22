@@ -13,15 +13,18 @@
 
 import asyncio
 import atexit
+import builtins
 import copy
 import json
+import math
 import os
 import queue as queue_mod
 import random
 import threading
 import time
 import warnings
-from collections import defaultdict
+import weakref
+from collections import defaultdict, deque
 from concurrent.futures import (
     FIRST_COMPLETED,
     Future,
@@ -36,6 +39,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
+from zsdtdx.adaptive_scheduler import (
+    AdaptiveConcurrencyController,
+    AdaptivePermit,
+)
 from zsdtdx.helper import parse_future_symbol
 from zsdtdx.unified_client import UnifiedTdxClient
 
@@ -45,6 +52,8 @@ except ImportError:
     psutil = None
 
 warnings.filterwarnings("ignore")
+# 保留模块属性供旧测试/扩展 patch；目标态槽位分配已改为确定性轮转。
+_RANDOM_COMPAT = random
 
 
 # =============================================================================
@@ -70,46 +79,156 @@ _worker_client_holder: Any = None
 _worker_client_context: Any = None
 _worker_client_pid: Optional[int] = None
 _worker_client_lock = threading.Lock()
+# 进程内复用的 chunk 尝试线程池。线程本地连接留在这些线程上，超时只关闭当次 socket。
+_worker_attempt_executor: Optional["_DaemonChunkExecutor"] = None
+_WORKER_ATTEMPT_EXECUTOR_WORKERS = 8
 
-_worker_chunk_coroutine_warmed_slots: int = 0
-_worker_chunk_coroutine_warmed_lock = threading.Lock()
 _active_config_path: Optional[str] = None
 _worker_sorted_hosts: Optional[Dict[str, list]] = None
 _global_pool_slot_manager: Any = None
 _global_pool_slot_counter: Any = None
+_global_adaptive_controller: Optional[AdaptiveConcurrencyController] = None
+_global_adaptive_controller_lock = threading.Lock()
+
+
+def _get_global_adaptive_controller(
+    *,
+    max_processes: int,
+    inproc_limit: int,
+    processes_per_host_std: int,
+    processes_per_host_ex: int,
+    decrease_factor: float,
+    cooldown_seconds: float,
+) -> AdaptiveConcurrencyController:
+    """
+    获取并配置跨 async job 共享的自适应控制器。
+
+    输入：进程硬顶、进程内并发、两侧每地址进程数与拥塞参数。
+    输出：全局控制器。
+    边界：每次调用以当前可达 host 快照刷新地址，但保留未变化 host 的拥塞状态。
+    """
+    global _global_adaptive_controller
+    from zsdtdx.unified_client import get_probe_result_cache
+
+    with _global_adaptive_controller_lock:
+        if _global_adaptive_controller is None:
+            _global_adaptive_controller = AdaptiveConcurrencyController(
+                max_processes=max_processes,
+                inproc_limit=inproc_limit,
+                processes_per_host_std=processes_per_host_std,
+                processes_per_host_ex=processes_per_host_ex,
+                decrease_factor=decrease_factor,
+                cooldown_seconds=cooldown_seconds,
+            )
+        else:
+            _global_adaptive_controller.configure(
+                max_processes=max_processes,
+                inproc_limit=inproc_limit,
+                processes_per_host_std=processes_per_host_std,
+                processes_per_host_ex=processes_per_host_ex,
+                decrease_factor=decrease_factor,
+                cooldown_seconds=cooldown_seconds,
+            )
+        snapshot = get_probe_result_cache()
+        _global_adaptive_controller.update_hosts(
+            "std", list(snapshot.get("standard") or [])
+        )
+        _global_adaptive_controller.update_hosts(
+            "ex", list(snapshot.get("extended") or [])
+        )
+        return _global_adaptive_controller
+
+
+def _reset_global_adaptive_controller() -> None:
+    """重置全局自适应学习状态；用于进程池/配置生命周期切换。"""
+    global _global_adaptive_controller
+    with _global_adaptive_controller_lock:
+        if _global_adaptive_controller is not None:
+            _global_adaptive_controller.reset()
+        _global_adaptive_controller = None
+
+
+def _host_list_from_snapshot(raw_hosts: List[Any]) -> List[Tuple[str, int]]:
+    """输入探测地址，输出去重后的 (ip, port) 列表。边界：非法项跳过。"""
+    ordered: List[Tuple[str, int]] = []
+    seen: set[Tuple[str, int]] = set()
+    for raw_host in raw_hosts:
+        item = _as_host_tuple(raw_host)
+        if item is None or item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def _expand_allocation_sequence(
+    hosts: List[Any], total_workers: int, per_host_cap: int
+) -> List[Tuple[str, int]]:
+    """
+    按 allocate_host_worker_counts 的轮转顺序展开每个进程的自家站。
+
+    输入：地址序列、进程总数、单站上限。
+    输出：与分配次数相同的自家站列表，靠前地址先出现。
+    边界：没有分到进程的地址不出现。
+    """
+    counts = allocate_host_worker_counts(hosts, total_workers, per_host_cap)
+    ordered = _host_list_from_snapshot(hosts)
+    remaining = {item: int(counts.get(item, 0)) for item in ordered}
+    sequence: List[Tuple[str, int]] = []
+    while any(count > 0 for count in remaining.values()):
+        for item in ordered:
+            if remaining[item] <= 0:
+                continue
+            sequence.append(item)
+            remaining[item] -= 1
+    return sequence
 
 
 def _build_worker_host_slot_assignments(
     snapshot: Dict[str, List[Any]],
     num_slots: int,
+    per_host_std: int = 4,
+    per_host_ex: int = 4,
 ) -> List[Dict[str, List[Any]]]:
     """
-    为每个 worker 槽位生成旋转后的建连地址列表。
+    为全局进程池的每个槽位生成自家站优先的地址表。
 
     输入：
-    1. snapshot: 主进程全量探测结果（standard/extended）。
-    2. num_slots: worker 数量。
+    1. snapshot: 主进程探测结果（standard/extended）。
+    2. num_slots: 全局进程数，标准侧和扩展侧共用这些槽位。
+    3. per_host_std/per_host_ex: 单站进程上限，传给 allocate_host_worker_counts。
     输出：
     1. 长度为 num_slots 的列表，每项为 {"standard": [...], "extended": [...]}。
     边界条件：
-    1. 每槽位对全量列表随机起始下标后循环旋转，不在 worker 内 shuffle。
-    2. 某侧列表为空时该侧返回 []。
+    1. 自家站由 allocate_host_worker_counts 决定，不另写分配。
+    2. 扩展侧分到的槽位是同一批进程里的前若干个，不额外增加进程。
+    3. 没分到扩展站的槽位 extended 为空，不主动连扩展行情。
     """
-    from zsdtdx.unified_client import rotate_hosts_list
+    global _slot_host_index
 
-    std_full = list(snapshot.get("standard") or [])
-    ex_full = list(snapshot.get("extended") or [])
+    std_full = _host_list_from_snapshot(list(snapshot.get("standard") or []))
+    ex_full = _host_list_from_snapshot(list(snapshot.get("extended") or []))
     slots = max(1, int(num_slots))
+    std_seq = _expand_allocation_sequence(std_full, slots, per_host_std)
+    ex_seq = _expand_allocation_sequence(ex_full, slots, per_host_ex)
+    std_index: Dict[Tuple[str, int], List[int]] = {}
+    ex_index: Dict[Tuple[str, int], List[int]] = {}
     assignments: List[Dict[str, List[Any]]] = []
-    for _ in range(slots):
-        std_start = random.randint(0, len(std_full) - 1) if std_full else 0
-        ex_start = random.randint(0, len(ex_full) - 1) if ex_full else 0
-        assignments.append(
-            {
-                "standard": rotate_hosts_list(std_full, std_start) if std_full else [],
-                "extended": rotate_hosts_list(ex_full, ex_start) if ex_full else [],
-            }
-        )
+    for slot_index in range(slots):
+        if slot_index < len(std_seq):
+            std_home = std_seq[slot_index]
+            std_list = _home_first_hosts(std_full, std_home)
+            std_index.setdefault(std_home, []).append(slot_index)
+        else:
+            std_list = []
+        if slot_index < len(ex_seq):
+            ex_home = ex_seq[slot_index]
+            ex_list = _home_first_hosts(ex_full, ex_home)
+            ex_index.setdefault(ex_home, []).append(slot_index)
+        else:
+            ex_list = []
+        assignments.append({"standard": std_list, "extended": ex_list})
+    _slot_host_index = {"std": std_index, "ex": ex_index}
     return assignments
 
 
@@ -251,10 +370,12 @@ def _get_global_process_pool(max_workers: int) -> ProcessPoolExecutor:
     """
     global _global_process_pool, _global_pool_max_workers, _global_pool_epoch
     global _global_pool_slot_manager, _global_pool_slot_counter
+    global _host_job_queues, _slot_result_queue, _routed_collector_started
 
     with _global_pool_lock:
         if _global_process_pool is None or _global_pool_max_workers != max_workers:
             if _global_process_pool is not None:
+                _stop_routed_workers()
                 try:
                     _global_process_pool.shutdown(wait=False)
                 except Exception as exc:
@@ -266,35 +387,49 @@ def _get_global_process_pool(max_workers: int) -> ProcessPoolExecutor:
             import multiprocessing as _mp
 
             from zsdtdx.unified_client import (
-                _ensure_availability_hosts_cache,
                 _normalize_hosts_from_cfg,
                 compute_hosts_fingerprint,
                 get_probe_result_cache,
             )
 
-            try:
-                _ensure_availability_hosts_cache(config_path=_active_config_path)
-            except Exception as exc:
-                _emit_log("error", f"[Parallel] TCP 可用地址缓存 ensure 失败: {exc}")
-
             snapshot = get_probe_result_cache()
-            if not snapshot.get("standard") and not snapshot.get("extended"):
-                _emit_log(
-                    "warning",
-                    "[Parallel] TCP 可用地址缓存为空，worker 建连可能失败",
-                )
 
             fingerprint: Tuple[Any, ...] = ((), ())
+            per_host_std = 4
+            per_host_ex = 4
             try:
                 from zsdtdx.unified_client import _load_merged_zsdtdx_config
 
                 cfg_for_fp = _load_merged_zsdtdx_config(_active_config_path)
                 std_hosts, ex_hosts = _normalize_hosts_from_cfg(cfg_for_fp)
                 fingerprint = compute_hosts_fingerprint(std_hosts, ex_hosts)
+                parallel_cfg = cfg_for_fp.get("parallel") or {}
+                per_host_std = max(
+                    1, int(parallel_cfg.get("adaptive_processes_per_host_std", 4) or 4)
+                )
+                per_host_ex = max(
+                    1, int(parallel_cfg.get("adaptive_processes_per_host_ex", 4) or 4)
+                )
+                # 未被当前任务探测的一侧仍下发原始配置，worker 仅保存列表、不主动建连。
+                if not snapshot.get("standard"):
+                    snapshot["standard"] = list(std_hosts)
+                if not snapshot.get("extended"):
+                    snapshot["extended"] = list(ex_hosts)
             except Exception as exc:
                 _emit_log("warning", f"[Parallel] 计算 hosts 指纹失败: {exc}")
 
-            assignments = _build_worker_host_slot_assignments(snapshot, max_workers)
+            assignments = _build_worker_host_slot_assignments(
+                snapshot, max_workers, per_host_std, per_host_ex
+            )
+            host_job_queues: Dict[Tuple[str, Tuple[str, int]], Any] = {}
+            for source_key, host_slots in _slot_host_index.items():
+                for host in host_slots:
+                    host_job_queues[(source_key, host)] = _mp.Queue()
+            slot_result_queue = _mp.Queue()
+            _host_job_queues = host_job_queues
+            _slot_result_queue = slot_result_queue
+            _routed_collector_started = False
+            _ensure_routed_collector()
             # C4 优化：用 multiprocessing.Value（共享内存原子计数器）替代 Manager.Value。
             # Manager.Value 的实现是通过 Manager 守护子进程的代理，缺少 get_lock() API
             # 导致 _init_worker 内 `slot_counter.get_lock()` 抛 AttributeError 退到 slot=0，
@@ -313,12 +448,293 @@ def _get_global_process_pool(max_workers: int) -> ProcessPoolExecutor:
                     copy.deepcopy(assignments),
                     fingerprint,
                     _global_pool_slot_counter,
+                    host_job_queues,
+                    slot_result_queue,
                 ),
             )
             _global_pool_epoch += 1
             _emit_log("info", f"[Parallel] 创建全局进程池 (workers: {max_workers})")
 
         return _global_process_pool
+
+
+_GET_GLOBAL_PROCESS_POOL_BUILTIN = _get_global_process_pool
+_slot_host_index: Dict[str, Dict[Tuple[str, int], List[int]]] = {"std": {}, "ex": {}}
+_host_job_queues: Dict[Tuple[str, Tuple[str, int]], Any] = {}
+_slot_result_queue: Any = None
+_routed_futures: Dict[int, Future] = {}
+_routed_job_seq = 0
+_routed_lock = threading.Lock()
+_routed_collector_started = False
+
+
+def _as_host_tuple(raw_host: Any) -> Optional[Tuple[str, int]]:
+    """输入 host 元组，输出 (ip, port)；无法解析时返回 None。"""
+    if isinstance(raw_host, (tuple, list)) and len(raw_host) >= 2:
+        host = str(raw_host[0]).strip()
+        try:
+            port = int(raw_host[1])
+        except (TypeError, ValueError):
+            return None
+        if host and port > 0:
+            return host, port
+    return None
+
+
+def allocate_host_worker_counts(
+    hosts: List[Any], total_workers: int, per_host_cap: int
+) -> Dict[Tuple[str, int], int]:
+    """
+    把进程数摊到行情站上。
+
+    输入：地址序列、进程总数、单地址进程上限。
+    输出：分到进程的地址及其进程数。
+    用途：建进程时确定每个站的自家进程，之后这个站的任务只进入这些进程。
+    边界：地址为空返回空映射。单站不超过上限，总和不超过总数。
+    传入顺序靠前的地址先分到进程（探测结果按延迟从低到高）。
+    """
+    ordered: List[Tuple[str, int]] = []
+    seen: set[Tuple[str, int]] = set()
+    for raw_host in hosts:
+        item = _as_host_tuple(raw_host)
+        if item is None or item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    if not ordered:
+        return {}
+    total = max(1, int(total_workers))
+    cap = max(1, int(per_host_cap))
+    counts = {item: 0 for item in ordered}
+    assigned = 0
+    while assigned < total:
+        progressed = False
+        for item in ordered:
+            if counts[item] >= cap:
+                continue
+            counts[item] += 1
+            assigned += 1
+            progressed = True
+            if assigned >= total:
+                break
+        if not progressed:
+            break
+    return {item: count for item, count in counts.items() if count > 0}
+
+
+def _home_first_hosts(
+    hosts: List[Tuple[str, int]], home: Tuple[str, int]
+) -> List[Tuple[str, int]]:
+    """输入地址列表和自家站，输出自家站排在第一的新列表。"""
+    ordered: List[Tuple[str, int]] = []
+    seen: set[Tuple[str, int]] = set()
+    for raw_host in (home, *hosts):
+        item = _as_host_tuple(raw_host)
+        if item is None or item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def _serve_routed_slot(job_queue: Any, result_queue: Any) -> None:
+    """
+    输入本槽位任务队列和回传队列，在已有 worker 进程里执行分到该槽的 K 线 bundle。
+
+    输出：无。收到 None 后退出。
+    边界：线程跑在全局进程池的 worker 内，不另开进程。
+    """
+    while True:
+        item = job_queue.get()
+        if item is None:
+            return
+        job_id, payload = item
+        try:
+            result_queue.put((int(job_id), None, _fetch_chunk_bundle(payload)))
+        except Exception as exc:
+            try:
+                result_queue.put((int(job_id), exc, None))
+            except Exception:
+                result_queue.put(
+                    (
+                        int(job_id),
+                        RuntimeError(f"{type(exc).__name__}: {exc}"),
+                        None,
+                    )
+                )
+
+
+def _collect_routed_results(result_queue: Any) -> None:
+    """输入回传队列，把 worker 结果写回父进程 Future。收到 job_id 为 None 时退出。"""
+    while True:
+        try:
+            job_id, err, result = result_queue.get()
+        except Exception:
+            return
+        if job_id is None:
+            return
+        with _routed_lock:
+            future = _routed_futures.pop(int(job_id), None)
+        if future is None or future.cancelled():
+            continue
+        if isinstance(err, BaseException):
+            future.set_exception(err)
+        else:
+            future.set_result(result)
+
+
+def _ensure_routed_collector() -> None:
+    """输入无。回传队列已就绪时启动一次父进程收集线程。"""
+    global _routed_collector_started
+    result_queue = _slot_result_queue
+    if result_queue is None or _routed_collector_started:
+        return
+    threading.Thread(
+        target=_collect_routed_results,
+        args=(result_queue,),
+        name="zsdtdx-routed-results",
+        daemon=True,
+    ).start()
+    _routed_collector_started = True
+
+
+def _stop_routed_workers() -> None:
+    """输入无。通知各站服务线程和收集线程退出，并清空路由表。"""
+    global \
+        _host_job_queues, \
+        _slot_result_queue, \
+        _routed_job_seq, \
+        _routed_collector_started
+    queues = list(_host_job_queues.items())
+    result_queue = _slot_result_queue
+    with _routed_lock:
+        _host_job_queues = {}
+        _slot_result_queue = None
+        pending = list(_routed_futures.values())
+        _routed_futures.clear()
+        _routed_job_seq = 0
+        _routed_collector_started = False
+    for future in pending:
+        if not future.done():
+            future.cancel()
+    for (source_key, host), job_queue in queues:
+        consumer_count = len((_slot_host_index.get(source_key) or {}).get(host) or [])
+        for _ in range(max(1, consumer_count)):
+            try:
+                job_queue.put(None)
+            except Exception:
+                break
+    if result_queue is not None:
+        try:
+            result_queue.put((None, "", None))
+        except Exception:
+            pass
+
+
+def _submit_routed_bundle(
+    source: str,
+    host: Optional[Tuple[str, int]],
+    payload: Dict[str, Any],
+    num_processes: int,
+):
+    """
+    输入行情侧、自家站和 bundle，提交到全局进程池里绑定该站的槽位。
+
+    输出：父进程 Future。
+    边界：测试替换了全局进程池，或该站没有槽位时，退回全局池的 submit。
+    """
+    global _routed_job_seq
+
+    source_key = "std" if str(source) == "std" else "ex"
+    home = _as_host_tuple(host)
+    job_queue = None if home is None else _host_job_queues.get((source_key, home))
+    if (
+        _get_global_process_pool is not _GET_GLOBAL_PROCESS_POOL_BUILTIN
+        or job_queue is None
+    ):
+        return _get_global_process_pool(num_processes).submit(
+            _fetch_chunk_bundle, payload
+        )
+    with _routed_lock:
+        _routed_job_seq += 1
+        job_id = int(_routed_job_seq)
+        future: Future = Future()
+        _routed_futures[job_id] = future
+    job_queue.put((job_id, payload))
+    return future
+
+
+def _side_host_snapshot(source: str) -> List[Tuple[str, int]]:
+    """输入 std/ex，输出该侧当前探测地址。"""
+    from zsdtdx.unified_client import get_probe_result_cache
+
+    snapshot = get_probe_result_cache()
+    side_key = "standard" if str(source) == "std" else "extended"
+    ordered: List[Tuple[str, int]] = []
+    seen: set[Tuple[str, int]] = set()
+    for raw_host in list(snapshot.get(side_key) or []):
+        item = _as_host_tuple(raw_host)
+        if item is None or item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def _limit_controller_to_affine_hosts(
+    controller: AdaptiveConcurrencyController,
+    source: str,
+    num_processes: int,
+    per_host_cap: int,
+) -> None:
+    """
+    输入控制器和进程预算，把可调度地址收成实际分到进程的站。
+
+    输出：无。
+    边界：测试替换了全局进程池入口时不改控制器，避免打乱桩对象。
+    """
+    if _get_global_process_pool is not _GET_GLOBAL_PROCESS_POOL_BUILTIN:
+        return
+    hosts = _side_host_snapshot(source)
+    plan = allocate_host_worker_counts(hosts, num_processes, per_host_cap)
+    controller.update_hosts(source, list(plan.keys()))
+
+
+class _DaemonChunkExecutor(ThreadPoolExecutor):
+    """
+    chunk 尝试与重连共用的线程池。线程为 daemon，关闭 socket 后阻塞调用返回。
+
+    输入：与 ThreadPoolExecutor 相同。
+    输出：线程池实例。
+    边界：同一进程复用线程，保留线程本地连接；超时必须关闭当次 socket，不能只等线程自然结束。
+    """
+
+    def _adjust_thread_count(self) -> None:
+        from concurrent.futures import thread as _cf_thread
+
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        def weakref_cb(_ref, q=self._work_queue) -> None:
+            q.put(None)
+
+        num_threads = len(self._threads)
+        if num_threads < self._max_workers:
+            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
+            worker = threading.Thread(
+                name=thread_name,
+                target=_cf_thread._worker,
+                args=(
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,
+                    self._initializer,
+                    self._initargs,
+                ),
+                daemon=True,
+            )
+            worker.start()
+            self._threads.add(worker)
+            _cf_thread._threads_queues[worker] = self._work_queue
 
 
 def _shutdown_global_pool():
@@ -336,6 +752,8 @@ def _shutdown_global_pool():
     """
     global _global_process_pool, _global_pool_epoch
     global _global_pool_slot_manager, _global_pool_slot_counter
+    # 先让槽位线程退出，再等待唯一的全局进程池结束。
+    _stop_routed_workers()
     if _global_process_pool is not None:
         try:
             _emit_log("info", "[Parallel] 关闭全局进程池")
@@ -347,6 +765,7 @@ def _shutdown_global_pool():
     # multiprocessing.Value 不需要 shutdown；置 None 让 GC 释放共享内存。
     _global_pool_slot_manager = None
     _global_pool_slot_counter = None
+    _reset_global_adaptive_controller()
 
 
 def destroy_parallel_fetcher() -> Dict[str, Any]:
@@ -410,7 +829,7 @@ def force_restart_parallel_fetcher(
     强制重启并行抓取器：终止旧 worker 并可选立即预热重建。
 
     输入：
-    1. prewarm: 是否在重启后立即执行 worker+连接预热。
+    1. prewarm: 是否在重启后立即拉起 worker 进程。
     2. prewarm_timeout_seconds: 预热超时时间（秒）。
     3. max_rounds: 预热最大轮次。
     输出：
@@ -429,6 +848,9 @@ def force_restart_parallel_fetcher(
         _global_process_pool = None
         _global_pool_max_workers = 0
         _global_pool_epoch += 1
+    # 旧 worker 会被终止，所有由其持有的准入 permit 同步失效。
+    _stop_routed_workers()
+    _reset_global_adaptive_controller()
 
     detail: Dict[str, Any] = {
         "prewarm": bool(prewarm),
@@ -530,7 +952,17 @@ def _close_worker_client_context() -> None:
         pass
 
 
-def _cleanup_worker_dead_thread_connections() -> None:
+def _target_pool_names(target: str = "both") -> Tuple[str, ...]:
+    """输入 std/ex/both，输出需要操作的连接池属性名；非法值回退 both。"""
+    normalized = str(target or "both").strip().lower()
+    if normalized == "std":
+        return ("std_pool",)
+    if normalized == "ex":
+        return ("ex_pool",)
+    return ("std_pool", "ex_pool")
+
+
+def _cleanup_worker_dead_thread_connections(target: str = "both") -> None:
     """
     清理 worker 内已退出线程遗留的连接。
 
@@ -546,16 +978,19 @@ def _cleanup_worker_dead_thread_connections() -> None:
     context = _worker_client_context
     if context is None:
         return
-    cleaner = getattr(context, "cleanup_dead_thread_connections", None)
-    if not callable(cleaner):
-        return
-    try:
-        cleaner()
-    except Exception:
-        pass
+    for pool_name in _target_pool_names(target):
+        pool = getattr(context, pool_name, None)
+        cleaner = getattr(pool, "cleanup_dead_thread_connections", None)
+        if callable(cleaner):
+            try:
+                cleaner()
+            except Exception:
+                pass
 
 
-def _apply_chunk_socket_read_deadline(client_context: Any, deadline: float) -> None:
+def _apply_chunk_socket_read_deadline(
+    client_context: Any, deadline: float, target: str = "both"
+) -> None:
     """
     按单次抓取尝试 deadline 设置当前线程 std/ex 池 socket 读超时。
 
@@ -568,7 +1003,7 @@ def _apply_chunk_socket_read_deadline(client_context: Any, deadline: float) -> N
     1. 剩余时间不足 0.1 秒时按 0.1 秒处理。
     """
     remaining = max(0.1, float(deadline) - time.monotonic())
-    for pool_name in ("std_pool", "ex_pool"):
+    for pool_name in _target_pool_names(target):
         pool = getattr(client_context, pool_name, None)
         setter = getattr(pool, "set_thread_socket_read_timeout", None)
         if callable(setter):
@@ -578,7 +1013,9 @@ def _apply_chunk_socket_read_deadline(client_context: Any, deadline: float) -> N
                 pass
 
 
-def _restore_chunk_socket_read_timeout(client_context: Any) -> None:
+def _restore_chunk_socket_read_timeout(
+    client_context: Any, target: str = "both"
+) -> None:
     """
     D3 优化：chunk 结束时还原 std/ex 池的 socket 读超时为 pool 默认。
 
@@ -588,7 +1025,7 @@ def _restore_chunk_socket_read_timeout(client_context: Any) -> None:
     用途：
     1. 避免一次短超时的 chunk 残留影响心跳/后续 chunk 读路径。
     """
-    for pool_name in ("std_pool", "ex_pool"):
+    for pool_name in _target_pool_names(target):
         pool = getattr(client_context, pool_name, None)
         restorer = getattr(pool, "restore_thread_socket_read_timeout", None)
         if callable(restorer):
@@ -657,16 +1094,25 @@ def _infer_recover_target_from_chunk(prep: Dict[str, Any]) -> str:
     输出：
     1. "std" / "ex" / "both"。
     用途：
-    1. C2 优化：stock chunk 仅走 std；index chunk 按 `_index_route_source` 单边选择；
-       两侧并发任务（罕见）退化为 "both"。
+    1. 优先读取 stock/index 共用的 `_route_source`；旧 index payload 回退
+       `_index_route_source`，无路由信息的旧 stock payload 回退 std。
     边界条件：
     1. prep 字段缺失或 task_kind 非 stock/index 时返回 "both" 兜底。
     """
+    normalized = prep.get("normalized_tasks") or []
+    generic_sources = {
+        str(item.get("_route_source", "")).strip().lower()
+        for item in normalized
+        if isinstance(item, dict)
+        and str(item.get("_route_source", "")).strip().lower() in {"std", "ex"}
+    }
+    if len(generic_sources) == 1:
+        return generic_sources.pop()
+
     task_kind = str(prep.get("task_kind", "stock")).strip().lower()
     if task_kind == "stock":
         return "std"
     if task_kind == "index":
-        normalized = prep.get("normalized_tasks") or []
         sources = set()
         for t in normalized:
             if not isinstance(t, dict):
@@ -678,143 +1124,6 @@ def _infer_recover_target_from_chunk(prep: Dict[str, Any]) -> str:
             return sources.pop()
         return "both"
     return "both"
-
-
-def _probe_worker_std_ex_pool_state() -> Dict[str, Any]:
-    """
-    探测 worker 内标准/扩展行情池连接状态。
-
-    输入：
-    1. 无显式输入参数。
-    输出：
-    1. 连接状态字典（std/ex 是否可用与当前活跃 host）。
-    用途：
-    1. 供 chunk 预热线程与 worker 主线程预热复用。
-    边界条件：
-    1. 建连失败时异常上抛，由调用方统一统计。
-    """
-    context_client = _ensure_worker_client_context()
-    std_pool = getattr(context_client, "std_pool", None)
-    ex_pool = getattr(context_client, "ex_pool", None)
-
-    std_ok = bool(std_pool.ensure_connected()) if std_pool is not None else False
-    ex_ok = bool(ex_pool.ensure_connected()) if ex_pool is not None else False
-    std_host = (
-        str(std_pool.get_active_host() or "").strip() if std_pool is not None else ""
-    )
-    ex_host = (
-        str(ex_pool.get_active_host() or "").strip() if ex_pool is not None else ""
-    )
-    return {
-        "std_ok": bool(std_ok),
-        "ex_ok": bool(ex_ok),
-        "std_host": std_host,
-        "ex_host": ex_host,
-    }
-
-
-def _worker_chunk_connection_probe() -> Dict[str, Any]:
-    """
-    在 to_thread 工作线程内触发连接建立并返回状态。
-
-    输入：
-    1. 无显式输入参数。
-    输出：
-    1. 连接状态字典（std/ex 是否可用与当前活跃 host）。
-    用途：
-    1. 供协程预热阶段提前建连。
-    边界条件：
-    1. 建连失败时异常上抛。
-    """
-    return _probe_worker_std_ex_pool_state()
-
-
-async def _prewarm_worker_chunk_coroutine_connections_async(
-    inproc_workers: int,
-) -> Dict[str, Any]:
-    """
-    预热 worker 进程内 chunk 协程并发槽位连接。
-
-    输入：
-    1. inproc_workers: 目标协程并发数。
-    输出：
-    1. 预热摘要。
-    边界条件：
-    1. 目标 <=1 时跳过；已满足预热槽位时短路。
-    """
-    global _worker_chunk_coroutine_warmed_slots
-    target_workers = max(1, int(inproc_workers))
-    if target_workers <= 1:
-        return {
-            "inproc_target_workers": int(target_workers),
-            "inproc_warmed_workers": 0,
-        }
-
-    with _worker_chunk_coroutine_warmed_lock:
-        warmed_before = int(_worker_chunk_coroutine_warmed_slots)
-    if warmed_before >= target_workers:
-        return {
-            "inproc_target_workers": int(target_workers),
-            "inproc_warmed_workers": int(warmed_before),
-        }
-
-    sem = asyncio.Semaphore(target_workers)
-    warmed_workers = 0
-    warmup_errors: List[str] = []
-
-    async def _one_probe() -> None:
-        nonlocal warmed_workers
-        async with sem:
-            try:
-                payload = await asyncio.to_thread(_worker_chunk_connection_probe)
-                if bool(payload.get("std_ok")) and bool(payload.get("ex_ok")):
-                    warmed_workers += 1
-            except Exception as exc:
-                warmup_errors.append(str(exc)[:200])
-
-    timeout_seconds = max(1.0, min(float(target_workers) * 1.2, 8.0))
-    try:
-        await asyncio.wait_for(
-            asyncio.gather(*[_one_probe() for _ in range(target_workers)]),
-            timeout=timeout_seconds,
-        )
-    except asyncio.TimeoutError:
-        warmup_errors.append("inproc chunk coroutine warmup timeout")
-
-    with _worker_chunk_coroutine_warmed_lock:
-        _worker_chunk_coroutine_warmed_slots = max(
-            int(_worker_chunk_coroutine_warmed_slots),
-            int(warmed_workers),
-        )
-        warmed_snapshot = int(_worker_chunk_coroutine_warmed_slots)
-
-    result: Dict[str, Any] = {
-        "inproc_target_workers": int(target_workers),
-        "inproc_warmed_workers": int(warmed_snapshot),
-    }
-    if warmup_errors:
-        result["inproc_warmup_errors"] = warmup_errors[:5]
-    return result
-
-
-def _prewarm_worker_chunk_coroutine_connections(inproc_workers: int) -> Dict[str, Any]:
-    """
-    同步入口：预热 worker chunk 协程槽位连接。
-
-    输入：
-    1. inproc_workers: 目标协程并发数。
-    输出：
-    1. 预热摘要。
-    边界条件：
-    1. 在已有事件循环时复用，否则 asyncio.run。
-    """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(
-            _prewarm_worker_chunk_coroutine_connections_async(inproc_workers)
-        )
-    raise RuntimeError("无法在运行中的事件循环内同步预热 chunk 协程连接")
 
 
 def _ensure_worker_client_context():
@@ -916,6 +1225,37 @@ def _is_connection_unavailable_error(error_text: str) -> bool:
     return False
 
 
+def _is_transport_congestion_error(error_text: str) -> bool:
+    """
+    判断错误是否属于应降低地址配额的传输失败。
+
+    输入：error_text 为原始错误文本。
+    输出：连接不可用或传输超时返回 True。
+    用途：重试耗尽后的拥塞标记。成功切站或重试成功不得调用本函数去覆盖已清除的标记。
+    边界：空字符串返回 False。同时识别 timeout、timed out 与「超时」。
+    """
+    if _is_connection_unavailable_error(error_text):
+        return True
+    plain = str(error_text or "").strip().lower()
+    if plain == "":
+        return False
+    return ("timeout" in plain) or ("timed out" in plain) or ("超时" in plain)
+
+
+def _chunk_reports_mark_congested(bundle_result: Dict[str, Any]) -> bool:
+    """
+    输入 bundle 执行结果，输出是否应降低发证地址的配额。
+
+    输出：任一 chunk 报告 congested 为 True 时返回 True。
+    用途：父进程释放准入时只认 worker 在重试耗尽后写下的标记。
+    边界：不扫描 payload 错误文本。重试成功的报告必须把 congested 写成 False。
+    """
+    for raw_report in list((bundle_result or {}).get("chunk_reports") or []):
+        if isinstance(raw_report, dict) and bool(raw_report.get("congested", False)):
+            return True
+    return False
+
+
 def _recover_worker_standard_connection_current_thread(
     reason: str = "",
 ) -> Dict[str, Any]:
@@ -1003,31 +1343,33 @@ def _worker_warmup_probe(
     inproc_workers: int = 1,
 ) -> Dict[str, Any]:
     """
-    worker 预热探针：确保常驻连接已建立并返回当前进程 pid。
+    worker 预热探针：只拉起进程并返回 pid，不建立行情连接。
 
     输入：
     1. hold_seconds: 探针持有时长（秒），用于提高任务分发到不同 worker 的概率。
-    2. inproc_workers: worker 进程内 chunk 协程并发数（用于预热 to_thread 槽位连接）。
+    2. inproc_workers: 仅写入摘要的进程内 chunk 并发目标。
     输出：
-    1. 预热结果字典，包含 `pid` 与标准行情 host 状态。
+    1. 预热结果字典，包含 `pid` 与进程内并发目标。
     用途：
-    1. 在启动阶段触发每个 worker 进程主线程的标准/扩展池建连。
-    2. 当 inproc_workers>1 时，同时预热 chunk 协程槽位连接，确保后续 chunk 复用。
+    1. 在启动阶段提前承担 Windows spawn 与模块加载成本。
     边界条件：
-    1. 建连失败时异常上抛，由主进程聚合并判定启动是否失败。
+    1. 不检查 std/ex 网络状态；连接由实际业务 bundle 按侧懒建。
     """
-    pool_state = _probe_worker_std_ex_pool_state()
-    active_std = str(pool_state.get("std_host", "")).strip()
     host_state = {
-        "active_std_host_before": active_std,
-        "active_std_host": active_std,
+        "active_std_host_before": "",
+        "active_std_host": "",
         "target_std_host": "",
         "std_host_switched": False,
         "std_host_matched": True,
-        "std_ok": bool(pool_state.get("std_ok")),
-        "ex_ok": bool(pool_state.get("ex_ok")),
+        "std_ok": False,
+        "ex_ok": False,
     }
-    inproc_summary = _prewarm_worker_chunk_coroutine_connections(inproc_workers)
+    # 预热仅拉起进程。业务连接由 route-homogeneous bundle 在实际执行时按侧懒建，
+    # 避免纯 std 任务在启动阶段向短 ex 地址池扇出。
+    inproc_summary = {
+        "inproc_target_workers": max(1, int(inproc_workers)),
+        "inproc_warmed_workers": 0,
+    }
     hold = max(0.0, min(float(hold_seconds), 1.0))
     if hold > 0:
         time.sleep(hold)
@@ -1042,7 +1384,7 @@ def prewarm_parallel_fetcher(
     target_workers: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    预热并行抓取器：强制拉起进程池并建立 worker 常驻连接。
+    预热并行抓取器：强制拉起目标数量的 worker 进程。
 
     输入：
     1. require_all_workers: 是否要求全部 worker 均完成预热。
@@ -1052,10 +1394,10 @@ def prewarm_parallel_fetcher(
     输出：
     1. 预热统计摘要（目标进程数、已预热进程数、pid 列表、耗时等）。
     用途：
-    1. 在服务启动阶段提前完成“进程 + 连接”初始化，缩短首批抓取冷启动。
+    1. 在服务启动阶段提前完成进程与模块初始化，缩短首批抓取冷启动。
     边界条件：
     1. 当 `require_all_workers=True` 且预热不足时抛出 RuntimeError。
-    2. 当探针执行超时或 worker 建连失败时，错误会进入摘要并参与失败判定。
+    2. 当进程探针执行超时时，错误会进入摘要并参与失败判定。
     """
     target_workers = max(
         1,
@@ -1070,6 +1412,7 @@ def prewarm_parallel_fetcher(
     started_at = time.monotonic()
     warmed_pids: set[int] = set()
     worker_std_host_map: Dict[int, str] = {}
+    worker_states: Dict[int, Dict[str, Any]] = {}
     round_errors: list[str] = []
     rounds_used = 0
 
@@ -1084,7 +1427,9 @@ def prewarm_parallel_fetcher(
             "max_rounds": int(rounds_limit),
         },
     )
-    executor = _get_global_process_pool(target_workers)
+    # 进程池硬上限始终保持配置值，target_workers 只控制本轮实际拉起数量，
+    # 避免小任务预热后正式调度又因 max_workers 变化重建整个池。
+    executor = _get_global_process_pool(max(1, int(get_fetcher().num_processes)))
 
     for round_idx in range(1, rounds_limit + 1):
         rounds_used = round_idx
@@ -1094,7 +1439,7 @@ def prewarm_parallel_fetcher(
             round_errors.append("warmup timeout before round dispatch")
             break
 
-        probe_count = max(target_workers * 2, target_workers)
+        probe_count = int(target_workers)
         futures = [
             executor.submit(_worker_warmup_probe, 0.15, inproc_workers)
             for _ in range(probe_count)
@@ -1106,6 +1451,7 @@ def prewarm_parallel_fetcher(
                     pid = int(payload.get("pid", 0))
                     if pid > 0:
                         warmed_pids.add(pid)
+                        worker_states[pid] = dict(payload)
                         active_std_host = str(
                             payload.get("active_std_host", "")
                         ).strip()
@@ -1150,6 +1496,7 @@ def prewarm_parallel_fetcher(
         "elapsed_seconds": float(elapsed_total),
         "rounds_used": int(rounds_used),
         "require_all_workers": bool(require_all_workers),
+        "worker_states": [dict(worker_states[pid]) for pid in sorted(worker_states)],
         "std_worker_host_distribution": _summarize_worker_std_host_distribution(
             worker_std_host_map
         ),
@@ -1254,6 +1601,8 @@ def _init_worker(
     slot_assignments: Optional[List[Dict[str, list]]] = None,
     hosts_fingerprint: Optional[Tuple[Any, ...]] = None,
     slot_counter: Any = None,
+    host_job_queues: Optional[Dict[Tuple[str, Tuple[str, int]], Any]] = None,
+    slot_result_queue: Any = None,
 ):
     """
     worker 进程初始化钩子。
@@ -1277,6 +1626,7 @@ def _init_worker(
         _active_config_path = config_path
 
     slot_hosts: Optional[Dict[str, list]] = None
+    slot = 0
     if (
         slot_assignments
         and isinstance(slot_assignments, list)
@@ -1296,6 +1646,24 @@ def _init_worker(
         _worker_sorted_hosts = slot_hosts
         if hosts_fingerprint is not None:
             _seed_probe_result_cache_from_snapshot(slot_hosts, hosts_fingerprint)
+
+    if host_job_queues and slot_result_queue is not None and slot_hosts:
+        for source_key, side_name in (("std", "standard"), ("ex", "extended")):
+            side_hosts = list(slot_hosts.get(side_name) or [])
+            if not side_hosts:
+                continue
+            home = _as_host_tuple(side_hosts[0])
+            job_queue = (
+                None if home is None else host_job_queues.get((source_key, home))
+            )
+            if job_queue is None:
+                continue
+            threading.Thread(
+                target=_serve_routed_slot,
+                args=(job_queue, slot_result_queue),
+                name=f"zsdtdx-{source_key}-{home[0]}-{home[1]}",
+                daemon=False,
+            ).start()
 
     try:
         atexit.register(_close_worker_client_context)
@@ -1337,7 +1705,7 @@ def get_optimal_process_count(core_multiplier: float = 1.5) -> int:
     计算并发抓取推荐进程数。
 
     输入：
-    1. core_multiplier: 物理核心数倍率（默认 1.5）。
+    1. core_multiplier: 物理核心数倍率。直接调用且未传时用 1.5；并行抓取器读取 config。建议 0.5~3.0，具体数值以配置文件为准。
     输出：
     1. 推荐进程数（`max(2, int(物理核心数 * core_multiplier))`）。
     用途：
@@ -1387,6 +1755,7 @@ class TaskChunk:
     code: str
     freq: str
     tasks: List[Dict[str, str]]
+    route_source: str = "std"
 
     @property
     def task_count(self) -> int:
@@ -1417,6 +1786,7 @@ class TaskChunk:
             "chunk_id": str(self.chunk_id),
             "code": str(self.code),
             "freq": str(self.freq),
+            "route_source": str(self.route_source),
             "task_count": int(self.task_count),
             "enable_cache": bool(enable_cache),
             "tasks": [dict(item) for item in self.tasks],
@@ -1441,6 +1811,7 @@ class ChunkBundle:
 
     bundle_id: int
     chunks: List[TaskChunk]
+    route_source: str = "std"
 
     @property
     def task_count(self) -> int:
@@ -1473,11 +1844,38 @@ class ChunkBundle:
             chunk_payloads.append(chunk.to_payload(enable_cache=enable_cache))
         return {
             "bundle_id": int(self.bundle_id),
+            "route_source": str(self.route_source),
             "bundle_task_count": int(self.task_count),
             "bundle_chunk_count": int(len(self.chunks)),
             "cache_min_tasks": int(cache_min_tasks),
             "chunks": chunk_payloads,
         }
+
+
+def _infer_stock_task_route_source(code: str) -> str:
+    """
+    根据股票代码契约推断行情侧。
+
+    输入：支持 sh./sz./bj./hk. 前缀的股票代码。
+    输出："std" 或 "ex"。
+    边界：无前缀时 5 位数字视为港股通，6 位数字视为标准行情；其它格式抛错。
+    """
+    raw_code = str(code or "").strip()
+    prefix = ""
+    compact = raw_code
+    if "." in raw_code:
+        prefix, compact = raw_code.split(".", 1)
+        prefix = prefix.strip().lower()
+        compact = compact.strip()
+    if prefix == "hk":
+        return "ex"
+    if prefix in {"sh", "sz", "bj"}:
+        return "std"
+    if compact.isdigit() and len(compact) == 5:
+        return "ex"
+    if compact.isdigit() and len(compact) == 6:
+        return "std"
+    raise ValueError(f"无法判断股票代码行情路由: {code}")
 
 
 def _normalize_task_payload(task: Dict[str, Any]) -> Dict[str, str]:
@@ -1507,11 +1905,15 @@ def _normalize_task_payload(task: Dict[str, Any]) -> Dict[str, str]:
         raise ValueError("task.start_time 不能为空")
     if end_time == "":
         raise ValueError("task.end_time 不能为空")
+    route_source = str(task.get("_route_source", "")).strip().lower()
+    if route_source not in {"std", "ex"}:
+        route_source = _infer_stock_task_route_source(code)
     return {
         "code": code,
         "freq": freq,
         "start_time": start_time,
         "end_time": end_time,
+        "_route_source": route_source,
     }
 
 
@@ -1556,6 +1958,7 @@ def _normalize_index_task_payload(task: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         route_market = -1
     if route_source in {"std", "ex"} and route_code != "" and route_market >= 0:
+        normalized["_route_source"] = route_source
         normalized["_index_route_source"] = route_source
         normalized["_index_route_market"] = int(route_market)
         normalized["_index_route_code"] = route_code
@@ -1798,6 +2201,15 @@ def _prepare_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
         "log_tag": str(profile["log_tag"]),
         "worker_pid": worker_pid,
         "chunk_id": chunk_id,
+        "route_source": str(
+            chunk_payload.get("route_source")
+            or normalized_tasks[0].get("_route_source")
+            or normalized_tasks[0].get("_index_route_source")
+            or "std"
+        )
+        .strip()
+        .lower(),
+        "preferred_host": chunk_payload.get("preferred_host"),
         "raw_tasks": raw_tasks,
         "enable_cache": enable_cache,
         "task_detail": task_detail,
@@ -1808,7 +2220,7 @@ def _prepare_one_task_chunk(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
             chunk_payload.get("reconnect_on_unavailable", True)
         ),
         "chunk_timeout": max(
-            1.0, float(chunk_payload.get("chunk_timeout_seconds", 30.0) or 30.0)
+            1.0, float(chunk_payload.get("chunk_timeout_seconds", 15.0) or 15.0)
         ),
         "chunk_retry_max": max(
             0, int(chunk_payload.get("chunk_retry_max_attempts", 2) or 0)
@@ -1836,21 +2248,46 @@ def _fetch_one_chunk_fetch_attempt(prep: Dict[str, Any]) -> Dict[str, Any]:
     attempt_deadline = time.monotonic() + chunk_timeout
 
     client_context = _ensure_worker_client_context()
-    _apply_chunk_socket_read_deadline(client_context, attempt_deadline)
+    route_source = str(prep.get("route_source", "std")).strip().lower()
+    if route_source not in {"std", "ex"}:
+        route_source = _infer_recover_target_from_chunk(prep)
+    preferred_host = prep.get("preferred_host")
+    pool_name = "std_pool" if route_source == "std" else "ex_pool"
+    target_pool = getattr(client_context, pool_name, None)
+    if (
+        isinstance(preferred_host, (tuple, list))
+        and len(preferred_host) >= 2
+        and target_pool is not None
+    ):
+        setter = getattr(target_pool, "set_thread_preferred_host", None)
+        if callable(setter):
+            try:
+                setter(str(preferred_host[0]), int(preferred_host[1]))
+            except Exception:
+                pass
+    _apply_chunk_socket_read_deadline(
+        client_context, attempt_deadline, target=route_source
+    )
     try:
         if task_kind == "index":
-            return client_context.get_index_kline_rows_for_chunk_tasks(
+            chunk_result = client_context.get_index_kline_rows_for_chunk_tasks(
                 tasks=normalized_tasks,
                 enable_cache=enable_cache,
             )
-        return client_context.get_stock_kline_rows_for_chunk_tasks(
-            tasks=normalized_tasks,
-            enable_cache=enable_cache,
-            qfq=qfq,
-        )
+        else:
+            chunk_result = client_context.get_stock_kline_rows_for_chunk_tasks(
+                tasks=normalized_tasks,
+                enable_cache=enable_cache,
+                qfq=qfq,
+            )
+        result = dict(chunk_result or {})
+        active_host_getter = getattr(target_pool, "get_active_host", None)
+        if callable(active_host_getter):
+            result["_active_host"] = str(active_host_getter() or "").strip()
+        return result
     finally:
         # D3 优化：chunk 结束时还原 socket 读超时，避免短超时残留影响后续 chunk/心跳。
-        _restore_chunk_socket_read_timeout(client_context)
+        _restore_chunk_socket_read_timeout(client_context, target=route_source)
 
 
 def _assemble_chunk_success_report(
@@ -1882,6 +2319,7 @@ def _assemble_chunk_success_report(
     chunk_network_page_calls = int(
         (chunk_result or {}).get("chunk_network_page_calls", 0) or 0
     )
+    active_host = str((chunk_result or {}).get("_active_host") or "").strip()
 
     for index, task in enumerate(normalized_tasks):
         item = (
@@ -1914,6 +2352,7 @@ def _assemble_chunk_success_report(
         "chunk_task_count": int(len(raw_tasks)),
         "chunk_hit_tasks": int(max(0, chunk_hit_tasks)),
         "chunk_network_page_calls": int(max(0, chunk_network_page_calls)),
+        "active_host": active_host,
         "task_detail": task_detail,
         "payloads": payloads,
         "failures": failures,
@@ -1934,8 +2373,8 @@ def _log_chunk_retry(
     输出：
     1. 无返回值。
     用途：
-    1. C2 简化：本函数仅记录重试日志。超时分支的连接重置已由
-       _fetch_one_task_chunk_async / _fetch_one_task_chunk_timed_body 在调用本函数之前完成；
+    1. 本函数仅记录重试日志。超时分支的连接重置已由
+       _fetch_one_task_chunk_async 在调用本函数之前完成；
        不再二次触发 _recover_worker_pools_current_thread，避免对刚重建的连接重复重置。
     边界条件：
     1. 仅写日志，不做任何连接恢复操作。
@@ -1973,77 +2412,6 @@ def _log_chunk_retry(
             "reason": str(error_text),
         },
     )
-
-
-def _fetch_one_task_chunk_timed_body(prep: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    chunk 同步执行主体：单次尝试受 chunk_timeout_seconds 限制，重试不受该上限约束。
-
-    输入：
-    1. prep: `_prepare_one_task_chunk` 返回的准备结果。
-    输出：
-    1. 分片执行结果字典。
-    边界条件：
-    1. 每次尝试独立计时；重试次数由 chunk_retry_max_attempts 控制。
-    """
-    log_tag = str(prep["log_tag"])
-    chunk_id = str(prep["chunk_id"])
-    raw_tasks = list(prep["raw_tasks"])
-    chunk_retry_max = int(prep["chunk_retry_max"])
-
-    error_text = ""
-    chunk_result: Optional[Dict[str, Any]] = None
-    try:
-        chunk_result = _fetch_one_chunk_attempt_with_timeout(prep)
-    except TimeoutError:
-        error_text = "chunk attempt timeout"
-        try:
-            _recover_worker_pools_current_thread(
-                "chunk_attempt_timeout",
-                _infer_recover_target_from_chunk(prep),
-            )
-        except Exception:
-            pass
-    except Exception as exc:
-        error_text = str(exc)[:200] or type(exc).__name__
-
-    retry_count = 0
-    while error_text and retry_count < chunk_retry_max:
-        retry_count += 1
-        _recover_chunk_connection_before_retry(prep, error_text)
-        _log_chunk_retry(prep, retry_count=retry_count, error_text=error_text)
-        try:
-            chunk_result = _fetch_one_chunk_attempt_with_timeout(prep)
-            error_text = ""
-        except TimeoutError:
-            error_text = "chunk attempt timeout"
-            try:
-                _recover_worker_pools_current_thread(
-                    "chunk_attempt_timeout",
-                    _infer_recover_target_from_chunk(prep),
-                )
-            except Exception:
-                pass
-        except Exception as retry_exc:
-            error_text = str(retry_exc)[:200] or type(retry_exc).__name__
-
-    if error_text:
-        if retry_count > 0:
-            _emit_log(
-                "error",
-                f"[Task Parallel] {log_tag} 重试耗尽仍失败",
-                {
-                    "stage": "chunk_retry_exhausted",
-                    "chunk_id": str(chunk_id),
-                    "chunk_task_count": int(len(raw_tasks)),
-                    "retry_count": int(retry_count),
-                    "retry_limit": int(chunk_retry_max),
-                    "last_error": str(error_text),
-                },
-            )
-        return _build_chunk_timeout_error_report(prep, error_text)
-
-    return _assemble_chunk_success_report(prep, dict(chunk_result or {}))
 
 
 def _build_chunk_timeout_error_report(
@@ -2092,23 +2460,74 @@ def _build_chunk_timeout_error_report(
 
 def _get_worker_chunk_executor(thread_name_prefix: str) -> ThreadPoolExecutor:
     """
-    创建 worker 内单 chunk attempt 使用的短生命周期线程池。
+    返回 worker 进程内复用的 chunk 尝试线程池。
 
     输入：
-    1. thread_name_prefix: 线程名前缀，便于诊断卡死 attempt。
+    1. thread_name_prefix: 兼容旧调用；池已存在时忽略。
     输出：
-    1. `ThreadPoolExecutor(max_workers=1)`。
+    1. 进程内共享的 daemon 线程池。
     用途：
-    1. 集中封装线程池创建，便于测试以内联 executor 替换，并避免使用 asyncio 默认 executor。
+    1. 尝试线程可复用，线程本地行情连接得以保留；测试可替换本函数。
     边界条件：
-    1. 调用方负责 shutdown；超时路径使用 wait=False 放弃等待阻塞线程。
+    1. 不在每次尝试后 shutdown。超时路径关闭 socket，让该线程上的阻塞调用返回。
     """
-    return ThreadPoolExecutor(max_workers=1, thread_name_prefix=str(thread_name_prefix))
+    global _worker_attempt_executor
+    if _worker_attempt_executor is None:
+        _worker_attempt_executor = _DaemonChunkExecutor(
+            max_workers=_WORKER_ATTEMPT_EXECUTOR_WORKERS,
+            thread_name_prefix=str(thread_name_prefix or "zsdtdx_chunk"),
+        )
+    return _worker_attempt_executor
+
+
+def _submit_attempt_call(
+    fn: Callable[..., Any], args: Tuple[Any, ...], *, thread_name: str
+):
+    """
+    在 daemon 线程中执行一次可能阻塞的调用，并登记它新建的 socket。
+
+    输入：
+    1. fn/args: 要执行的函数与参数。
+    2. thread_name: 线程名前缀。
+    输出：
+    1. (executor, future, closer)。
+    用途：让单次尝试和重连都能在超时时关闭自己的 socket。
+    边界：调用方负责在超时后 closer.close()，并 shutdown executor 且不等待线程。
+    """
+    from zsdtdx.unified_client import AttemptSocketCloser, _attempt_socket_closer
+
+    closer = AttemptSocketCloser()
+
+    def _runner() -> Any:
+        token = _attempt_socket_closer.set(closer)
+        try:
+            return fn(*args)
+        finally:
+            _attempt_socket_closer.reset(token)
+
+    executor = _get_worker_chunk_executor(thread_name)
+    future = executor.submit(_runner)
+    return executor, future, closer
+
+
+def _shutdown_attempt_executor(executor: Any) -> None:
+    """输入线程池，输出无。边界：复用池不关闭；测试替换进来的池可以关闭且不等待。"""
+    if executor is None or executor is _worker_attempt_executor:
+        return
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        try:
+            executor.shutdown(wait=False)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def _fetch_one_chunk_attempt_with_timeout(prep: Dict[str, Any]) -> Dict[str, Any]:
     """
-    在线程内执行单次 chunk attempt，并在超时时放弃等待阻塞线程。
+    在线程内执行单次 chunk attempt，并在超时时关闭本次 socket。
 
     输入：
     1. prep: `_prepare_one_task_chunk` 返回的准备结果。
@@ -2117,27 +2536,29 @@ def _fetch_one_chunk_attempt_with_timeout(prep: Dict[str, Any]) -> Dict[str, Any
     用途：
     1. 让同步 chunk 路径也具备外层墙钟超时，避免阻塞调用方。
     边界条件：
-    1. Python 线程不能被安全强杀；超时后关闭 executor 的等待语义并抛 TimeoutError，由 socket deadline
-       促使底层 I/O 尽快自然退出。
+    1. 超时后关闭本次尝试的 socket，使阻塞中的 recv/connect 返回，并抛 TimeoutError。
     """
     chunk_timeout = float(prep["chunk_timeout"])
-    executor = _get_worker_chunk_executor("zsdtdx_chunk_attempt")
-    future = executor.submit(_fetch_one_chunk_fetch_attempt, prep)
+    executor, future, closer = _submit_attempt_call(
+        _fetch_one_chunk_fetch_attempt,
+        (prep,),
+        thread_name="zsdtdx_chunk_attempt",
+    )
     try:
         return future.result(timeout=chunk_timeout)
     except TimeoutError as exc:
-        try:
-            future.cancel()
-        except Exception:
-            pass
+
+        def _discard_late_error(finished: Any) -> None:
+            try:
+                finished.exception()
+            except Exception:
+                pass
+
+        future.add_done_callback(_discard_late_error)
+        closer.close()
         raise TimeoutError("chunk attempt timeout") from exc
     finally:
-        try:
-            executor.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            executor.shutdown(wait=False)
-        except Exception:
-            pass
+        _shutdown_attempt_executor(executor)
 
 
 def _recover_chunk_connection_before_retry(
@@ -2184,50 +2605,86 @@ async def _recover_chunk_connection_before_retry_async(
     if not _is_connection_unavailable_error(error_text):
         return
     try:
-        await asyncio.to_thread(
+        await _await_attempt_call(
             _recover_worker_pools_current_thread,
-            "chunk_connection_unavailable",
-            _infer_recover_target_from_chunk(prep),
+            (
+                "chunk_connection_unavailable",
+                _infer_recover_target_from_chunk(prep),
+            ),
+            timeout=float(prep["chunk_timeout"]),
+            thread_name="zsdtdx_chunk_recover_async",
         )
     except Exception:
         pass
+
+
+async def _await_attempt_call(
+    fn: Callable[..., Any],
+    args: Tuple[Any, ...],
+    *,
+    timeout: float,
+    thread_name: str,
+) -> Any:
+    """
+    在限时内等待一次线程调用；超时则关闭本次 socket 并立刻返回。
+
+    输入：
+    1. fn/args: 线程中执行的函数与参数。
+    2. timeout: 墙钟上限（秒）。
+    3. thread_name: 线程名前缀。
+    输出：函数返回值。
+    边界：不等待线程自然结束；关闭 socket 后阻塞读会返回。超时抛 asyncio.TimeoutError。
+    """
+    executor, future, closer = _submit_attempt_call(fn, args, thread_name=thread_name)
+    loop = asyncio.get_running_loop()
+    finished = asyncio.Event()
+
+    def _on_thread_done(done_future: Any) -> None:
+        try:
+            done_future.exception()
+        except Exception:
+            pass
+        try:
+            loop.call_soon_threadsafe(finished.set)
+        except RuntimeError:
+            # 事件循环已经结束时，本次调用早已按超时返回。
+            pass
+
+    future.add_done_callback(_on_thread_done)
+    try:
+        try:
+            await asyncio.wait_for(finished.wait(), timeout=max(0.05, float(timeout)))
+        except asyncio.TimeoutError:
+            if future.done():
+                return future.result()
+            closer.close()
+            raise asyncio.TimeoutError("chunk attempt timeout")
+        return future.result()
+    finally:
+        _shutdown_attempt_executor(executor)
 
 
 async def _fetch_one_chunk_attempt_with_timeout_async(
     prep: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    在线程内执行单次 chunk attempt，并让协程超时不等待默认 executor 收尾。
+    在线程内执行单次 chunk attempt，超时后关闭本次 socket 并返回。
 
     输入：
     1. prep: `_prepare_one_task_chunk` 返回的准备结果。
     输出：
     1. 单次 attempt 的 chunk 报告字典。
     用途：
-    1. 避免 `asyncio.to_thread` 使用默认 executor 后在 `asyncio.run()` 退出阶段等待卡死线程。
+    1. 不把超时后的阻塞读留在默认 executor 里，避免 chunk 协程和进程退出一直等待。
     边界条件：
-    1. 超时后仅放弃等待该线程；底层 socket deadline 负责让阻塞 I/O 自然结束。
+    1. 超时关闭本次尝试登记的 socket，使 connect/recv 返回，并抛 asyncio.TimeoutError。
     """
-    chunk_timeout = float(prep["chunk_timeout"])
-    loop = asyncio.get_running_loop()
-    executor = _get_worker_chunk_executor("zsdtdx_chunk_attempt_async")
-    future = executor.submit(_fetch_one_chunk_fetch_attempt, prep)
-    wrapped = asyncio.wrap_future(future, loop=loop)
-    try:
-        return await asyncio.wait_for(wrapped, timeout=chunk_timeout)
-    except asyncio.TimeoutError as exc:
-        try:
-            future.cancel()
-        except Exception:
-            pass
-        raise asyncio.TimeoutError("chunk attempt timeout") from exc
-    finally:
-        try:
-            executor.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            executor.shutdown(wait=False)
-        except Exception:
-            pass
+    return await _await_attempt_call(
+        _fetch_one_chunk_fetch_attempt,
+        (prep,),
+        timeout=float(prep["chunk_timeout"]),
+        thread_name="zsdtdx_chunk_attempt_async",
+    )
 
 
 async def _fetch_one_task_chunk_async(chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2239,7 +2696,8 @@ async def _fetch_one_task_chunk_async(chunk_payload: Dict[str, Any]) -> Dict[str
     输出：
     1. 分片执行结果字典。
     边界条件：
-    1. 单次尝试 asyncio.TimeoutError 时可重试；重试耗尽后返回整 chunk error。
+    1. 单次尝试 asyncio.TimeoutError 时可重试；重试耗尽后返回整 chunk error，并标记拥塞。
+    2. 重试后最终成功时不标记拥塞。
     """
     prep = _prepare_one_task_chunk(chunk_payload)
     early = prep.get("early_report")
@@ -2252,20 +2710,26 @@ async def _fetch_one_task_chunk_async(chunk_payload: Dict[str, Any]) -> Dict[str
     chunk_id = str(prep["chunk_id"])
     raw_tasks = list(prep.get("raw_tasks") or [])
 
-    # C2: 按 chunk 路由推断需要重置的连接边（stock=std-only / index=按 _index_route_source）。
+    # 按父进程固化路由选择需要重置的连接侧。
     recover_target = _infer_recover_target_from_chunk(prep)
 
     error_text = ""
+    congested = False
     chunk_result: Optional[Dict[str, Any]] = None
     try:
         chunk_result = await _fetch_one_chunk_attempt_with_timeout_async(prep)
     except asyncio.TimeoutError:
         error_text = "chunk attempt timeout"
-        await asyncio.to_thread(
-            _recover_worker_pools_current_thread,
-            "chunk_attempt_timeout",
-            recover_target,
-        )
+        congested = True
+        try:
+            await _await_attempt_call(
+                _recover_worker_pools_current_thread,
+                ("chunk_attempt_timeout", recover_target),
+                timeout=float(chunk_timeout),
+                thread_name="zsdtdx_chunk_recover_async",
+            )
+        except Exception:
+            pass
         _emit_log(
             "error",
             f"[Task Parallel] {log_tag} 单次尝试调度超时",
@@ -2281,6 +2745,17 @@ async def _fetch_one_task_chunk_async(chunk_payload: Dict[str, Any]) -> Dict[str
         )
     except Exception as exc:
         error_text = str(exc)[:200] or type(exc).__name__
+        congested = bool(_is_transport_congestion_error(error_text))
+        if congested and not _is_connection_unavailable_error(error_text):
+            try:
+                await _await_attempt_call(
+                    _recover_worker_pools_current_thread,
+                    ("chunk_transport_error", recover_target),
+                    timeout=float(chunk_timeout),
+                    thread_name="zsdtdx_chunk_recover_async",
+                )
+            except Exception:
+                pass
 
     retry_count = 0
     while error_text and retry_count < chunk_retry_max:
@@ -2292,11 +2767,16 @@ async def _fetch_one_task_chunk_async(chunk_payload: Dict[str, Any]) -> Dict[str
             error_text = ""
         except asyncio.TimeoutError:
             error_text = "chunk attempt timeout"
-            await asyncio.to_thread(
-                _recover_worker_pools_current_thread,
-                "chunk_attempt_timeout",
-                recover_target,
-            )
+            congested = True
+            try:
+                await _await_attempt_call(
+                    _recover_worker_pools_current_thread,
+                    ("chunk_attempt_timeout", recover_target),
+                    timeout=float(chunk_timeout),
+                    thread_name="zsdtdx_chunk_recover_async",
+                )
+            except Exception:
+                pass
             _emit_log(
                 "error",
                 f"[Task Parallel] {log_tag} 单次尝试调度超时",
@@ -2312,6 +2792,18 @@ async def _fetch_one_task_chunk_async(chunk_payload: Dict[str, Any]) -> Dict[str
             )
         except Exception as retry_exc:
             error_text = str(retry_exc)[:200] or type(retry_exc).__name__
+            retry_congested = bool(_is_transport_congestion_error(error_text))
+            congested = bool(congested or retry_congested)
+            if retry_congested and not _is_connection_unavailable_error(error_text):
+                try:
+                    await _await_attempt_call(
+                        _recover_worker_pools_current_thread,
+                        ("chunk_transport_error", recover_target),
+                        timeout=float(chunk_timeout),
+                        thread_name="zsdtdx_chunk_recover_async",
+                    )
+                except Exception:
+                    pass
 
     if error_text:
         if retry_count > 0:
@@ -2327,9 +2819,14 @@ async def _fetch_one_task_chunk_async(chunk_payload: Dict[str, Any]) -> Dict[str
                     "last_error": str(error_text),
                 },
             )
-        return _build_chunk_timeout_error_report(prep, error_text)
+        report = _build_chunk_timeout_error_report(prep, error_text)
+        report["congested"] = bool(congested)
+        return report
 
-    return _assemble_chunk_success_report(prep, dict(chunk_result or {}))
+    report = _assemble_chunk_success_report(prep, dict(chunk_result or {}))
+    # 最终成功说明超时或连接失败已被重试消化，不把这次抖动记成拥塞。
+    report["congested"] = False
+    return report
 
 
 async def _fetch_chunk_bundle_async(bundle_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2356,11 +2853,17 @@ async def _fetch_chunk_bundle_async(bundle_payload: Dict[str, Any]) -> Dict[str,
         ),
     )
     bundle_id = int(bundle_payload.get("bundle_id", 0) or 0)
+    bundle_route_source = (
+        str(bundle_payload.get("route_source", "std") or "std").strip().lower()
+    )
+    if bundle_route_source not in {"std", "ex"}:
+        bundle_route_source = "both"
+    preferred_host = bundle_payload.get("preferred_host")
     reconnect_on_unavailable = bool(
         bundle_payload.get("reconnect_on_unavailable", True)
     )
     chunk_timeout_seconds = float(
-        bundle_payload.get("chunk_timeout_seconds", 30.0) or 30.0
+        bundle_payload.get("chunk_timeout_seconds", 15.0) or 15.0
     )
     chunk_retry_max_attempts = int(
         bundle_payload.get("chunk_retry_max_attempts", 2) or 0
@@ -2376,6 +2879,8 @@ async def _fetch_chunk_bundle_async(bundle_payload: Dict[str, Any]) -> Dict[str,
         normalized_payload["qfq"] = bool(
             normalized_payload.get("qfq", bundle_payload.get("qfq", True))
         )
+        normalized_payload["route_source"] = str(bundle_route_source)
+        normalized_payload["preferred_host"] = preferred_host
         prepared_chunk_payloads.append(normalized_payload)
 
     chunk_reports: List[Dict[str, Any]] = []
@@ -2432,6 +2937,7 @@ async def _fetch_chunk_bundle_async(bundle_payload: Dict[str, Any]) -> Dict[str,
                         for t in raw_tasks
                     ],
                     "worker_pid": worker_pid,
+                    "congested": bool(_is_transport_congestion_error(error_text)),
                 }
 
     try:
@@ -2440,7 +2946,11 @@ async def _fetch_chunk_bundle_async(bundle_payload: Dict[str, Any]) -> Dict[str,
         )
         chunk_reports.extend(reports)
     finally:
-        _cleanup_worker_dead_thread_connections()
+        try:
+            _cleanup_worker_dead_thread_connections(bundle_route_source)
+        except TypeError:
+            # 兼容外部测试/扩展仍按历史无参签名替换清理钩子。
+            _cleanup_worker_dead_thread_connections()
 
     # 不再返回 bundle-level "payloads"：父进程的 _iter_task_payloads_parallel_chunked
     # 通过 chunk_reports[i].payloads 取数，bundle 级聚合曾是无意义的双倍 pickle 浪费。
@@ -2618,56 +3128,47 @@ class ParallelKlineFetcher:
         self.config = self._load_config()
 
         parallel_cfg = self.config.get("parallel", {})
-        self.parallel_total_timeout_seconds = self._safe_float_config(
-            parallel_cfg.get("parallel_total_timeout_seconds"),
-            default=300.0,
-            minimum=1.0,
-        )
-        self.parallel_result_timeout_seconds = self._safe_float_config(
-            parallel_cfg.get("parallel_result_timeout_seconds"),
-            default=600.0,
-            minimum=1.0,
-        )
-        self.force_recycle_on_timeout = bool(
-            parallel_cfg.get("force_recycle_on_timeout", True)
-        )
-        self.timeout_fallback_to_serial = bool(
-            parallel_cfg.get("timeout_fallback_to_serial", True)
-        )
-        self.task_chunk_cache_min_tasks = self._safe_int_config(
-            parallel_cfg.get("task_chunk_cache_min_tasks"),
-            default=2,
-            minimum=1,
-        )
-        self.task_chunk_inproc_coroutine_workers = self._safe_int_config(
-            parallel_cfg.get("task_chunk_inproc_coroutine_workers"),
-            default=3,
-            minimum=1,
-        )
+        # get_future_kline 的 DataFrame 批处理仍使用这四项，不再从配置读取。
+        self.parallel_total_timeout_seconds = 300.0
+        self.parallel_result_timeout_seconds = 600.0
+        self.force_recycle_on_timeout = True
+        self.timeout_fallback_to_serial = True
+        self.task_chunk_cache_min_tasks = 2
+        self.task_chunk_inproc_coroutine_workers = 3
         self.task_chunk_max_inflight_multiplier = self._safe_int_config(
             parallel_cfg.get("task_chunk_max_inflight_multiplier"),
             default=2,
             minimum=1,
         )
-        self.auto_prewarm_on_async = bool(
-            parallel_cfg.get("auto_prewarm_on_async", True)
-        )
-        self.auto_prewarm_require_all_workers = bool(
-            parallel_cfg.get("auto_prewarm_require_all_workers", True)
-        )
-        self.auto_prewarm_timeout_seconds = self._safe_float_config(
-            parallel_cfg.get("auto_prewarm_timeout_seconds"),
-            default=60.0,
-            minimum=1.0,
-        )
-        self.auto_prewarm_max_rounds = self._safe_int_config(
-            parallel_cfg.get("auto_prewarm_max_rounds"),
-            default=3,
+        self.adaptive_concurrency_enabled = True
+        self.adaptive_processes_per_host_std = self._safe_int_config(
+            parallel_cfg.get("adaptive_processes_per_host_std"),
+            default=4,
             minimum=1,
         )
-        self.chunk_reconnect_on_unavailable = bool(
-            parallel_cfg.get("chunk_reconnect_on_unavailable", True)
+        self.adaptive_processes_per_host_ex = self._safe_int_config(
+            parallel_cfg.get("adaptive_processes_per_host_ex"),
+            default=4,
+            minimum=1,
         )
+        self.adaptive_decrease_factor = min(
+            0.95,
+            self._safe_float_config(
+                parallel_cfg.get("adaptive_decrease_factor"),
+                default=0.75,
+                minimum=0.1,
+            ),
+        )
+        self.adaptive_cooldown_seconds = self._safe_float_config(
+            parallel_cfg.get("adaptive_cooldown_seconds"),
+            default=1.5,
+            minimum=0.0,
+        )
+        self.auto_prewarm_on_async = True
+        self.auto_prewarm_require_all_workers = False
+        self.auto_prewarm_timeout_seconds = 60.0
+        self.auto_prewarm_max_rounds = 3
+        self.chunk_reconnect_on_unavailable = True
         self.chunk_timeout_seconds = self._safe_float_config(
             parallel_cfg.get("chunk_timeout_seconds"),
             default=30.0,
@@ -2678,55 +3179,27 @@ class ParallelKlineFetcher:
             default=2,
             minimum=0,
         )
-        self.bundle_watchdog_grace_seconds = self._safe_float_config(
-            parallel_cfg.get("bundle_watchdog_grace_seconds"),
-            default=10.0,
-            minimum=0.0,
-        )
+        self.bundle_watchdog_grace_seconds = 10.0
         self.process_count_core_multiplier = self._safe_float_config(
             parallel_cfg.get("process_count_core_multiplier"),
-            default=1.0,
+            default=5.0,
             minimum=0.1,
         )
-        # 自动计算进程数：CPU物理核心数 * 配置倍率（默认 1）
+        # 自动计算进程数：物理核心数 × config.yaml 的 process_count_core_multiplier（建议 0.5~3.0）。
         self.num_processes = get_optimal_process_count(
             core_multiplier=self.process_count_core_multiplier
         )
-        self.company_info_stock_inproc_workers = self._safe_int_config(
-            parallel_cfg.get("company_info_stock_inproc_workers"),
-            default=3,
-            minimum=1,
-        )
-        self.company_info_category_workers = self._safe_int_config(
-            parallel_cfg.get("company_info_category_workers"),
-            default=3,
-            minimum=1,
-        )
-        self.company_info_codes_per_chunk = self._safe_int_config(
-            parallel_cfg.get("company_info_codes_per_chunk"),
-            default=40,
-            minimum=1,
-        )
-        self.company_info_max_inflight_multiplier = self._safe_int_config(
-            parallel_cfg.get("company_info_max_inflight_multiplier"),
-            default=2,
-            minimum=1,
-        )
+        self.company_info_stock_inproc_workers = 3
+        self.company_info_category_workers = 3
+        self.company_info_codes_per_chunk = 40
+        self.company_info_max_inflight_multiplier = 2
         self._auto_prewarm_lock = threading.Lock()
         self._auto_prewarm_last_epoch: int = -1
         self._auto_prewarm_last_workers: int = 0
         self._auto_prewarm_last_summary: Optional[Dict[str, Any]] = None
         self._auto_prewarm_last_success: bool = False
 
-        try:
-            from zsdtdx.unified_client import _ensure_availability_hosts_cache
-
-            _ensure_availability_hosts_cache(
-                config_path=self.config_path,
-                cfg=self.config,
-            )
-        except Exception as exc:
-            _emit_log("error", f"[Parallel] Fetcher 初始化时 ensure 缓存失败: {exc}")
+        # 地址探测延迟到已知任务路由后按侧执行，避免纯 std/ex 调用触碰无关地址池。
 
     def _build_chunk_task_detail(
         self, task_detail: List[Dict[str, Any]]
@@ -2970,7 +3443,9 @@ class ParallelKlineFetcher:
             raise ValueError("preprocessor_operator 必须返回 dict 或 None")
         return transformed
 
-    def _ensure_async_prewarm(self) -> Optional[Dict[str, Any]]:
+    def _ensure_async_prewarm(
+        self, target_workers: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
         """
         按配置自动执行 async 进程池预热（仅必要时触发一次）。
 
@@ -2979,7 +3454,7 @@ class ParallelKlineFetcher:
         输出：
         1. 预热摘要字典；无需预热时返回 None。
         用途：
-        1. 在 async 首次执行前自动完成 worker+连接预热，降低冷启动抖动。
+        1. 在 async 首次执行前按任务量拉起 worker，降低 Windows spawn 冷启动抖动。
         边界条件：
         1. num_processes <= 1 时跳过预热。
         2. 进程池重建（epoch 变化）后会自动再次预热。
@@ -2987,7 +3462,15 @@ class ParallelKlineFetcher:
         if not bool(self.auto_prewarm_on_async):
             return None
 
-        target_workers = max(1, int(self.num_processes))
+        target_workers = max(
+            1,
+            min(
+                int(self.num_processes),
+                int(target_workers)
+                if target_workers is not None
+                else int(self.num_processes),
+            ),
+        )
         if target_workers <= 1:
             return None
 
@@ -3044,8 +3527,8 @@ class ParallelKlineFetcher:
         边界：tasks 为空时返回 []。
         """
         grouped: Dict[
-            Tuple[str, str],
-            List[Tuple[int, Dict[str, str], pd.Timestamp, pd.Timestamp]],
+            Tuple[str, str, str],
+            List[Tuple[int, Dict[str, Any], pd.Timestamp, pd.Timestamp]],
         ] = defaultdict(list)
         to_sortable_ts = _to_sortable_task_ts
         for index, raw_task in enumerate(tasks or []):
@@ -3054,7 +3537,19 @@ class ParallelKlineFetcher:
             normalized_task = dict(raw_task)
             symbol = str(normalized_task.get(group_key, "")).strip()
             freq = str(normalized_task.get("freq", "")).strip()
-            grouped[(symbol, freq)].append(
+            route_source = (
+                str(
+                    normalized_task.get("_route_source")
+                    or normalized_task.get("_index_route_source")
+                    or "std"
+                )
+                .strip()
+                .lower()
+            )
+            if route_source not in {"std", "ex"}:
+                route_source = "std"
+            normalized_task["_route_source"] = route_source
+            grouped[(route_source, symbol, freq)].append(
                 (
                     int(index),
                     normalized_task,
@@ -3064,15 +3559,19 @@ class ParallelKlineFetcher:
             )
 
         chunks: List[TaskChunk] = []
-        for chunk_idx, ((symbol, freq), items) in enumerate(grouped.items(), start=1):
+        for chunk_idx, (
+            (route_source, symbol, freq),
+            items,
+        ) in enumerate(grouped.items(), start=1):
             items.sort(key=lambda item: (item[2], item[3], item[0]))
             chunk_tasks = [dict(item[1]) for item in items]
             chunks.append(
                 TaskChunk(
-                    chunk_id=f"{symbol}:{freq}:{chunk_idx}",
+                    chunk_id=f"{route_source}:{symbol}:{freq}:{chunk_idx}",
                     code=str(symbol),
                     freq=str(freq),
                     tasks=chunk_tasks,
+                    route_source=str(route_source),
                 )
             )
 
@@ -3099,7 +3598,7 @@ class ParallelKlineFetcher:
         self, chunks: List[TaskChunk], inproc_workers: int
     ) -> List[ChunkBundle]:
         """
-        构建 chunk 批次：先按进程负载均衡，再按进程内并发切批。
+        构建路由同质 chunk 批次。
 
         输入：
         1. chunks: 已排序分片列表。
@@ -3107,62 +3606,50 @@ class ParallelKlineFetcher:
         输出：
         1. chunk 批次列表。
         用途：
-        1. 近似按 task 数将 chunk 贪心分配到进程，再将每个进程分片切成 bundle。
+        1. 分 std/ex 切批，再按批次交替排队，避免混合任务把一侧全部派完才轮到另一侧。
         边界条件：
         1. chunks 为空时返回空列表。
+        2. 单个 bundle 仍然只含同一行情侧。
         """
         if not chunks:
             return []
 
         max_per_bundle = max(1, int(inproc_workers))
-        process_count = max(1, int(self.num_processes))
-        process_buckets: List[Dict[str, Any]] = [
-            {"process_index": idx, "chunks": [], "load": 0}
-            for idx in range(1, process_count + 1)
-        ]
-
+        by_source: Dict[str, List[TaskChunk]] = {"std": [], "ex": []}
         for chunk in chunks:
-            target = min(
-                process_buckets,
-                key=lambda item: (
-                    int(item["load"]),
-                    int(len(item["chunks"])),
-                    int(item["process_index"]),
-                ),
-            )
-            target["chunks"].append(chunk)
-            target["load"] += int(chunk.task_count)
+            source = str(chunk.route_source or "std").strip().lower()
+            by_source[source if source in by_source else "std"].append(chunk)
 
-        raw_bundles: List[Dict[str, Any]] = []
-        for bucket in process_buckets:
-            assigned_chunks = list(bucket.get("chunks") or [])
-            if not assigned_chunks:
-                continue
-            for offset in range(0, len(assigned_chunks), max_per_bundle):
-                chunk_items = assigned_chunks[offset : offset + max_per_bundle]
+        grouped: Dict[str, List[ChunkBundle]] = {"std": [], "ex": []}
+        for source in ("std", "ex"):
+            source_chunks = list(by_source[source])
+            for offset in range(0, len(source_chunks), max_per_bundle):
+                chunk_items = source_chunks[offset : offset + max_per_bundle]
                 if not chunk_items:
                     continue
-                raw_bundles.append(
-                    {
-                        "process_index": int(bucket["process_index"]),
-                        "slice_index": int(offset // max_per_bundle),
-                        "chunks": chunk_items,
-                        "load": int(sum(item.task_count for item in chunk_items)),
-                    }
+                grouped[source].append(
+                    ChunkBundle(
+                        bundle_id=0,
+                        chunks=chunk_items,
+                        route_source=source,
+                    )
                 )
 
-        raw_bundles.sort(
-            key=lambda item: (
-                -int(item["load"]),
-                int(item["slice_index"]),
-                int(item["process_index"]),
-                str(item["chunks"][0].chunk_id if item["chunks"] else ""),
-            )
-        )
-        return [
-            ChunkBundle(bundle_id=index, chunks=list(item["chunks"]))
-            for index, item in enumerate(raw_bundles, start=1)
-        ]
+        bundles: List[ChunkBundle] = []
+        std_bundles = grouped["std"]
+        ex_bundles = grouped["ex"]
+        std_index = 0
+        ex_index = 0
+        while std_index < len(std_bundles) or ex_index < len(ex_bundles):
+            if std_index < len(std_bundles):
+                bundles.append(std_bundles[std_index])
+                std_index += 1
+            if ex_index < len(ex_bundles):
+                bundles.append(ex_bundles[ex_index])
+                ex_index += 1
+        for bundle_id, bundle in enumerate(bundles, start=1):
+            bundle.bundle_id = bundle_id
+        return bundles
 
     def _iter_task_payloads_inproc_chunked(
         self, tasks: List[Dict[str, Any]], task_kind: str = "stock", qfq: bool = True
@@ -3382,6 +3869,19 @@ class ParallelKlineFetcher:
         chunks = build_chunks(task_list)
         if not chunks:
             return
+        adaptive_enabled = bool(getattr(self, "adaptive_concurrency_enabled", False))
+        if adaptive_enabled:
+            required_sources = {
+                "standard" if str(chunk.route_source) == "std" else "extended"
+                for chunk in chunks
+            }
+            from zsdtdx.unified_client import _ensure_availability_hosts_cache
+
+            _ensure_availability_hosts_cache(
+                config_path=getattr(self, "config_path", None),
+                cfg=getattr(self, "config", None),
+                required_sources=required_sources,
+            )
         bundles = self._build_chunk_bundles(
             chunks, self.task_chunk_inproc_coroutine_workers
         )
@@ -3391,13 +3891,45 @@ class ParallelKlineFetcher:
         total_tasks = int(len(task_list))
         total_chunks = int(len(chunks))
         total_bundles = int(len(bundles))
-        max_inflight = max(
-            1, int(self.num_processes) * int(self.task_chunk_max_inflight_multiplier)
+        inflight_multiplier = max(
+            1, int(getattr(self, "task_chunk_max_inflight_multiplier", 2) or 2)
         )
+        # 窗口大于进程数，空闲 worker 可以立刻取到下一批，不必等父进程再提交。
+        max_inflight = max(1, int(self.num_processes) * inflight_multiplier)
+        bundle_queue = deque(bundles)
+        adaptive_controller: Optional[AdaptiveConcurrencyController] = None
+        if adaptive_enabled:
+            # 标准侧配额随窗口放大，否则 H×per_host 会把在飞数卡在进程数上。
+            # 扩展侧保持配置值，少地址不会被倍率再放大。
+            adaptive_controller = _get_global_adaptive_controller(
+                max_processes=int(max_inflight),
+                inproc_limit=int(self.task_chunk_inproc_coroutine_workers),
+                processes_per_host_std=int(
+                    getattr(self, "adaptive_processes_per_host_std", 4)
+                )
+                * inflight_multiplier,
+                processes_per_host_ex=int(
+                    getattr(self, "adaptive_processes_per_host_ex", 4)
+                ),
+                decrease_factor=float(getattr(self, "adaptive_decrease_factor", 0.75)),
+                cooldown_seconds=float(getattr(self, "adaptive_cooldown_seconds", 1.5)),
+            )
 
-        executor = _get_global_process_pool(self.num_processes)
+        if adaptive_controller is not None:
+            _limit_controller_to_affine_hosts(
+                adaptive_controller,
+                "std",
+                int(self.num_processes),
+                int(getattr(self, "adaptive_processes_per_host_std", 4)),
+            )
+            _limit_controller_to_affine_hosts(
+                adaptive_controller,
+                "ex",
+                int(self.num_processes),
+                int(getattr(self, "adaptive_processes_per_host_ex", 4)),
+            )
         pending_futures: Dict[Any, Dict[str, Any]] = {}
-        bundle_cursor = 0
+        next_bundle_id = int(total_bundles + 1)
         done_tasks = 0
         dispatch_cursor = 0
         bundle_watchdog_budget = max(
@@ -3457,7 +3989,7 @@ class ParallelKlineFetcher:
                         worker_pid=os.getpid(),
                     )
 
-        def _submit_one_bundle() -> bool:
+        def _submit_one_bundle(wait_timeout: float = 0.0) -> bool:
             """
             提交一个 bundle 到进程池并记录 chunk 分发日志。
 
@@ -3470,15 +4002,56 @@ class ParallelKlineFetcher:
             边界条件：
             1. 当 bundle_cursor 越界时直接返回 False，不抛异常。
             """
-            nonlocal bundle_cursor, dispatch_cursor
-            if bundle_cursor >= len(bundles):
+            nonlocal dispatch_cursor, next_bundle_id
+            if not bundle_queue:
                 return False
-            bundle = bundles[bundle_cursor]
-            bundle_cursor += 1
+
+            permit: Optional[AdaptivePermit] = None
+            bundle: Optional[ChunkBundle] = None
+            queue_checks = int(len(bundle_queue))
+            for _ in range(queue_checks):
+                candidate = bundle_queue[0]
+                source = str(candidate.route_source or "std").strip().lower()
+                if adaptive_controller is None:
+                    bundle = bundle_queue.popleft()
+                    break
+                try:
+                    permit = adaptive_controller.acquire(
+                        source,
+                        max_units=max(1, len(candidate.chunks)),
+                        timeout=max(0.0, float(wait_timeout)),
+                    )
+                except (TimeoutError, builtins.TimeoutError):
+                    bundle_queue.rotate(-1)
+                    continue
+                requested_units = max(1, int(permit.units))
+                selected_chunks = list(candidate.chunks[:requested_units])
+                remaining_chunks = list(candidate.chunks[requested_units:])
+                bundle_queue.popleft()
+                bundle = ChunkBundle(
+                    bundle_id=int(candidate.bundle_id),
+                    chunks=selected_chunks,
+                    route_source=source,
+                )
+                if remaining_chunks:
+                    bundle_queue.appendleft(
+                        ChunkBundle(
+                            bundle_id=int(next_bundle_id),
+                            chunks=remaining_chunks,
+                            route_source=source,
+                        )
+                    )
+                    next_bundle_id += 1
+                break
+
+            if bundle is None:
+                return False
 
             bundle_payload = bundle.to_payload(
                 cache_min_tasks=self.task_chunk_cache_min_tasks
             )
+            if permit is not None:
+                bundle_payload["preferred_host"] = list(permit.host)
             for chunk_payload in list(bundle_payload.get("chunks") or []):
                 if isinstance(chunk_payload, dict):
                     chunk_payload["task_kind"] = str(kind)
@@ -3498,9 +4071,23 @@ class ParallelKlineFetcher:
             )
             bundle_payload["qfq"] = bool(qfq)
             submitted_at = time.monotonic()
-            future = executor.submit(_fetch_chunk_bundle, bundle_payload)
+            try:
+                future = _submit_routed_bundle(
+                    source,
+                    None if permit is None else permit.host,
+                    bundle_payload,
+                    int(self.num_processes),
+                )
+            except Exception:
+                if adaptive_controller is not None and isinstance(
+                    permit, AdaptivePermit
+                ):
+                    adaptive_controller.release(permit, success=False, congested=False)
+                bundle_queue.appendleft(bundle)
+                raise
             pending_futures[future] = {
                 "bundle": bundle,
+                "permit": permit,
                 "submitted_at": float(submitted_at),
                 "deadline_at": float(submitted_at + bundle_watchdog_budget),
             }
@@ -3530,14 +4117,81 @@ class ParallelKlineFetcher:
                 )
             return True
 
-        while len(pending_futures) < max_inflight and _submit_one_bundle():
+        while len(pending_futures) < max_inflight and _submit_one_bundle(0.0):
             pass
 
-        while pending_futures or bundle_cursor < len(bundles):
-            while len(pending_futures) < max_inflight and _submit_one_bundle():
+        dispatch_stalled_at: Optional[float] = None
+
+        def _reap_overdue_bundles() -> int:
+            """
+            回收已超过 bundle 时限的 future。
+
+            输入：无。
+            输出：逐条产出该 bundle 的失败 payload，并返回回收的 future 数。
+            边界：只失败这一条 bundle；其它仍在时限内的任务继续派发。permit 等 worker 停下再释放。
+            """
+            now = time.monotonic()
+            overdue_items = [
+                (future, meta)
+                for future, meta in list(pending_futures.items())
+                if float(meta.get("deadline_at", 0.0) or 0.0) <= now
+            ]
+            for future, meta in overdue_items:
+                pending_futures.pop(future, None)
+                permit = meta.get("permit")
+                if adaptive_controller is not None and isinstance(
+                    permit, AdaptivePermit
+                ):
+
+                    def _release_when_worker_stops(
+                        _future: Any,
+                        *,
+                        controller: AdaptiveConcurrencyController = adaptive_controller,
+                        held_permit: AdaptivePermit = permit,
+                    ) -> None:
+                        controller.release(held_permit, success=False, congested=True)
+
+                    future.add_done_callback(_release_when_worker_stops)
+                try:
+                    future.cancel()
+                except Exception:
+                    pass
+                bundle = meta["bundle"]
+                for payload in _iter_bundle_failure_payloads(
+                    bundle,
+                    error_text="bundle watchdog timeout",
+                    stage="bundle_watchdog_timeout",
+                ):
+                    yield payload
+            return len(overdue_items)
+
+        while pending_futures or bundle_queue:
+            while len(pending_futures) < max_inflight and _submit_one_bundle(0.0):
                 pass
+            # 其它 bundle 仍在完成时也要检查超时，不能等到整批安静才发现尾部卡住。
+            yield from _reap_overdue_bundles()
             if not pending_futures:
-                break
+                if not bundle_queue:
+                    break
+                if _submit_one_bundle(min(0.5, bundle_watchdog_poll)):
+                    dispatch_stalled_at = None
+                    continue
+                now = time.monotonic()
+                if dispatch_stalled_at is None:
+                    dispatch_stalled_at = now
+                # 超时 worker 仍占着配额、新 bundle 也派不出去时，才放弃剩余队列。
+                if now - float(dispatch_stalled_at) >= bundle_watchdog_budget:
+                    while bundle_queue:
+                        aborted_bundle = bundle_queue.popleft()
+                        for payload in _iter_bundle_failure_payloads(
+                            aborted_bundle,
+                            error_text="bundle dispatch aborted after watchdog timeout",
+                            stage="bundle_watchdog_aborted",
+                        ):
+                            yield payload
+                    dispatch_stalled_at = None
+                continue
+            dispatch_stalled_at = None
 
             done_future = None
             try:
@@ -3547,82 +4201,27 @@ class ParallelKlineFetcher:
                     done_future = item
                     break
             except TimeoutError:
-                done_future = None
+                continue
 
-            if done_future is None:
-                now = time.monotonic()
-                overdue_items = [
-                    (future, meta)
-                    for future, meta in list(pending_futures.items())
-                    if float(meta.get("deadline_at", 0.0) or 0.0) <= now
-                ]
-                if not overdue_items:
-                    continue
-
-                if bool(self.force_recycle_on_timeout):
-                    affected_items = list(pending_futures.items())
-                    for future, _meta in affected_items:
-                        try:
-                            future.cancel()
-                        except Exception:
-                            pass
-                    overdue_bundle_ids = [
-                        int(item[1]["bundle"].bundle_id)
-                        for item in overdue_items
-                        if isinstance(item[1].get("bundle"), ChunkBundle)
-                    ]
-                    _emit_log(
-                        "error",
-                        "[Task Parallel] bundle watchdog 超时，开始回收并行进程池",
-                        {
-                            "stage": "bundle_watchdog_recycle",
-                            "overdue_bundle_ids": overdue_bundle_ids,
-                            "pending_bundle_count": int(len(affected_items)),
-                            "watchdog_budget_seconds": float(bundle_watchdog_budget),
-                        },
-                    )
-                    for future, meta in affected_items:
-                        pending_futures.pop(future, None)
-                        bundle = meta["bundle"]
-                        error_text = "bundle watchdog timeout"
-                        for payload in _iter_bundle_failure_payloads(
-                            bundle,
-                            error_text=error_text,
-                            stage="bundle_watchdog_timeout",
-                        ):
-                            yield payload
-                    try:
-                        force_restart_parallel_fetcher(prewarm=False)
-                    except Exception as exc:
-                        _emit_log(
-                            "error",
-                            f"[Task Parallel] bundle watchdog 回收进程池失败: {exc}",
-                            {"stage": "bundle_watchdog_recycle_failed"},
-                        )
-                    executor = _get_global_process_pool(self.num_processes)
-                    continue
-
-                for future, meta in overdue_items:
-                    pending_futures.pop(future, None)
-                    try:
-                        future.cancel()
-                    except Exception:
-                        pass
-                    bundle = meta["bundle"]
-                    for payload in _iter_bundle_failure_payloads(
-                        bundle,
-                        error_text="bundle watchdog timeout",
-                        stage="bundle_watchdog_timeout",
-                    ):
-                        yield payload
+            if done_future is None or done_future not in pending_futures:
                 continue
 
             meta = pending_futures.pop(done_future)
             bundle = meta["bundle"]
+            permit = meta.get("permit")
             try:
                 bundle_result = done_future.result()
             except Exception as exc:
                 error_text = str(exc)[:200]
+                congested = _is_transport_congestion_error(error_text)
+                if adaptive_controller is not None and isinstance(
+                    permit, AdaptivePermit
+                ):
+                    adaptive_controller.release(
+                        permit,
+                        success=False,
+                        congested=bool(congested),
+                    )
                 for payload in _iter_bundle_failure_payloads(
                     bundle,
                     error_text=error_text,
@@ -3630,6 +4229,15 @@ class ParallelKlineFetcher:
                 ):
                     yield payload
                 continue
+
+            # 重试成功或成功切站都不降配额；只认 chunk 报告上的拥塞标记。
+            bundle_congested = _chunk_reports_mark_congested(bundle_result)
+            if adaptive_controller is not None and isinstance(permit, AdaptivePermit):
+                adaptive_controller.release(
+                    permit,
+                    success=not bool(bundle_congested),
+                    congested=bool(bundle_congested),
+                )
 
             report_map: Dict[str, Dict[str, Any]] = {}
             for report in list(bundle_result.get("chunk_reports") or []):
@@ -3855,9 +4463,34 @@ class ParallelKlineFetcher:
         )
 
         self._validate_queue(queue)
-        self._ensure_async_prewarm()
         normalized_tasks = [normalize_item(item) for item in list(tasks or [])]
         total_tasks = int(len(normalized_tasks))
+        symbol_field = "index_name" if kind == "index" else "code"
+        unique_chunks = {
+            (
+                str(item.get("_route_source", "")).strip().lower(),
+                str(item.get(symbol_field, "")).strip(),
+                str(item.get("freq", "")).strip(),
+            )
+            for item in normalized_tasks
+        }
+        useful_workers = max(
+            1,
+            min(
+                int(self.num_processes),
+                int(
+                    math.ceil(
+                        max(1, len(unique_chunks))
+                        / max(1, int(self.task_chunk_inproc_coroutine_workers))
+                    )
+                ),
+            ),
+        )
+        try:
+            self._ensure_async_prewarm(target_workers=useful_workers)
+        except TypeError:
+            # 兼容外部子类/测试仍实现历史无参钩子。
+            self._ensure_async_prewarm()
 
         def _run_async_worker() -> List[Dict[str, Any]]:
             outputs: List[Dict[str, Any]] = []
