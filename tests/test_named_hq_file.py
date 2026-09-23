@@ -4,7 +4,7 @@
 
 职责：
 1. 离线验收 0x02C5 / 0x06B9 组包与回包解析对齐银河抓包。
-2. 验收 infoharbor 行解析与 get_etf_code_name_map 完整名过滤。
+2. 验收 infoharbor 行解析与 get_etf_code_name_map 名称合并。
 
 边界：
 1. 不访问网络。
@@ -86,6 +86,7 @@ def _etf_client() -> UnifiedTdxClient:
         {"market": 1, "code": "510300", "name": "沪深300ETF华泰柏瑞"},
         {"market": 0, "code": "159105", "name": "恒生生物科技ETF易方达"},
         {"market": 0, "code": "161725", "name": "白酒LOF"},
+        {"market": 1, "code": "510050", "name": "上证50ETF华夏"},
         {"market": 0, "code": "159001", "name": "货币ETF"},
         {"market": 1, "code": "511010", "name": "国债ETF"},
         {"market": 0, "code": "159992", "name": "银华增强ETF"},
@@ -105,11 +106,10 @@ def _etf_client() -> UnifiedTdxClient:
         {"market": 0, "code": "159992"},
         {"market": 0, "code": "399306"},
         {"market": 2, "code": "920000"},
+        {"market": 0, "code": "158099"},
     ]
     client._etf_name_date = "2099-01-01"
-    client._std_catalog_records = [
-        {"market": 1, "code": "510050", "name": "上证50ETF华夏"},
-    ]
+    client._std_catalog_records = []
     client._catalog_cache_enabled = False
 
     def _skip_network(*args, **kwargs):
@@ -154,6 +154,7 @@ def test_get_etf_code_name_map_uses_full_remote_names():
     assert result["sz.161725"] == "白酒LOF"
     assert result["sh.510050"] == "上证50ETF华夏"
     assert result["sz.159888"] == "某主题ETF"
+    assert "sz.158099" not in result
     assert "sz.159001" not in result
     assert "sh.511010" not in result
     assert "sz.159992" not in result
@@ -186,6 +187,7 @@ def test_ensure_etf_name_catalog_merges_board_files():
         "infoharbor_ex.name": "0|159105|恒生生物科技ETF易方达\n".encode("gbk"),
         "spec/specetfdata.txt": b"0,159105,HZ5366,27\n1,510050,000016,1\n",
         "spec/speclofdata.txt": b"0,161725,x,1\n1,510050,dup,1\n",
+        "zhb.zip": b"",
     }
 
     def _today() -> str:
@@ -203,6 +205,80 @@ def test_ensure_etf_name_catalog_merges_board_files():
     board_keys = {(int(r["market"]), str(r["code"])) for r in client._etf_board_records}
     assert board_keys == {(0, "159105"), (1, "510050"), (0, "161725")}
     assert client._etf_name_date == "2099-01-01"
+
+
+def test_merge_etf_name_records_prefer_ilong():
+    """输入：harbor 与 ilong。输出：同码取 ilong，仅 ilong 也保留。用途：合并规则。边界：离线。"""
+    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+    harbor = [
+        {"market": 0, "code": "159545", "name": "港股通红利低波ETF易方达"},
+        {"market": 0, "code": "158061", "name": "创业板算力ETF天弘"},
+    ]
+    ilong = [
+        {"market": 0, "code": "159545", "name": "恒生红利低波ETF易方达"},
+        {"market": 0, "code": "158053", "name": "创业板算力ETF大成"},
+    ]
+    merged = client._merge_etf_name_records_prefer_ilong(harbor, ilong)
+    by_code = {r["code"]: r["name"] for r in merged}
+    assert by_code["159545"] == "恒生红利低波ETF易方达"
+    assert by_code["158061"] == "创业板算力ETF天弘"
+    assert by_code["158053"] == "创业板算力ETF大成"
+
+
+def test_ensure_etf_name_catalog_merges_ilong_from_zhb_zip():
+    """输入：mock zhb.zip 含 ilong。输出：同码覆盖且补缺。用途：冷启动并入 ilong。边界：离线。"""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "ilong.dat",
+            "0|158011||创业板软件ETF国泰改\n0|158053||创业板算力ETF大成\n".encode(
+                "gbk"
+            ),
+        )
+    client = _ensure_client(
+        {
+            "infoharbor_ex.name": (
+                "0|158011|创业板软件ETF国泰\n0|158061|创业板算力ETF天弘\n"
+            ).encode("gbk"),
+            "spec/specetfdata.txt": b"0,158053,x,1\n0,158061,x,1\n0,158011,x,1\n",
+            "spec/speclofdata.txt": b"0,158061,x,1\n",
+            "zhb.zip": buf.getvalue(),
+        }
+    )
+    client.market_rules = {
+        **client.market_rules,
+        "etf_name_drop_substr": ["债", "货币"],
+    }
+    client._std_catalog_records = []
+    client.ensure_code_catalog = lambda **kwargs: None  # type: ignore[method-assign]
+    client._ensure_etf_name_catalog(refresh=True)
+    by_code = {r["code"]: r["name"] for r in client._etf_name_records}
+    assert by_code["158011"] == "创业板软件ETF国泰改"
+    assert by_code["158053"] == "创业板算力ETF大成"
+    assert by_code["158061"] == "创业板算力ETF天弘"
+    result = client.get_etf_code_name_map(use_cache=True)
+    assert result["sz.158053"] == "创业板算力ETF大成"
+    assert result["sz.158011"] == "创业板软件ETF国泰改"
+
+
+def test_get_etf_code_name_map_falls_back_to_std_short_name():
+    """输入：板块有码、命名文件无名、std 有 16 字节短名。输出：收录短名。用途：版面补缺。边界：离线。"""
+    client = _etf_client()
+    client._etf_name_records = []
+    client._etf_board_records = [
+        {"market": 0, "code": "159915"},
+        {"market": 1, "code": "501046"},
+    ]
+    client._std_catalog_records = [
+        {"market": 0, "code": "159915", "name": "创业板ETF易方达"},
+        {"market": 1, "code": "501046", "name": "财通福鑫定开混合"},
+    ]
+    result = client.get_etf_code_name_map(use_cache=True)
+    assert result["sz.159915"] == "创业板ETF易方达"
+    assert result["sh.501046"] == "财通福鑫定开混合"
 
 
 def _ensure_client(files: dict[str, bytes]) -> UnifiedTdxClient:

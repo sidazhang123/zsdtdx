@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # 与 0x044D 16 字节 GBK 名称记录对应；版本不符的磁盘缓存直接丢弃。
-_CATALOG_CACHE_FORMAT_VERSION = 2
+# v3：ETF 名称合并 zhb.zip/ilong.dat（同码覆盖 infoharbor）。
+_CATALOG_CACHE_FORMAT_VERSION = 3
 KIND_STD = "std"
 KIND_EX = "ex"
 KIND_ETF = "etf"

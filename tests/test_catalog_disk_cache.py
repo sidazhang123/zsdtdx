@@ -51,7 +51,7 @@ def test_catalog_cache_rejects_wrong_date_and_kind(tmp_path: Path):
 def test_validate_catalog_payload_requires_kind_and_records():
     assert validate_catalog_payload({"format_version": 1}, KIND_STD) is None
     payload = {
-        "format_version": 2,
+        "format_version": 3,
         "kind": "std",
         "cache_date": "2026-09-17",
         "records": [{"market": 0, "code": "000001", "name": "平安银行"}],

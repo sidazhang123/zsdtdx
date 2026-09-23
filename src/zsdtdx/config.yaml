@@ -97,7 +97,8 @@ pagination:
 
 catalog_cache:
   # 标准/扩展码表与 ETF/LOF 名称板块的磁盘缓存：按自然日分文件保存，使用时再过滤。
-  # ETF 文件为 etf_code_name.pkl；当日已有则 get_etf_code_name 不再下载 0x02C5/0x06B9。
+  # ETF 文件为 etf_code_name.pkl；当日已有则 get_etf_code_name 不再下载 0x02C5/0x06B9
+  #（含 infoharbor_ex.name、zhb.zip/ilong.dat 与板块文件）。
   enabled: true
   # 可选：手动指定缓存目录（文件路径则取其父目录）。
   # 留空时自动选择用户可写目录；不可写会回退系统临时目录。

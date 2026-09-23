@@ -449,8 +449,9 @@ def get_etf_code_name(use_cache: bool = True) -> Dict[str, str]:
     输入:
     - use_cache: True 时复用当日磁盘/内存快照（`catalog_cache` 的
       `etf_code_name.pkl`）；False 时强制重新下载命名文件。
-      成分来自 `spec/specetfdata.txt`/`spec/speclofdata.txt`，板块不要求名称含
-      etf/lof；名称优先 `infoharbor_ex.name`，缺名回退 `0x044D` 16 字节 GBK。
+      成分来自 `spec/specetfdata.txt`/`spec/speclofdata.txt`；名称优先
+      `infoharbor_ex.name` 与 `zhb.zip` 内 `ilong.dat` 合并，同码以 ilong 为准；
+      板块缺名时回退本库 std/`0x044D` 码表 16 字节短名（与客户端版面一致，可截断）。
       名称文件中额外命中 etf/lof 的代码一并纳入；剔除见
       `config.yaml.market_rules.etf_name_drop_substr`（默认债/货币等）。
       内存解压拼接，不读银河安装目录。仅当本地没有当日缓存时才冷启动下载。
@@ -458,7 +459,7 @@ def get_etf_code_name(use_cache: bool = True) -> Dict[str, str]:
 
     输出:
     - 返回 `Dict[str, str]`：key 为 `sz.`/`sh.` 前缀代码，value 为名称
-      （infoharbor 完整名，否则 16 字节回退名）；不扩宽 `get_stock_code_name` 口径。
+      （优先 ilong/infoharbor，否则版面短名）；不扩宽 `get_stock_code_name` 口径。
 
     调用示例:
     ```python

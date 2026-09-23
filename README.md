@@ -204,7 +204,7 @@ with get_client():
 
 #### get_etf_code_name
 
-获取场内 ETF/LOF（本语境统称 etf）代码名称字典。成分来自标准行情 `7709` 板块文件（默认 `spec/specetfdata.txt` / `spec/speclofdata.txt`），名称优先 `infoharbor_ex.name`，缺名回退标准码表 `0x044D` 的 16 字节 GBK 名称。当日快照写入 `catalog_cache` 的 `etf_code_name.pkl`，仅本地没有当日文件时才下载。不改动 `get_stock_code_name` 口径，不读银河安装目录。
+获取场内 ETF/LOF（本语境统称 etf）代码名称字典。成分来自标准行情 `7709` 板块文件（默认 `spec/specetfdata.txt` / `spec/speclofdata.txt`），名称优先 `infoharbor_ex.name` 与 `zhb.zip` 内 `ilong.dat` 合并（同码以 ilong 为准）；板块缺名时回退本库已拉的 std/`0x044D` 码表 16 字节短名（与客户端版面一致）。当日快照写入 `catalog_cache` 的 `etf_code_name.pkl`，仅本地没有当日文件时才下载。不改动 `get_stock_code_name` 口径，不读银河安装目录。
 
 **调用前置约定:**
 
@@ -213,12 +213,12 @@ with get_client():
 **输入:**
 
 - use_cache: True 复用当日磁盘/内存快照；False 强制重新下载命名文件。
-- 板块成分跳过 etf/lof 初筛，仍排除 `399*` 与 `etf_name_drop_substr`；名称文件中额外命中 etf/lof 的代码一并纳入。
-- 远程文件为 `infoharbor_ex.name` 与 `spec/specetfdata.txt`、`spec/speclofdata.txt`；单页 30000 字节。名称剔除子串仍由 `market_rules.etf_name_drop_substr` 配置。
+- 板块成分不要求名称含 etf/lof，仍排除 `399*` 与 `etf_name_drop_substr`；名称文件中额外命中 etf/lof 的代码一并纳入。
+- 远程文件为 `infoharbor_ex.name`、`zhb.zip`（取成员 `ilong.dat`）与 `spec/specetfdata.txt`、`spec/speclofdata.txt`；单页 30000 字节。名称剔除子串仍由 `market_rules.etf_name_drop_substr` 配置。
 
 **输出:**
 
-- 返回 `Dict[str, str]`：key 为 `sz.`/`sh.` 前缀代码，value 为名称（infoharbor 完整名或 16 字节回退名）；排除深指 `399*` 与名称命中剔除子串的品种。
+- 返回 `Dict[str, str]`：key 为 `sz.`/`sh.` 前缀代码，value 为名称（优先 ilong/infoharbor，否则 `0x044D` 版面短名）；排除深指 `399*` 与名称命中剔除子串的品种。
 
 **调用示例:**
 

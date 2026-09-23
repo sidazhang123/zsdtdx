@@ -3480,8 +3480,8 @@ class UnifiedTdxClient:
 
         输入：名称字符串。
         输出：True 表示去空白后大小写不敏感命中 etf 或 lof。
-        用途：`get_etf_code_name_map` 初筛。
-        边界：子串写死为 etf/lof，不读配置；空名称 False。
+        用途：名称文件中未列入板块的额外代码初筛。
+        边界：子串写死为 etf/lof，不读配置；空名称 False。板块成分不走本函数。
         """
         compact = self._etf_name_compact(name).lower()
         if not compact:
@@ -4648,6 +4648,94 @@ class UnifiedTdxClient:
             records.append({"market": market, "code": code, "name": name})
         return records
 
+    def _parse_ilong_name_file(self, raw: bytes) -> List[Dict[str, Any]]:
+        """
+        输入 `ilong.dat` 原文，输出 market/code/name 记录。
+
+        输入：
+        1. raw: `zhb.zip` 内 `ilong.dat` 全文。
+        输出：
+        1. list[dict]，字段 market/code/name。
+        用途：
+        1. 解析 `市场|代码|中间列|名称`（中间列常空）。
+        边界条件：
+        1. 列不足 2 或代码为空跳过；名称取第 4 列起拼接，若无则回退第 3 列。
+        """
+        text, _status = self._decode_company_info_bytes(bytes(raw or b""))
+        records: List[Dict[str, Any]] = []
+        for line in str(text or "").splitlines():
+            parts = line.split("|")
+            if len(parts) < 2:
+                continue
+            code = str(parts[1] or "").strip()
+            if not code:
+                continue
+            try:
+                market = int(str(parts[0]).strip())
+            except Exception:
+                continue
+            if len(parts) >= 4:
+                name = "|".join(parts[3:]).strip()
+            elif len(parts) == 3:
+                name = str(parts[2] or "").strip()
+            else:
+                name = ""
+            if not name:
+                continue
+            records.append({"market": market, "code": code, "name": name})
+        return records
+
+    def _merge_etf_name_records_prefer_ilong(
+        self,
+        harbor_records: List[Dict[str, Any]],
+        ilong_records: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        输入 infoharbor 与 ilong 记录，输出合并后的名称列表。
+
+        输入：
+        1. harbor_records: `infoharbor_ex.name` 解析结果。
+        2. ilong_records: `ilong.dat` 解析结果。
+        输出：
+        1. list[dict]，同 `(market, code)` 以 ilong 名覆盖 harbor。
+        用途：
+        1. ETF/LOF 名称表冷启动合并。
+        边界条件：
+        1. ilong 为空时返回 harbor 副本；两侧同码均保留最后一次 ilong 写入。
+        """
+        merged: Dict[Tuple[int, str], str] = {}
+        order: List[Tuple[int, str]] = []
+        for item in harbor_records or []:
+            code = str(item.get("code", "")).strip()
+            try:
+                market = int(item.get("market", -1))
+            except Exception:
+                continue
+            name = str(item.get("name", "")).strip()
+            if not code or not name:
+                continue
+            key = (market, code)
+            if key not in merged:
+                order.append(key)
+            merged[key] = name
+        for item in ilong_records or []:
+            code = str(item.get("code", "")).strip()
+            try:
+                market = int(item.get("market", -1))
+            except Exception:
+                continue
+            name = str(item.get("name", "")).strip()
+            if not code or not name:
+                continue
+            key = (market, code)
+            if key not in merged:
+                order.append(key)
+            merged[key] = name
+        return [
+            {"market": market, "code": code, "name": merged[(market, code)]}
+            for market, code in order
+        ]
+
     def _parse_etf_board_file(self, raw: bytes) -> List[Dict[str, Any]]:
         """
         输入板块成分原文，输出 market/code。
@@ -4681,7 +4769,10 @@ class UnifiedTdxClient:
 
     def _etf_std_name_lookup(self) -> Dict[Tuple[int, str], str]:
         """
-        输入：无。输出：(market,code)->std 16 字节 GBK 名称。用途：板块成分缺 infoharbor 名时回退。边界：未拉码表则空。
+        输入：无。
+        输出：(market, code) -> std/`0x044D` 16 字节 GBK 名称。
+        用途：板块成分在 infoharbor/ilong 无名称时，用与客户端版面一致的短名补缺。
+        边界：依赖已加载的 `_std_catalog_records`；未拉码表则返回空字典。
         """
         out: Dict[Tuple[int, str], str] = {}
         for item in self._std_catalog_records or []:
@@ -4708,7 +4799,8 @@ class UnifiedTdxClient:
         用途：
         1. 先复用当日磁盘/内存，没有才冷启动下载命名文件。
         边界条件：
-        1. 名称或任一块配置板块文件解析为空则不落盘、不把空列表当成当天成功。
+        1. 名称来自 `infoharbor_ex.name` 与 `zhb.zip`/`ilong.dat` 合并（同码 ilong 覆盖）；
+           合并后名称或任一块配置板块文件解析为空则不落盘。
         2. 不读银河安装目录。
         """
         if (not bool(refresh)) and self._etf_memory_fresh():
@@ -4721,7 +4813,11 @@ class UnifiedTdxClient:
             self._clear_etf_name_catalog()
             return
         raw_names = self._download_named_hq_file(filename)
-        names = self._parse_infoharbor_name_file(raw_names)
+        harbor_names = self._parse_infoharbor_name_file(raw_names)
+        zip_raw = self._download_named_hq_file(TDXParams.ZHB_ZIP_REMOTE_FILE)
+        ilong_raw = read_zip_entry(zip_raw, TDXParams.ILONG_ZIP_MEMBER)
+        ilong_names = self._parse_ilong_name_file(ilong_raw)
+        names = self._merge_etf_name_records_prefer_ilong(harbor_names, ilong_names)
         boards: List[Dict[str, Any]] = []
         seen: set[Tuple[int, str]] = set()
         boards_ok = True
@@ -4756,10 +4852,11 @@ class UnifiedTdxClient:
         用途：
         1. 独立于 `get_stock_code_name_map`，不扩宽 A 股宇宙。
         边界条件：
-        1. 成分来自 `spec/specetfdata.txt`/`spec/speclofdata.txt`（板块跳过 etf/lof 初筛），
-           名称优先 `infoharbor_ex.name`，缺名才回退 std 码表 16 字节 GBK；
-           名称文件中额外命中 etf/lof 的代码一并纳入；排除 399*；drop 见 market_rules；
-           同码先出现优先；命名文件与 std 码表均按 `catalog_cache` 自然日落盘。
+        1. 成分来自 `spec/specetfdata.txt`/`spec/speclofdata.txt`，
+           名称优先 `infoharbor_ex.name` 与 `zhb.zip`/`ilong.dat` 合并（同码以 ilong 为准）；
+           板块缺名时回退本库已拉的 std/`0x044D` 码表 16 字节短名（与客户端版面一致）；
+           名称文件中额外命中 etf/lof 的代码一并纳入；
+           排除 399*；drop 见 market_rules；按 `catalog_cache` 自然日落盘。
         """
         self._ensure_etf_name_catalog(refresh=not bool(use_cache))
         name_by_key: Dict[Tuple[int, str], str] = {}

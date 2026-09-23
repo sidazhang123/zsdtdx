@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.2.2 - 2026-09-23
+
+### Summary
+1. `get_etf_code_name` 名称表并入 `zhb.zip` 内 `ilong.dat`；与 `infoharbor_ex.name` 同码时以 ilong 为准；板块缺名仍回退本库 std/`0x044D` 16 字节短名（与客户端版面一致）。名称文件中未列入板块的代码须名称含 etf/lof。
+2. 码表磁盘缓存 `format_version` 升至 3，使旧 ETF 快照失效并重拉。
+3. 版本号：`pyproject.toml` 与 `__init__.__version__` 对齐为 `2.2.2`。
+
 ## v2.2.1 - 2026-09-23
 
 ### Summary

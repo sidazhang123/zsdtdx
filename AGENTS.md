@@ -139,7 +139,7 @@ with get_client():
 - `get_supported_markets`
 - `get_stock_code_name`
 - `get_stock_concepts`（`infoharbor_block.dat` 加 `tdxhy.cfg` 与 `zhb.zip`/`tdxzs.cfg` 的基础行业；当日码表换成股票名；返回 `{names, map}`；不写 pkl）
-- `get_etf_code_name`（ETF+LOF 并集：`spec/specetfdata.txt` + `spec/speclofdata.txt`；名称 `infoharbor_ex.name`；当日 `etf_code_name.pkl`；空列表不落盘；不读银河安装目录；不扩宽 `get_stock_code_name`）
+- `get_etf_code_name`（ETF+LOF 并集：`spec/specetfdata.txt` + `spec/speclofdata.txt`；名称优先 `infoharbor_ex.name` 与 `zhb.zip`/`ilong.dat` 合并且同码取 ilong，板块缺名回退 std/`0x044D` 版面短名；当日 `etf_code_name.pkl`；空列表不落盘；不读银河安装目录；不扩宽 `get_stock_code_name`）
 - `get_all_future_list`
 - `get_future_kline`
 - `get_company_info`
