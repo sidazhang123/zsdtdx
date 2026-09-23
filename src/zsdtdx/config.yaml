@@ -58,7 +58,7 @@ parallel:
   # 并行进程数倍率：推荐进程数 = max(2, int(物理核心数 * 该倍率))。
   # 取值: 正浮点数（建议 0.5~3.0）
   # 影响: 倍率越大并发越高，吞吐可能提升，但 CPU/内存占用也会上升。
-  process_count_core_multiplier: 5
+  process_count_core_multiplier: 1
   # 父进程同时提交的 bundle 窗口 = 进程数 × 本值。
   # 取值: 正整数
   # 影响: 标准侧地址配额按本值放大，用来把下一批 bundle 放进进程池队列；扩展侧不放大。
@@ -157,10 +157,6 @@ output:
   filter_suspended_placeholder_bar: true
 
 index_kline:
-  # 运行时动态发现 ex 指数市场的优先候选列表（用于名称->路由解析）。
-  # 默认优先中证指数(62)；可按需追加国证(102)、全球(37)、香港(27)等。
-  prefer_ex_markets:
-    - 62
   # 指数别名：先将用户输入转换为标准名称，再执行精确匹配。
   aliases:
     上证综指: 上证指数

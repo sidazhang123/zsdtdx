@@ -54,8 +54,7 @@
 6. `chunk_timeout_seconds`
 7. `chunk_retry_max_attempts`
 8. `process_count_core_multiplier`
-9. `index_kline.prefer_ex_markets`
-10. `index_kline.aliases`
+9. `index_kline.aliases`
 
 ## 7. 文档联动约束
 

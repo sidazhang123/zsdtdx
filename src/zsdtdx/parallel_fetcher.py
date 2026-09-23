@@ -3182,7 +3182,7 @@ class ParallelKlineFetcher:
         self.bundle_watchdog_grace_seconds = 10.0
         self.process_count_core_multiplier = self._safe_float_config(
             parallel_cfg.get("process_count_core_multiplier"),
-            default=5.0,
+            default=1.0,
             minimum=0.1,
         )
         # 自动计算进程数：物理核心数 × config.yaml 的 process_count_core_multiplier（建议 0.5~3.0）。

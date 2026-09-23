@@ -3748,9 +3748,6 @@ class UnifiedTdxClient:
                 }
             )
 
-        ex_index_markets = set(
-            self.index_kline_cfg.get("prefer_ex_markets", [62, 102, 37, 27])
-        )
         for item in self._ex_catalog_records or []:
             name = str(item.get("name", "")).strip()
             code = str(item.get("code", "")).strip()
@@ -3761,10 +3758,8 @@ class UnifiedTdxClient:
             if name == "" or code == "" or market < 0:
                 continue
             market_name = str(self._get_ex_market_name(market) or "").strip()
-            should_keep = (
-                market in ex_index_markets
-                or "指数" in market_name
-                or any(marker in name for marker in index_name_markers)
+            should_keep = "指数" in market_name or any(
+                marker in name for marker in index_name_markers
             )
             if not should_keep:
                 continue

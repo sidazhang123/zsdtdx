@@ -236,7 +236,7 @@ def test_discover_index_route_records_reuses_instrument_cache():
         "standard_security_list_page_size": 1600,
         "extended_instrument_info_page_size": 800,
     }
-    client.index_kline_cfg = {"prefer_ex_markets": [62]}
+    client.index_kline_cfg = {}
     client.index_kline_lookup_cfg = {}
     client._catalog_cache_enabled = False
     client._catalog_cache_dir = None

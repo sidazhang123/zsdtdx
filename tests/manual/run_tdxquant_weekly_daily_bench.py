@@ -248,7 +248,7 @@ def main() -> int:
 
     from tqcenter import tq
 
-    multiplier = float(cfg.get("process_count_core_multiplier", 5))
+    multiplier = float(cfg.get("process_count_core_multiplier", 1))
     batch_size = int(cfg.get("default_batch_size", 100))
     num_processes = get_optimal_process_count(multiplier)
     max_inflight = num_processes

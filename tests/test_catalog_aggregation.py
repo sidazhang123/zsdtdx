@@ -18,7 +18,7 @@ def _catalog_client() -> UnifiedTdxClient:
         "stock_prefix_sh": ["600", "601", "603", "605"],
         "future_market_names": ["上海期货", "大连商品"],
     }
-    client.index_kline_cfg = {"prefer_ex_markets": [62]}
+    client.index_kline_cfg = {}
     client.index_kline_lookup_cfg = {"normalize_whitespace": True}
     client._ex_market_name_map = {
         30: "上海期货",

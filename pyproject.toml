@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zsdtdx"
-version = "2.2.0"
+version = "2.2.1"
 description = "A-share/futures market data APIs inspired by pytdx; some request/response parsers are reimplemented, not a direct pytdx wrapper."
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"

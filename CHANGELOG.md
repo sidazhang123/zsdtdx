@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.2.1 - 2026-09-23
+
+### Summary
+1. 去掉 `index_kline.prefer_ex_markets`。扩展行情指数按市场名含「指数」或名称关键字纳入，同名路由仍由 `_index_route_priority` 决定。
+2. 默认 `parallel.process_count_core_multiplier` 由 5 改为 1。
+3. 版本号：`pyproject.toml` 与 `__init__.__version__` 对齐为 `2.2.1`。
+
 ## v2.2.0 - 2026-09-23
 
 ### Summary

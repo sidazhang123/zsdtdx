@@ -195,7 +195,7 @@ def test_discover_index_route_includes_beijing_from_std_list():
     client.pagination = {
         "standard_security_list_page_size": TDXParams.MAX_SECURITY_LIST_COUNT
     }
-    client.index_kline_cfg = {"prefer_ex_markets": [62]}
+    client.index_kline_cfg = {}
     client.index_kline_lookup_cfg = {"normalize_whitespace": True}
 
     def fake_call(method_name, market, start, count=1600, allow_none=True):

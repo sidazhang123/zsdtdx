@@ -8,7 +8,7 @@ compare:
   freq: "d"
   artifacts_root: "artifacts/tdxquant_vs_zsdtdx_weekly_d"
   # 与 zsdtdx/config.yaml 对齐
-  process_count_core_multiplier: 5
+  process_count_core_multiplier: 1
   default_batch_size: 100
   task_chunk_inproc_coroutine_workers: 3
   # TdxQuant 模块路径
