@@ -402,6 +402,43 @@ def get_stock_code_name(use_cache: bool = True) -> Dict[str, str]:
     )
 
 
+def get_stock_concepts() -> Dict[str, Any]:
+    """获取股票所属板块，结构与概念 pkl 的 `{names, map}` 一致。
+
+    调用前置约定:
+    - 请先进入 `with get_client():`；
+      一个 with 块内可连续调用多个 `get_*` 函数。
+
+    输入:
+    - 无。标准行情主机取配置 `hosts.standard`。
+      `infoharbor_block.dat` 提供概念、风格、指数；
+      `tdxhy.cfg` 提供股票的通达信行业码；
+      `zhb.zip` 内的 `tdxzs.cfg` 把行业码换成钢铁、煤炭、水泥等行业板块名。
+
+    输出:
+    - names: 有成分代码的板块名称（概念、风格、指数、基础行业），去重后按字排序。
+    - map: 股票名称 -> 所属板块名称列表；列表去重且按字排序。
+    - 股票名称来自 `get_stock_code_name` 的当日码表缓存；缓存缺失或不是当日时先按该函数的更新路径拉取码表。
+    - 码表中没有名称的代码不进入 map。不写 pkl 文件。
+
+    调用示例:
+    ```python
+    with get_client():
+        concepts = get_stock_concepts()
+    ```
+
+    返回示例:
+    ```json
+    {"names": ["5G概念", "芯片"], "map": {"中信特钢": ["5G概念"]}}
+    ```
+    """
+    return _call_with_client(
+        lambda client: client.get_stock_concepts(),
+        get_active_context_client=UnifiedTdxClient.get_active_context_client,
+        build_client=lambda: get_client(),
+    )
+
+
 def get_etf_code_name(use_cache: bool = True) -> Dict[str, str]:
     """获取场内 ETF/LOF（本语境统称 etf）代码名称字典。
 
@@ -1231,6 +1268,7 @@ __all__ = [
     "get_client",
     "get_supported_markets",
     "get_stock_code_name",
+    "get_stock_concepts",
     "get_etf_code_name",
     "get_all_future_list",
     "get_stock_kline",

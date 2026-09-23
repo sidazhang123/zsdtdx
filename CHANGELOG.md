@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.2.0 - 2026-09-23
+
+### Summary
+1. 新增 `get_stock_concepts`：结构与概念 pkl 的 `{names, map}` 一致（股票名称 → 板块名列表）。
+2. 概念/风格/指数来自标准行情命名文件 `infoharbor_block.dat`（0x02C5 + 0x06B9）。
+3. 通达信基础行业来自 `tdxhy.cfg` 与 `zhb.zip` 内 `tdxzs.cfg`；只输出个股挂上的最下级行业名。
+4. 股票名称复用 `get_stock_code_name` 当日码表；解析落在 `parser/infoharbor_block.py`。
+5. 版本号：`pyproject.toml` 与 `__init__.__version__` 对齐为 `2.2.0`。
+
 ## v2.1.0 - 2026-09-22
 
 ### Summary

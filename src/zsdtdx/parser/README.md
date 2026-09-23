@@ -30,6 +30,7 @@
 - `get_index_bars.py`
 - `get_minute_time_data.py`
 - `get_report_file.py`（标准行情命名文件：0x02C5 元数据、0x06B9 分页）
+- `infoharbor_block.py`（`infoharbor_block.dat` 板块正文，以及 `tdxhy.cfg` / `tdxzs.cfg` 基础行业）
 - `get_security_bars.py`
 - `get_security_count.py`
 - `get_security_list.py`

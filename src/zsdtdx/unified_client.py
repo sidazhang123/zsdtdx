@@ -46,6 +46,12 @@ from zsdtdx.catalog_disk_cache import (
     save_etf_catalog_cache,
 )
 from zsdtdx.helper import parse_future_symbol
+from zsdtdx.parser.infoharbor_block import (
+    build_stock_concept_payload,
+    parse_infoharbor_block,
+    parse_tdx_industry_blocks,
+    read_zip_entry,
+)
 from zsdtdx.log import log
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
@@ -4381,6 +4387,31 @@ class UnifiedTdxClient:
                 continue
             result[prefixed_code] = str(rec.get("name", "")).strip()
         return result
+
+    def get_stock_concepts(self) -> Dict[str, Any]:
+        """
+        输入无，输出 `{names, map}`；板块来自标准行情命名文件，名称来自当日码表。
+
+        输入：
+        1. 无。主机使用配置里的标准行情地址。
+        输出：
+        1. names: 有成分代码的板块名列表。
+        2. map: 股票名称到所属板块名列表。
+        用途：
+        1. 下载概念板块、行业归属和行业名称表，再用当日码表把代码换成名称。
+        边界条件：
+        1. 码表内存或磁盘不是当日、或不存在时，走 `get_stock_code_name_map(use_cache=True)` 的下载更新。
+        2. 某一份远程文件失败时，其余成功的部分仍然返回。
+        3. 全部失败时返回空 names 与空 map。不落盘 pkl。
+        """
+        code_name = self.get_stock_code_name_map(use_cache=True)
+        block_raw = self._download_named_hq_file(TDXParams.INFOHARBOR_BLOCK_REMOTE_FILE)
+        hy_raw = self._download_named_hq_file(TDXParams.TDXHY_REMOTE_FILE)
+        zip_raw = self._download_named_hq_file(TDXParams.ZHB_ZIP_REMOTE_FILE)
+        zs_raw = read_zip_entry(zip_raw, TDXParams.TDXZS_ZIP_MEMBER)
+        blocks = parse_infoharbor_block(block_raw)
+        blocks.extend(parse_tdx_industry_blocks(hy_raw, zs_raw))
+        return build_stock_concept_payload(blocks, code_name)
 
     def _named_hq_file_chunk_size(self) -> int:
         """输入：无。输出：命名文件单页字节。用途：0x06B9 翻页。边界：固定 30000。"""

@@ -14,6 +14,7 @@ pip install zsdtdx
 - `get_client`
 - `get_supported_markets`
 - `get_stock_code_name`
+- `get_stock_concepts`
 - `get_etf_code_name`
 - `get_all_future_list`
 - `get_stock_kline`
@@ -167,6 +168,36 @@ with get_client():
 
 ```json
 {"sh.600000": "浦发银行", "sz.000001": "平安银行"}
+```
+
+
+
+#### get_stock_concepts
+
+获取股票所属板块。概念、风格、指数来自 `infoharbor_block.dat`。钢铁、煤炭、水泥等通达信基础行业来自 `tdxhy.cfg`（股票→行业码）和 `zhb.zip` 内的 `tdxzs.cfg`（行业码→板块名）。主机用配置里的 `hosts.standard`，都走命名文件下载。股票名称用 `get_stock_code_name` 的当日码表。不写 pkl。
+
+**调用前置约定:**
+
+- 请先进入 `with get_client():`；
+
+**输出:**
+
+- `names`: 有成分代码的板块名称（概念、风格、指数、基础行业），去重后按字排序。
+- `map`: 股票名称到所属板块名称列表；列表去重且按字排序。码表中没有名称的代码不进入 `map`。
+
+**调用示例:**
+
+```python
+from zsdtdx import get_client, get_stock_concepts
+
+with get_client():
+    concepts = get_stock_concepts()
+```
+
+**返回示例:**
+
+```json
+{"names": ["5G概念", "芯片"], "map": {"中信特钢": ["5G概念"]}}
 ```
 
 

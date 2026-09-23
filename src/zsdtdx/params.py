@@ -76,3 +76,10 @@ class TDXParams:
     # 场内 ETF/LOF 远程名称文件与板块成分文件
     ETF_NAME_REMOTE_FILE = "infoharbor_ex.name"
     ETF_BOARD_REMOTE_FILES = ("spec/specetfdata.txt", "spec/speclofdata.txt")
+    # 标准行情命名板块文件：概念/风格/指数，板块名对股票代码
+    INFOHARBOR_BLOCK_REMOTE_FILE = "infoharbor_block.dat"
+    # 股票到通达信行业码、研究行业码
+    TDXHY_REMOTE_FILE = "tdxhy.cfg"
+    # 行业板块名称表打在该 zip 内，成员为 tdxzs.cfg
+    ZHB_ZIP_REMOTE_FILE = "zhb.zip"
+    TDXZS_ZIP_MEMBER = "tdxzs.cfg"

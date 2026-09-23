@@ -7,7 +7,7 @@
 `zsdtdx` 是一个面向 A 股/期货行情场景的 Python 封装库，参考 pytdx 生态提供统一 API、连接池、重试和并行抓取能力。部分请求组包与回包解析已按实盘抓包重新实现，并非对 `pytdx` 的直接二次封装或运行时依赖；归属说明见 `THIRD_PARTY_NOTICES.md`。
 
 - **名称**：`zsdtdx`
-- **版本**：`2.1.0`（同时定义在 `pyproject.toml` 与 `src/zsdtdx/__init__.py`）
+- **版本**：`2.2.0`（同时定义在 `pyproject.toml` 与 `src/zsdtdx/__init__.py`）
 - **许可证**：MIT（见 `LICENSE`）
 - **Python 要求**：`>=3.10`
 - **核心依赖**：`numpy`、`pandas`、`PyYAML`、`six`、`psutil`
@@ -16,6 +16,7 @@
 
 - 标准/扩展行情连接管理（`get_client`、`set_config_path`）
 - 市场、股票代码表、期货列表查询
+- 股票所属板块（`get_stock_concepts`：`infoharbor_block.dat` 概念/风格/指数，`tdxhy.cfg` + `zhb.zip` 内 `tdxzs.cfg` 补基础行业）
 - 股票 K 线/指数 K 线（同步 + 异步并行）
 - 商品期货 K 线
 - 实时最新价（股票/期货）
@@ -48,6 +49,7 @@
 │   ├── config.yaml             # 包内默认配置
 │   └── parser/                 # 通达信协议解析器集合
 │       ├── base.py
+│       ├── infoharbor_block.py  # 板块正文与通达信基础行业
 │       ├── get_security_bars.py
 │       ├── get_index_bars.py
 │       ├── ex_get_instrument_bars.py
@@ -136,6 +138,7 @@ with get_client():
 
 - `get_supported_markets`
 - `get_stock_code_name`
+- `get_stock_concepts`（`infoharbor_block.dat` 加 `tdxhy.cfg` 与 `zhb.zip`/`tdxzs.cfg` 的基础行业；当日码表换成股票名；返回 `{names, map}`；不写 pkl）
 - `get_etf_code_name`（ETF+LOF 并集：`spec/specetfdata.txt` + `spec/speclofdata.txt`；名称 `infoharbor_ex.name`；当日 `etf_code_name.pkl`；空列表不落盘；不读银河安装目录；不扩宽 `get_stock_code_name`）
 - `get_all_future_list`
 - `get_future_kline`
@@ -245,6 +248,7 @@ K 线数据契约：
 | 异步并行调度 | `src/zsdtdx/parallel_fetcher.py` |
 | 协议解析字段/数值刻度 | `src/zsdtdx/helper.py` + `src/zsdtdx/parser/*.py` |
 | ETF 完整名称（0x02C5/0x06B9） | `src/zsdtdx/parser/get_report_file.py` + `unified_client.get_etf_code_name_map` |
+| 股票所属板块 | `src/zsdtdx/parser/infoharbor_block.py` + `unified_client.get_stock_concepts` |
 | 码表磁盘缓存 | `src/zsdtdx/catalog_disk_cache.py`（含 `etf_code_name.pkl`） |
 | 默认配置项 | `src/zsdtdx/config.yaml` + `README.md` 中的示例 |
 | 版本号 | `pyproject.toml`、`src/zsdtdx/__init__.py`、`CHANGELOG.md` |
