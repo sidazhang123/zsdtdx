@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import struct
+import threading
 from unittest.mock import MagicMock
 
 from zsdtdx.parser.get_company_info_category import GetCompanyInfoCategory
@@ -11,6 +12,24 @@ from zsdtdx.parser.get_company_info_content import (
     GetCompanyInfoContent,
 )
 from zsdtdx.unified_client import UnifiedTdxClient
+
+
+def _attach_pinned_pool(client, fake_call, hosts=None):
+    """
+    输入：客户端、请求替身、可选地址列表。
+    输出：挂好的连接池替身。
+    用途：公司信息单测走不换站接口。
+    边界：不访问网络；`call` 被调用时直接失败，避免测到旧的换站入口。
+    """
+    pool = MagicMock()
+    pool.hosts = list(hosts or [("127.0.0.1", 7709)])
+    pool.get_active_host.return_value = f"{pool.hosts[0][0]}:{pool.hosts[0][1]}"
+    pool.connect_thread_to_host.return_value = True
+    pool.rotate_thread_host.return_value = False
+    pool.call_current_host.side_effect = fake_call
+    pool.call.side_effect = AssertionError("公司信息不应再走会换站的 call")
+    client.std_pool = pool
+    return pool
 
 
 def _pack_category_body(rows: list[tuple[str, str, int, int]]) -> bytes:
@@ -111,7 +130,7 @@ def test_fetch_company_content_pages_like_official_client():
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
     client.pagination = {"company_info_chunk_size": 30720}
     client.std_pool = MagicMock()
-    client.std_pool.call.side_effect = fake_call
+    client.std_pool.call_current_host.side_effect = fake_call
     text, status = UnifiedTdxClient._fetch_company_content(
         client,
         market=0,
@@ -159,7 +178,7 @@ def test_fetch_company_content_joins_bytes_before_gbk_decode():
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
     client.pagination = {"company_info_chunk_size": page_size}
     client.std_pool = MagicMock()
-    client.std_pool.call.side_effect = fake_call
+    client.std_pool.call_current_host.side_effect = fake_call
     text, status = UnifiedTdxClient._fetch_company_content(
         client,
         market=0,
@@ -222,8 +241,7 @@ def test_get_company_info_content_records_gbk_ignore_fallback():
     }
     client._runtime_failures = []
     client.output = {"return_df_default": False}
-    client.std_pool = MagicMock()
-    client.std_pool.call.side_effect = fake_call
+    _attach_pinned_pool(client, fake_call)
 
     rows = UnifiedTdxClient.get_company_info_content(
         client, code="600000", return_df=False
@@ -306,8 +324,7 @@ def test_get_company_info_content_beijing_queries_market_zero():
     }
     client._runtime_failures = []
     client.output = {"return_df_default": False}
-    client.std_pool = MagicMock()
-    client.std_pool.call.side_effect = fake_call
+    _attach_pinned_pool(client, fake_call)
 
     rows = UnifiedTdxClient.get_company_info_content(
         client, code="920002", return_df=False
@@ -369,8 +386,7 @@ def test_get_company_info_content_category_workers_preserves_order():
     }
     client._runtime_failures = []
     client.output = {"return_df_default": False}
-    client.std_pool = MagicMock()
-    client.std_pool.call.side_effect = fake_call
+    _attach_pinned_pool(client, fake_call)
 
     rows = UnifiedTdxClient.get_company_info_content(
         client,
@@ -380,6 +396,209 @@ def test_get_company_info_content_category_workers_preserves_order():
     )
     assert [r["category"] for r in rows] == ["最新提示", "公司概况"]
     assert [r["content"] for r in rows] == ["A", "B"]
+
+
+def _client_for_stock(code: str, market: int) -> UnifiedTdxClient:
+    """
+    输入：代码与市场。
+    输出：只含该路由的客户端空壳。
+    用途：公司信息钉站单测。
+    边界：不建真连接。
+    """
+    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+    client.pagination = {"company_info_chunk_size": 30720}
+    client.market_rules = {"include_beijing_prefixes": ["92"]}
+    client._stock_route = {
+        code: {
+            "code": code,
+            "name": "测试",
+            "market": market,
+            "market_name": "深圳",
+            "source": "std",
+            "asset_type": "stock",
+        }
+    }
+    client._runtime_failures = []
+    client.output = {"return_df_default": False}
+    return client
+
+
+def test_company_info_content_threads_bind_category_host():
+    """输入：两分类并发；输出：正文线程只连目录所在站，且不走会换站的 call。"""
+    binds: list[tuple[str, int, int]] = []
+    caller = threading.get_ident()
+
+    def fake_call(method_name, *args, allow_none=False, **kwargs):
+        """
+        输入：方法名与协议参数。
+        输出：两条目录或占位正文。
+        用途：观察正文钉站。
+        边界：不访问网络。
+        """
+        if method_name == "get_company_info_category":
+            return [
+                {
+                    "index": 0,
+                    "name": "股东研究",
+                    "filename": "000559.txt",
+                    "start": 10,
+                    "length": 2,
+                },
+                {
+                    "index": 1,
+                    "name": "财务分析",
+                    "filename": "000559.txt",
+                    "start": 20,
+                    "length": 2,
+                },
+            ]
+        return b"OK"
+
+    def connect(host, port):
+        """
+        输入：目标站。
+        输出：记录调用并视为连上。
+        用途：确认正文线程的目标站。
+        边界：不建 socket。
+        """
+        binds.append((str(host), int(port), threading.get_ident()))
+        return True
+
+    client = _client_for_stock("000559", 0)
+    pool = _attach_pinned_pool(
+        client,
+        fake_call,
+        hosts=[("10.1.1.1", 7709), ("10.2.2.2", 7709)],
+    )
+    pool.get_active_host.return_value = "10.1.1.1:7709"
+    pool.connect_thread_to_host.side_effect = connect
+
+    rows = UnifiedTdxClient.get_company_info_content(
+        client,
+        code="000559",
+        return_df=False,
+        category_workers=2,
+    )
+    assert [row["content"] for row in rows] == ["OK", "OK"]
+    assert binds
+    assert {(host, port) for host, port, _ident in binds} == {("10.1.1.1", 7709)}
+    assert any(ident != caller for _host, _port, ident in binds)
+    pool.call.assert_not_called()
+
+
+def test_company_info_retries_whole_stock_when_content_host_fails():
+    """输入：第一台站正文中断；输出：换站重拉目录，正文使用第二台站自己的 start。"""
+    state = {"host": ("10.0.0.1", 7709)}
+    content_starts: list[tuple[str, int]] = []
+    payload = "正文".encode("gbk")
+    catalogs = {
+        "10.0.0.1": {
+            "index": 0,
+            "name": "股东研究",
+            "filename": "000559.txt",
+            "start": 66477,
+            "length": 4,
+        },
+        "10.0.0.2": {
+            "index": 0,
+            "name": "股东研究",
+            "filename": "000559.txt",
+            "start": 52879,
+            "length": len(payload),
+        },
+    }
+
+    def get_active_host():
+        """输入无。输出当前替身站。边界：不访问网络。"""
+        host, port = state["host"]
+        return f"{host}:{port}"
+
+    def rotate():
+        """输入无。输出切到第二台站。边界：只改替身状态。"""
+        state["host"] = ("10.0.0.2", 7709)
+        return True
+
+    def connect(host, port):
+        """输入目标站。输出是否等于当前替身站。边界：不建 socket。"""
+        return (str(host), int(port)) == state["host"]
+
+    def fake_call(method_name, *args, allow_none=False, **kwargs):
+        """
+        输入：方法名与协议参数。
+        输出：按当前站返回目录；第一台站正文为 None，第二台站返回正文。
+        用途：模拟跨站偏移不能混用。
+        边界：不访问网络。
+        """
+        host = state["host"][0]
+        if method_name == "get_company_info_category":
+            return [dict(catalogs[host])]
+        start = int(args[3])
+        content_starts.append((host, start))
+        if host == "10.0.0.1":
+            return None
+        return payload
+
+    client = _client_for_stock("000559", 0)
+    pool = _attach_pinned_pool(
+        client,
+        fake_call,
+        hosts=[("10.0.0.1", 7709), ("10.0.0.2", 7709)],
+    )
+    pool.get_active_host.side_effect = get_active_host
+    pool.rotate_thread_host.side_effect = rotate
+    pool.connect_thread_to_host.side_effect = connect
+
+    rows = UnifiedTdxClient.get_company_info_content(
+        client, code="000559", return_df=False
+    )
+    assert rows[0]["category"] == "股东研究"
+    assert rows[0]["content"] == "正文"
+    assert content_starts == [("10.0.0.1", 66477), ("10.0.0.2", 52879)]
+    assert client._runtime_failures == []
+    pool.call.assert_not_called()
+
+
+def test_company_info_raises_when_every_host_fails():
+    """输入：两台站目录都抛错；输出：把最后一次异常抛出，不当成空正文。"""
+
+    def fake_call(method_name, *args, allow_none=False, **kwargs):
+        """
+        输入：方法名与协议参数。
+        输出：无；总是断开。
+        用途：覆盖全部站点失败。
+        边界：不访问网络。
+        """
+        raise RuntimeError(f"down:{method_name}")
+
+    client = _client_for_stock("000559", 0)
+    state = {"host": ("10.0.0.1", 7709)}
+    pool = _attach_pinned_pool(
+        client,
+        fake_call,
+        hosts=[("10.0.0.1", 7709), ("10.0.0.2", 7709)],
+    )
+
+    def get_active_host():
+        """输入无。输出当前替身站。边界：不访问网络。"""
+        host, port = state["host"]
+        return f"{host}:{port}"
+
+    def rotate():
+        """输入无。输出切到第二台站。边界：只改替身状态。"""
+        state["host"] = ("10.0.0.2", 7709)
+        return True
+
+    pool.get_active_host.side_effect = get_active_host
+    pool.rotate_thread_host.side_effect = rotate
+
+    try:
+        UnifiedTdxClient.get_company_info_content(
+            client, code="000559", return_df=False
+        )
+    except RuntimeError as exc:
+        assert "down:get_company_info_category" in str(exc)
+    else:
+        raise AssertionError("全部站点失败时应抛出异常")
 
 
 def test_fetch_company_info_parallel_payload_forwards_category(monkeypatch):

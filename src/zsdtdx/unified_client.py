@@ -1324,6 +1324,80 @@ class PersistentFailoverPool:
             return None
         raise RuntimeError(f"{self.name}.{method_name} 调用失败: {last_exception}")
 
+    def connect_thread_to_host(self, host: str, port: int) -> bool:
+        """
+        把当前线程连到指定 host，不顺带尝试地址池里的其它站。
+
+        输入：
+        1. host/port: 目标行情站。
+        输出：
+        1. 已在该站或成功连上时为 True，地址不在池内或连接失败为 False。
+        用途：
+        1. 公司信息正文线程复用目录所在站，避免用另一台站的文件偏移。
+        边界条件：
+        1. 只改当前线程的连接；已连在目标站上时不重连。
+        2. 不修改 `call()` 的换站行为。
+        """
+        target = (str(host or "").strip(), int(port))
+        try:
+            index = self.hosts.index(target)
+        except ValueError:
+            return False
+        thread_data = self._get_thread_data()
+        if thread_data.get("api") is not None and int(
+            thread_data.get("active_index", -1)
+        ) == int(index):
+            return True
+        return bool(self._connect_to_index(index))
+
+    def call_current_host(
+        self,
+        method_name: str,
+        *args,
+        allow_none: bool = False,
+        **kwargs,
+    ):
+        """
+        只在当前线程已经选中的 host 上请求，失败不换站。
+
+        输入：
+        1. method_name/args/kwargs: 与 `call` 相同。
+        2. allow_none: 为 True 时，三步后仍得到 None 则返回 None。
+        输出：
+        1. 底层 API 的返回值。
+        用途：
+        1. 公司信息的目录和每一页正文都留在同一台站。
+        边界条件：
+        1. 单 host 仍是三步：请求、同连接再请求、同 host 重连后再请求。
+        2. 三步失败后直接结束，不调用 `_rotate`。
+        """
+        with self._stats_lock:
+            self._global_stats["total_calls"] += 1
+        if not self._ensure_connected():
+            raise RuntimeError(f"{self.name} 无可用连接")
+
+        result, last_exception, succeeded = self._run_host_call_ladder(
+            method_name, allow_none, *args, **kwargs
+        )
+        if succeeded:
+            return result
+        if allow_none and last_exception is None:
+            with self._stats_lock:
+                self._global_stats["none_as_end"] += 1
+            return None
+        raise RuntimeError(f"{self.name}.{method_name} 调用失败: {last_exception}")
+
+    def rotate_thread_host(self) -> bool:
+        """
+        当前线程换到下一台可用 host。
+
+        输入：无。
+        输出：至少一台连接成功时为 True。
+        用途：公司信息在当前站正文失败后，整只股票换站重拉目录。
+        边界：只动当前线程；不改变其它线程，也不改变 `call()` 的换站次数。
+        """
+        return bool(self._rotate())
+
     def get_active_host(self) -> str:
         """输入无，输出活跃 host；用于报告；未连接返回空字符串。"""
         thread_data = self._get_thread_data()
@@ -5524,6 +5598,33 @@ class UnifiedTdxClient:
         except UnicodeDecodeError:
             return raw.decode("gbk", "ignore"), "gbk_ignore_fallback"
 
+    @staticmethod
+    def _split_pool_host_label(label: str) -> Optional[Tuple[str, int]]:
+        """
+        输入 `host:port` 标签，输出 (host, port)。
+
+        输入：
+        1. label: `get_active_host()` 的返回值。
+        输出：
+        1. 能解析时为 (host, port)，否则 None。
+        用途：
+        1. 把目录所在站交给正文线程重新连接。
+        边界条件：
+        1. 只按最后一个冒号切分；空串或端口不是整数时返回 None。
+        """
+        text = str(label or "").strip()
+        if ":" not in text:
+            return None
+        host, port_text = text.rsplit(":", 1)
+        host = host.strip()
+        if not host:
+            return None
+        try:
+            port = int(port_text)
+        except ValueError:
+            return None
+        return host, port
+
     def _fetch_company_content(
         self,
         market: int,
@@ -5532,23 +5633,33 @@ class UnifiedTdxClient:
         start: int,
         length: int,
         category_index: int,
+        bind_host: Optional[Tuple[str, int]] = None,
     ) -> Tuple[str, str]:
         """
         输入目录给出的文件定位与分类下标，输出拼接后的全文和状态。
 
         输入：
-        1. market/code/filename/start/length: 目录记录字段；start 一般为 0，length 为全文字节。
+        1. market/code/filename/start/length: 目录记录字段；start 为文件内偏移，length 为全文字节。
         2. category_index: 目录下标，写入正文请求。
+        3. bind_host: 目录所在站；给出时每一轮读取前都把当前线程连到该站。
         输出：
-        1. (正文, status)；status 为 success / none_terminated / empty_terminated /
-           gbk_ignore_fallback。
+        1. (正文, status)。status 为 success / none_terminated / empty_terminated /
+           gbk_ignore_fallback / host_bind_failed / host_call_failed。
         用途：
         1. 按官方客户端分页拉取各页原始字节，拼完整包后再做 GBK 解码。
         边界条件：
         1. 单页上限为 `TDXParams.COMPANY_INFO_CHUNK_SIZE`（30720）。
-        2. 某一页返回 None 或空 bytes 时停止后续页。
-        3. 严格 GBK 失败时 ignore 兜底，并由调用方记入运行态失败。
+        2. 请求走 `call_current_host`，页与页之间不换站。
+        3. 某一页返回 None 或空 bytes 时停止后续页。
+        4. 严格 GBK 失败时 ignore 兜底，并由调用方记入运行态失败。
         """
+        if bind_host is not None:
+            bound = self.std_pool.connect_thread_to_host(
+                str(bind_host[0]), int(bind_host[1])
+            )
+            if not bound:
+                return "", "host_bind_failed"
+
         chunk_size = int(TDXParams.COMPANY_INFO_CHUNK_SIZE)
         offset = 0
         chunks: List[bytes] = []
@@ -5556,16 +5667,20 @@ class UnifiedTdxClient:
 
         while offset < int(length):
             remaining = int(length) - offset
-            part = self.std_pool.call(
-                "get_company_info_content",
-                int(market),
-                str(code),
-                str(filename),
-                int(start) + offset,
-                remaining,
-                int(category_index),
-                allow_none=True,
-            )
+            try:
+                part = self.std_pool.call_current_host(
+                    "get_company_info_content",
+                    int(market),
+                    str(code),
+                    str(filename),
+                    int(start) + offset,
+                    remaining,
+                    int(category_index),
+                    allow_none=True,
+                )
+            except Exception:
+                status = "host_call_failed"
+                break
             if part is None:
                 status = "none_terminated"
                 break
@@ -5644,7 +5759,9 @@ class UnifiedTdxClient:
         1. code/category/content 三列（DataFrame 或 list[dict]）。
         边界条件：
         1. 非标准市场返回空表并记录失败。
-        2. 目录拉取后按 category_workers 并发抓正文；失败分类记入运行态失败。
+        2. 目录与全部分类、全部分页钉在同一台行情站；正文线程会连到目录那台站。
+        3. 某一页换不了站：正文中断时丢掉本次结果，换下一台站后从目录重新拉取。
+        4. 目录为空列表时直接返回空结果；全部站点都失败时才记运行态失败。
         """
         normalized_code = self._normalize_stock_query_code(code)
         route = self._lookup_stock_route(normalized_code)
@@ -5665,65 +5782,119 @@ class UnifiedTdxClient:
 
         # 北交所行情路由为 market=2，但 F10 目录/正文需走 market=0。
         market = self._company_info_protocol_market(route)
-        categories = self.std_pool.call(
-            "get_company_info_category", market, str(normalized_code), allow_none=True
+        category_filter = self._normalize_category_filter(category)
+        raw_hosts = getattr(self.std_pool, "hosts", None)
+        host_count = (
+            len(raw_hosts) if isinstance(raw_hosts, (list, tuple)) and raw_hosts else 1
         )
+        # 这些状态说明当前站的文件没有按目录读完，换站后必须重拉目录。
+        retry_status = {
+            "none_terminated",
+            "empty_terminated",
+            "host_bind_failed",
+            "host_call_failed",
+        }
+        last_attempt: Optional[Tuple[List[Dict[str, Any]], List[str], set]] = None
+        last_error: Optional[Exception] = None
 
-        if not categories:
+        for attempt in range(int(host_count)):
+            if attempt > 0 and not self.std_pool.rotate_thread_host():
+                break
+            try:
+                categories = self.std_pool.call_current_host(
+                    "get_company_info_category",
+                    market,
+                    str(normalized_code),
+                    allow_none=True,
+                )
+            except Exception as exc:
+                last_error = exc
+                categories = None
+            if categories is None:
+                continue
+            if not categories:
+                if self._default_return_df(return_df):
+                    return pd.DataFrame(columns=["code", "category", "content"])
+                return []
+
+            bind_host = self._split_pool_host_label(self.std_pool.get_active_host())
+            if bind_host is None:
+                continue
+
+            missing_category = set(category_filter) if category_filter else set()
+            selected: List[Tuple[int, Dict[str, Any], str]] = []
+            for seq, cat in enumerate(categories):
+                cat_name = str(cat.get("name", "")).strip()
+                cat_name_key = self._normalize_category_name(cat_name)
+                if category_filter and cat_name_key not in category_filter:
+                    continue
+                if cat_name_key in missing_category:
+                    missing_category.discard(cat_name_key)
+                selected.append((seq, cat, cat_name))
+
+            def _fetch_one(
+                item: Tuple[int, Dict[str, Any], str],
+                host_pin: Tuple[str, int] = bind_host,
+            ) -> Tuple[Dict[str, Any], str]:
+                """
+                输入单条目录项，输出正文记录和状态。
+
+                输入：目录序号、目录字典、分类名；host_pin 为本次目录所在站。
+                输出：(对外记录, status)。
+                边界：不在这里写运行态失败；换站重试前的失败会丢掉。
+                """
+                seq, cat, cat_name = item
+                try:
+                    content, status = self._fetch_company_content(
+                        market=market,
+                        code=str(normalized_code),
+                        filename=str(cat.get("filename", "")),
+                        start=int(cat.get("start", 0)),
+                        length=int(cat.get("length", 0)),
+                        category_index=int(cat.get("index", seq)),
+                        bind_host=host_pin,
+                    )
+                except Exception:
+                    content, status = "", "host_call_failed"
+                return (
+                    {"code": str(code), "category": cat_name, "content": content},
+                    status,
+                )
+
+            workers = max(1, int(category_workers or 1))
+            if workers <= 1 or len(selected) <= 1:
+                pairs = [_fetch_one(item) for item in selected]
+            else:
+                pairs = []
+                with _ThreadPoolExecutor(
+                    max_workers=min(workers, len(selected))
+                ) as pool:
+                    futures = [pool.submit(_fetch_one, item) for item in selected]
+                    for fut in futures:
+                        pairs.append(fut.result())
+
+            records = [row for row, _status in pairs]
+            statuses = [status for _row, status in pairs]
+            last_attempt = (records, statuses, missing_category)
+            if any(status in retry_status for status in statuses):
+                continue
+            break
+
+        if last_attempt is None:
+            if last_error is not None:
+                raise last_error
             if self._default_return_df(return_df):
                 return pd.DataFrame(columns=["code", "category", "content"])
             return []
 
-        category_filter = self._normalize_category_filter(category)
-        missing_category = set(category_filter) if category_filter else set()
-
-        selected: List[Tuple[int, Dict[str, Any], str]] = []
-        for seq, cat in enumerate(categories):
-            cat_name = str(cat.get("name", "")).strip()
-            cat_name_key = self._normalize_category_name(cat_name)
-            if category_filter and cat_name_key not in category_filter:
+        records, statuses, missing_category = last_attempt
+        for row, status in zip(records, statuses):
+            if status == "success":
                 continue
-            if cat_name_key in missing_category:
-                missing_category.discard(cat_name_key)
-            selected.append((seq, cat, cat_name))
-
-        def _fetch_one(item: Tuple[int, Dict[str, Any], str]) -> Dict[str, Any]:
-            """
-            输入单条目录项，输出正文记录；用于单股内标签拉取。
-
-            边界：失败状态写入运行态失败后仍返回 content（可能为空串）。
-            """
-            seq, cat, cat_name = item
-            content, status = self._fetch_company_content(
-                market=market,
-                code=str(normalized_code),
-                filename=str(cat.get("filename", "")),
-                start=int(cat.get("start", 0)),
-                length=int(cat.get("length", 0)),
-                category_index=int(cat.get("index", seq)),
-            )
-            if status != "success":
-                detail = f"category={cat_name}"
-                if status == "gbk_ignore_fallback":
-                    detail = f"{detail}; strict_gbk_failed_used_ignore"
-                self._record_failure(
-                    "company_info",
-                    str(code),
-                    status,
-                    detail,
-                )
-            return {"code": str(code), "category": cat_name, "content": content}
-
-        workers = max(1, int(category_workers or 1))
-        if workers <= 1 or len(selected) <= 1:
-            records = [_fetch_one(item) for item in selected]
-        else:
-            records = []
-            with _ThreadPoolExecutor(max_workers=min(workers, len(selected))) as pool:
-                futures = [pool.submit(_fetch_one, item) for item in selected]
-                for fut in futures:
-                    records.append(fut.result())
-
+            detail = f"category={row.get('category', '')}"
+            if status == "gbk_ignore_fallback":
+                detail = f"{detail}; strict_gbk_failed_used_ignore"
+            self._record_failure("company_info", str(code), status, detail)
         for miss_name in sorted(missing_category):
             self._record_failure(
                 "company_info",
