@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock
 
-from zsdtdx.unified_client import UnifiedTdxClient
+from zsdtdx.engine.unified_client import UnifiedTdxClient
 
 
 def _catalog_client() -> UnifiedTdxClient:

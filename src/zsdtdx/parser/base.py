@@ -18,7 +18,7 @@ import struct
 import sys
 import zlib
 
-from zsdtdx.log import DEBUG, log
+from zsdtdx.util.log import DEBUG, log
 
 try:
     import cython

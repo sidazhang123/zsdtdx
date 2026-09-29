@@ -8,7 +8,7 @@ import struct
 import unittest
 from unittest.mock import MagicMock, patch
 
-from zsdtdx.parallel_fetcher import _build_index_task_payload, _build_task_payload_for_kind
+from zsdtdx.engine.parallel_fetcher import _build_index_task_payload, _build_task_payload_for_kind
 from zsdtdx.parser.get_index_bars import GetIndexBarsCmd
 
 
@@ -49,7 +49,7 @@ class TestIndexPayloadKind(unittest.TestCase):
 
 class TestChunkCacheCoversEnd(unittest.TestCase):
     def test_daily_bar_1500_covers_end_1600_same_day(self):
-        from zsdtdx.unified_client import UnifiedTdxClient
+        from zsdtdx.engine.unified_client import UnifiedTdxClient
 
         client = UnifiedTdxClient.__new__(UnifiedTdxClient)
         newest = dt.datetime(2026, 5, 18, 15, 0)
@@ -59,7 +59,7 @@ class TestChunkCacheCoversEnd(unittest.TestCase):
         )
 
     def test_minute_bar_requires_datetime_not_calendar_day_only(self):
-        from zsdtdx.unified_client import UnifiedTdxClient
+        from zsdtdx.engine.unified_client import UnifiedTdxClient
 
         client = UnifiedTdxClient.__new__(UnifiedTdxClient)
         end = dt.datetime(2026, 5, 18, 16, 0)
@@ -77,7 +77,7 @@ class TestChunkCacheCoversEnd(unittest.TestCase):
 
 class TestPlaceholderRawKlineFilter(unittest.TestCase):
     def test_skip_ohlc_equal_zero_volume(self):
-        from zsdtdx.unified_client import UnifiedTdxClient
+        from zsdtdx.engine.unified_client import UnifiedTdxClient
 
         client = UnifiedTdxClient.__new__(UnifiedTdxClient)
         client.output_cfg = {
@@ -111,7 +111,7 @@ class TestPlaceholderRawKlineFilter(unittest.TestCase):
         self.assertEqual(filtered[0]["datetime"], "2026-05-18 11:30")
 
     def test_append_page_keeps_normal_bars_when_page_has_placeholder(self):
-        from zsdtdx.unified_client import UnifiedTdxClient
+        from zsdtdx.engine.unified_client import UnifiedTdxClient
 
         client = UnifiedTdxClient.__new__(UnifiedTdxClient)
         client.output_cfg = {
@@ -146,9 +146,9 @@ class TestPlaceholderRawKlineFilter(unittest.TestCase):
 
 class TestIndexChunkCache(unittest.TestCase):
     def test_multi_end_time_second_task_hits_cache(self):
-        from zsdtdx.unified_client import UnifiedTdxClient
+        from zsdtdx.engine.unified_client import UnifiedTdxClient
 
-        from zsdtdx.unified_client import SharedChunkCache
+        from zsdtdx.engine.unified_client import SharedChunkCache
 
         client = UnifiedTdxClient.__new__(UnifiedTdxClient)
         client.pagination = {"standard_kline_page_size": 800, "max_kline_pages": 300}

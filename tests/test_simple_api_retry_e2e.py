@@ -24,11 +24,11 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from zsdtdx import get_stock_kline, set_config_path  # noqa: E402
-from zsdtdx.parallel_fetcher import (  # noqa: E402
+from zsdtdx.engine.parallel_fetcher import (  # noqa: E402
     _close_worker_client_context,
     destroy_parallel_fetcher,
 )
-from zsdtdx.unified_client import UnifiedTdxClient  # noqa: E402
+from zsdtdx.engine.unified_client import UnifiedTdxClient  # noqa: E402
 
 _CONFIG_PATH = str(_SRC / "zsdtdx" / "config.yaml")
 _SAMPLE_TASK = {
@@ -93,11 +93,11 @@ def _inline_thread_pools() -> Iterator[None]:
     inline = _InlineThreadPoolExecutor()
     with (
         patch(
-            "zsdtdx.parallel_fetcher.ThreadPoolExecutor",
+            "zsdtdx.engine.parallel_fetcher.ThreadPoolExecutor",
             _InlineThreadPoolExecutor,
         ),
         patch(
-            "zsdtdx.parallel_fetcher._get_worker_chunk_executor",
+            "zsdtdx.engine.parallel_fetcher._get_worker_chunk_executor",
             return_value=inline,
         ),
     ):
@@ -123,7 +123,7 @@ def _install_mock_worker(
     输出：
     1. (worker 上下文 UnifiedTdxClient, ensure patch 对象)；调用方须在 tearDown 中 stop patch。
     """
-    import zsdtdx.parallel_fetcher as pf
+    import zsdtdx.engine.parallel_fetcher as pf
 
     _reset_parallel_state()
     pf._restore_ensure_worker_client_context_binding()
@@ -185,7 +185,7 @@ class TestSimpleApiSameConnectionRetryE2E(unittest.TestCase):
     _worker_ensure_patch: Any = None
 
     def tearDown(self) -> None:
-        import zsdtdx.parallel_fetcher as pf
+        import zsdtdx.engine.parallel_fetcher as pf
 
         if self._worker_ensure_patch is not None:
             self._worker_ensure_patch.stop()
@@ -222,7 +222,7 @@ class TestSimpleApiSameConnectionRetryE2E(unittest.TestCase):
 
         with (
             patch(
-                "zsdtdx.parallel_fetcher._recover_worker_standard_connection_current_thread"
+                "zsdtdx.engine.parallel_fetcher._recover_worker_standard_connection_current_thread"
             ) as recover_mock,
             _inline_thread_pools(),
         ):
@@ -248,11 +248,11 @@ class TestSimpleApiSameConnectionRetryE2E(unittest.TestCase):
 
         with (
             patch(
-                "zsdtdx.parallel_fetcher._get_global_process_pool",
+                "zsdtdx.engine.parallel_fetcher._get_global_process_pool",
                 return_value=inline_pool,
             ),
             patch(
-                "zsdtdx.parallel_fetcher.ParallelKlineFetcher._ensure_async_prewarm",
+                "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher._ensure_async_prewarm",
                 return_value=None,
             ),
             _inline_thread_pools(),
@@ -270,7 +270,7 @@ class TestSimpleApiChunkReconnectRetryE2E(unittest.TestCase):
     _worker_ensure_patch: Any = None
 
     def tearDown(self) -> None:
-        import zsdtdx.parallel_fetcher as pf
+        import zsdtdx.engine.parallel_fetcher as pf
 
         if self._worker_ensure_patch is not None:
             self._worker_ensure_patch.stop()
@@ -317,7 +317,7 @@ class TestSimpleApiChunkReconnectRetryE2E(unittest.TestCase):
 
         with (
             patch(
-                "zsdtdx.parallel_fetcher._recover_worker_standard_connection_current_thread",
+                "zsdtdx.engine.parallel_fetcher._recover_worker_standard_connection_current_thread",
                 side_effect=_fake_recover,
             ),
             _inline_thread_pools(),
@@ -350,15 +350,15 @@ class TestSimpleApiChunkReconnectRetryE2E(unittest.TestCase):
         inline_pool = _InlineProcessPool()
         with (
             patch(
-                "zsdtdx.parallel_fetcher._recover_worker_standard_connection_current_thread",
+                "zsdtdx.engine.parallel_fetcher._recover_worker_standard_connection_current_thread",
                 side_effect=_fake_recover,
             ),
             patch(
-                "zsdtdx.parallel_fetcher._get_global_process_pool",
+                "zsdtdx.engine.parallel_fetcher._get_global_process_pool",
                 return_value=inline_pool,
             ),
             patch(
-                "zsdtdx.parallel_fetcher.ParallelKlineFetcher._ensure_async_prewarm",
+                "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher._ensure_async_prewarm",
                 return_value=None,
             ),
             _inline_thread_pools(),

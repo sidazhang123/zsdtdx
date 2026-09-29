@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.3.0 - 2026-09-29
+
+### Summary
+1. 新增 `get_block_names` / `get_block_kline` / `BlockKlineTask`：按板块名称抓取板块指数 K 线（协议 `0x0523`），与 `get_stock_concepts` 共用命名文件并提供 6 小时本地缓存。
+2. 对外不再导出 `get_supported_markets`（仍保留 `UnifiedTdxClient.get_supported_markets`）；`StockKlineTask` / `IndexKlineTask` / `BlockKlineTask` 聚合在 `kline_task.py` 并经包入口导出。
+3. 股票/指数/板块/期货 K 线与公司信息业务门面迁入 `biz/`；传输/编排/缓存拆为 `net/`、`engine/`、`cache/`；异常/工具/日志迁入 `util/`。
+4. `params` 增补港股通市场名、`tdxzs3.cfg`、股票/期货日期默认时分秒、`FUTURE_PATTERNS`。
+5. 版本号：`pyproject.toml` 与 `__init__.__version__` 对齐为 `2.3.0`。
+
 ## v2.2.2 - 2026-09-23
 
 ### Summary

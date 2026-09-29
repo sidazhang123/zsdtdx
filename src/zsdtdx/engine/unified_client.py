@@ -1,5 +1,5 @@
 """
-模块：`unified_client.py`。
+模块：`engine/unified_client.py`。
 
 职责：
 1. 统一高层客户端、连接池、重试与 TCP 可用地址探测。
@@ -30,11 +30,11 @@ from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple
 import pandas as pd
 import yaml
 
-import zsdtdx.base_socket_client as _base_socket_client
-from zsdtdx.exhq import TdxExHq_API
-from zsdtdx.hq import TdxHq_API
+import zsdtdx.net.base_socket_client as _base_socket_client
+from zsdtdx.net.exhq import TdxExHq_API
+from zsdtdx.net.hq import TdxHq_API
 from zsdtdx.params import TDXParams
-from zsdtdx.catalog_disk_cache import (
+from zsdtdx.cache.catalog_disk_cache import (
     KIND_ETF,
     KIND_EX,
     KIND_STD,
@@ -45,16 +45,22 @@ from zsdtdx.catalog_disk_cache import (
     save_catalog_cache,
     save_etf_catalog_cache,
 )
-from zsdtdx.helper import parse_future_symbol
+from zsdtdx.util.helper import parse_future_symbol
+from zsdtdx.cache.block_file_cache import load_fresh_block_files, save_block_files
+from zsdtdx.parser.block_index_catalog import (
+    REQUIRED_BLOCK_FILES,
+    BlockIndexCatalog,
+    parse_block_index_catalog,
+)
 from zsdtdx.parser.infoharbor_block import (
     build_stock_concept_payload,
     parse_infoharbor_block,
     parse_tdx_industry_blocks,
     read_zip_entry,
 )
-from zsdtdx.log import log
+from zsdtdx.util.log import log
 
-_PACKAGE_DIR = Path(__file__).resolve().parent
+_PACKAGE_DIR = Path(__file__).resolve().parent.parent
 _DEFAULT_CONFIG_PATH = _PACKAGE_DIR / "config.yaml"
 _DEFAULT_MAX_KLINE_PAGES = TDXParams.MAX_KLINE_PAGES
 _SUSPENDED_PLACEHOLDER_EPS = 1.0e-20
@@ -1541,6 +1547,9 @@ SharedChunkCache = ChunkLocalRowCache
 class UnifiedTdxClient:
     """统一行情高层客户端，封装市场路由、分页和连接池。"""
 
+    # 板块三文件缓存的进程内互斥，避免名称与 K 线同时触发下载。
+    _block_catalog_lock = threading.Lock()
+
     PERIOD_MAP = {
         "5min": 0,
         "5": 0,
@@ -1569,7 +1578,7 @@ class UnifiedTdxClient:
     }
     STOCK_SCOPE_TOKENS = {"szsh", "bj", "hk"}
     # 港股只认扩展行情「港股通」（抓包 0x2422 市场 71）；不含香港主板/创业板。
-    HK_EX_MARKET_NAME = "港股通"
+    HK_EX_MARKET_NAME = TDXParams.HK_EX_MARKET_NAME
     _CONTEXT_STACK: List["UnifiedTdxClient"] = []
 
     def __init__(
@@ -1771,14 +1780,25 @@ class UnifiedTdxClient:
     def _normalize_future_time_window(
         self, start_time: Any, end_time: Any
     ) -> Tuple[pd.Timestamp, pd.Timestamp]:
-        """标准化期货时间窗口；日期入参默认映射为 start=09:00:00、end=15:00:00。"""
+        """标准化期货时间窗口；日期入参默认映射为 params 中的期货默认时刻。"""
         start_ts = self._to_datetime(start_time)
         end_ts = self._to_datetime(end_time)
+        start_h, start_m, start_s = (
+            int(part)
+            for part in str(TDXParams.FUTURE_DATE_ONLY_START_TIME).split(":")
+        )
+        end_h, end_m, end_s = (
+            int(part) for part in str(TDXParams.FUTURE_DATE_ONLY_END_TIME).split(":")
+        )
 
         if self._is_date_only_input(start_time):
-            start_ts = start_ts.replace(hour=9, minute=0, second=0, microsecond=0)
+            start_ts = start_ts.replace(
+                hour=start_h, minute=start_m, second=start_s, microsecond=0
+            )
         if self._is_date_only_input(end_time):
-            end_ts = end_ts.replace(hour=15, minute=0, second=0, microsecond=0)
+            end_ts = end_ts.replace(
+                hour=end_h, minute=end_m, second=end_s, microsecond=0
+            )
         return start_ts, end_ts
 
     def _to_datetime_no_df(self, value: Any) -> dt.datetime:
@@ -1859,17 +1879,18 @@ class UnifiedTdxClient:
         return normalized
 
     def _normalize_index_task_payload_no_df(
-        self, task: Dict[str, Any]
+        self, task: Dict[str, Any], symbol_field: str = "index_name"
     ) -> Dict[str, Any]:
-        """输入指数任务字典，输出标准化任务；用于无 DataFrame 指数 chunk 校验；缺字段或时间非法抛错。"""
+        """输入名称类 K 线任务，输出标准化任务；缺字段或时间非法抛错。"""
         if not isinstance(task, dict):
             raise ValueError("task 必须是 dict")
-        index_name = str(task.get("index_name", "")).strip()
+        field = str(symbol_field or "index_name")
+        symbol = str(task.get(field, "")).strip()
         freq = str(task.get("freq", "")).strip().lower()
         start_time = str(task.get("start_time", "")).strip()
         end_time = str(task.get("end_time", "")).strip()
-        if index_name == "":
-            raise ValueError("task.index_name 不能为空")
+        if symbol == "":
+            raise ValueError(f"task.{field} 不能为空")
         if freq == "":
             raise ValueError("task.freq 不能为空")
         if start_time == "":
@@ -1884,7 +1905,7 @@ class UnifiedTdxClient:
             raise ValueError("start_time 不能晚于 end_time")
 
         normalized: Dict[str, Any] = {
-            "index_name": index_name,
+            field: symbol,
             "freq": self._normalize_freq(freq),
             "start_time": start_time,
             "end_time": end_time,
@@ -1915,9 +1936,11 @@ class UnifiedTdxClient:
         self,
         normalized_task: Dict[str, Any],
         route: Dict[str, Any],
+        symbol_field: str = "index_name",
+        include_code: bool = True,
     ) -> List[Dict[str, Any]]:
-        """输入标准化任务和路由，输出指数K线；用于无 DataFrame 任务执行；同请求内路由发现最多 refresh 一次。"""
-        index_name = str(normalized_task.get("index_name", "")).strip()
+        """输入标准化任务和路由，输出指数或板块 K 线；板块路由失败时不改查指数目录。"""
+        symbol = str(normalized_task.get(symbol_field, "")).strip()
         freq = str(normalized_task.get("freq", "")).strip().lower()
         start_dt = self._to_datetime_no_df(normalized_task.get("start_time"))
         end_dt = self._to_datetime_no_df(normalized_task.get("end_time"))
@@ -1939,7 +1962,7 @@ class UnifiedTdxClient:
                 if source == "std":
                     return self._pool_call_allow_none(
                         self.std_pool,
-                        "get_index_bars",
+                        self._std_bars_api_name(current_route),
                         int(category),
                         int(market),
                         str(code),
@@ -1966,31 +1989,29 @@ class UnifiedTdxClient:
 
         resolved_route = dict(route)
         route_refreshed = False
+        block_bars = self._is_block_bars_route(resolved_route)
         try:
             effective_route, raw_rows = _fetch_route_rows(resolved_route)
         except Exception:
-            if not route_refreshed:
-                resolved_route = self.resolve_index_name(
-                    index_name=index_name, refresh=True
-                )
-                route_refreshed = True
-                effective_route, raw_rows = _fetch_route_rows(resolved_route)
-            else:
+            if block_bars or route_refreshed:
                 raise
-        if not raw_rows and not route_refreshed:
-            resolved_route = self.resolve_index_name(
-                index_name=index_name, refresh=True
-            )
+            resolved_route = self.resolve_index_name(index_name=symbol, refresh=True)
+            route_refreshed = True
+            effective_route, raw_rows = _fetch_route_rows(resolved_route)
+        if not raw_rows and not route_refreshed and not block_bars:
+            resolved_route = self.resolve_index_name(index_name=symbol, refresh=True)
             route_refreshed = True
             effective_route, raw_rows = _fetch_route_rows(resolved_route)
 
         return self._normalize_index_kline_rows(
             rows=raw_rows,
-            index_name=str(resolved_route.get("name", index_name)),
+            index_name=str(resolved_route.get("name", symbol)),
             route_code=str(effective_route.get("code", "")),
             freq=freq,
             start_dt=start_dt,
             end_dt=end_dt,
+            name_field=symbol_field,
+            include_code=include_code,
         )
 
     def _ensure_ex_market_name_map_no_df(self):
@@ -2376,7 +2397,10 @@ class UnifiedTdxClient:
         except Exception:
             market = -1
         code = str(route.get("code", "")).strip()
-        return f"{source}:{market}:{code}"
+        fingerprint = f"{source}:{market}:{code}"
+        if self._is_block_bars_route(route):
+            fingerprint = f"{fingerprint}:block"
+        return fingerprint
 
     def _reset_index_chunk_partition(self, partition: Dict[str, Any]) -> None:
         """
@@ -2415,12 +2439,14 @@ class UnifiedTdxClient:
         freq: str,
         start_dt: dt.datetime,
         end_dt: dt.datetime,
+        name_field: str = "index_name",
+        include_code: bool = True,
     ) -> List[Dict[str, Any]]:
         """
-        输入：原始指数 K 线行、名称/代码/频率与时间窗。
-        输出：标准化指数 K 线 dict 列表。
-        用途：chunk 窗口过滤阶段批量归一化；仅使用 socket 层 datetime/_ts，不解析年月日时分分列。
-        边界条件：无有效行时返回 []。
+        输入：原始 K 线行、名称/代码/频率与时间窗。
+        输出：标准化 K 线 dict 列表。名称字段由 name_field 决定。
+        用途：chunk 窗口过滤阶段批量归一化。
+        边界条件：无有效行时返回 []；include_code 为 False 时不写代码字段。
         """
         if not rows:
             return []
@@ -2518,20 +2544,24 @@ class UnifiedTdxClient:
             if not dt_str:
                 # parser 已写入 YYYY-MM-DD HH:MM:SS（秒位固定 :00）；fallback 强制按同一 schema 生成。
                 dt_str = dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-            out.append(
-                {
-                    "index_name": route_name,
+            item = {
+                name_field: route_name,
+                "freq": normalized_freq,
+                "open": float(opens[i]),
+                "close": float(closes[i]),
+                "high": float(highs[i]),
+                "low": float(lows[i]),
+                "volume": int(volumes[i]),
+                "amount": int(amounts[i]),
+                "datetime": dt_str,
+            }
+            if include_code:
+                item = {
+                    name_field: route_name,
                     "code": route_code_text,
-                    "freq": normalized_freq,
-                    "open": float(opens[i]),
-                    "close": float(closes[i]),
-                    "high": float(highs[i]),
-                    "low": float(lows[i]),
-                    "volume": int(volumes[i]),
-                    "amount": int(amounts[i]),
-                    "datetime": dt_str,
+                    **{key: item[key] for key in item if key != name_field},
                 }
-            )
+            out.append(item)
         return out
 
     def _fetch_std_kline_rows(
@@ -2701,7 +2731,7 @@ class UnifiedTdxClient:
         if source_key == "std":
             rows = self._pool_call_allow_none(
                 self.std_pool,
-                "get_index_bars",
+                self._std_bars_api_name(route),
                 int(category),
                 int(market),
                 str(code),
@@ -3050,10 +3080,34 @@ class UnifiedTdxClient:
             "chunk_network_page_calls": int(chunk_network_page_calls),
         }
 
+    def get_block_kline_rows_for_chunk_tasks(
+        self,
+        tasks: List[Dict[str, Any]],
+        enable_cache: bool,
+    ) -> Dict[str, Any]:
+        """
+        输入同一板块的 chunk 任务，输出逐任务 K 线。
+
+        输入：tasks 含 block_name/freq/start_time/end_time 与已解析路由。
+        输出：与指数 chunk 相同的结果字典，行字段为 block_name。
+        用途：复用指数分页，请求命令为 get_block_bars。
+        边界条件：任务缺少路由时抛 ValueError，不走指数名称目录。
+        """
+        return self.get_index_kline_rows_for_chunk_tasks(
+            tasks,
+            enable_cache,
+            symbol_field="block_name",
+            bars_api="get_block_bars",
+            include_code=False,
+        )
+
     def get_index_kline_rows_for_chunk_tasks(
         self,
         tasks: List[Dict[str, Any]],
         enable_cache: bool,
+        symbol_field: str = "index_name",
+        bars_api: str = "get_index_bars",
+        include_code: bool = True,
     ) -> Dict[str, Any]:
         """
         执行同 `index_name+freq` 的指数 chunk 任务并返回逐任务结果。
@@ -3076,16 +3130,20 @@ class UnifiedTdxClient:
 
         normalized_tasks: List[Dict[str, Any]] = []
         for item in raw_tasks:
-            normalized_tasks.append(self._normalize_index_task_payload_no_df(item))
+            normalized_tasks.append(
+                self._normalize_index_task_payload_no_df(
+                    item, symbol_field=symbol_field
+                )
+            )
 
-        base_index_name = str(normalized_tasks[0]["index_name"]).strip()
+        base_symbol = str(normalized_tasks[0][symbol_field]).strip()
         base_freq = str(normalized_tasks[0]["freq"]).strip()
         for task in normalized_tasks[1:]:
             if (
-                str(task["index_name"]).strip() != base_index_name
+                str(task[symbol_field]).strip() != base_symbol
                 or str(task["freq"]).strip() != base_freq
             ):
-                raise ValueError("chunk 任务必须属于同一 index_name+freq")
+                raise ValueError(f"chunk 任务必须属于同一 {symbol_field}+freq")
 
         ordered_tasks = sorted(
             list(enumerate(normalized_tasks)),
@@ -3113,13 +3171,17 @@ class UnifiedTdxClient:
             and pre_route_market >= 0
         ):
             route = {
-                "name": pre_route_name if pre_route_name != "" else base_index_name,
+                "name": pre_route_name if pre_route_name != "" else base_symbol,
                 "source": pre_route_source,
                 "market": pre_route_market,
                 "code": pre_route_code,
+                "bars_api": bars_api,
             }
+        elif bars_api == "get_block_bars":
+            raise ValueError("板块任务缺少代码路由")
         else:
-            route = self.resolve_index_name(index_name=base_index_name, refresh=False)
+            route = dict(self.resolve_index_name(index_name=base_symbol, refresh=False))
+            route["bars_api"] = bars_api
 
         if not bool(enable_cache):
             results: List[Dict[str, Any]] = []
@@ -3128,6 +3190,8 @@ class UnifiedTdxClient:
                     rows = self._fetch_index_rows_for_task_with_route_no_df(
                         normalized_task=task,
                         route=route,
+                        symbol_field=symbol_field,
+                        include_code=include_code,
                     )
                 except Exception as exc:
                     results.append({"task": task, "rows": [], "error": str(exc)[:200]})
@@ -3145,7 +3209,7 @@ class UnifiedTdxClient:
         category = self._freq_to_category(base_freq)
         source = str(route.get("source", "std")).strip().lower()
         route_code = str(route.get("code", "")).strip()
-        route_name = str(route.get("name", base_index_name)).strip() or base_index_name
+        route_name = str(route.get("name", base_symbol)).strip() or base_symbol
         page_size = self._kline_page_size(source)
         max_pages = int(_DEFAULT_MAX_KLINE_PAGES)
 
@@ -3154,9 +3218,7 @@ class UnifiedTdxClient:
         results: List[Dict[str, Any]] = []
         normalized_bar_by_dt_key: Dict[str, Dict[str, Any]] = {}
 
-        partition = self._shared_chunk_cache.acquire_partition(
-            base_index_name, base_freq
-        )
+        partition = self._shared_chunk_cache.acquire_partition(base_symbol, base_freq)
         try:
             self._ensure_index_chunk_route_valid(partition, route)
             cache_rows = partition["cache_rows"]
@@ -3205,16 +3267,16 @@ class UnifiedTdxClient:
                             page_size=page_size,
                         )
                     except Exception:
-                        if not route_refreshed:
-                            route = self.resolve_index_name(
-                                index_name=base_index_name, refresh=True
-                            )
-                            route_refreshed = True
-                            self._ensure_index_chunk_route_valid(partition, route)
+                        if self._is_block_bars_route(route) or route_refreshed:
+                            raise
+                        route = self.resolve_index_name(
+                            index_name=base_symbol, refresh=True
+                        )
+                        route_refreshed = True
+                        self._ensure_index_chunk_route_valid(partition, route)
                         route_code = str(route.get("code", "")).strip()
                         route_name = (
-                            str(route.get("name", base_index_name)).strip()
-                            or base_index_name
+                            str(route.get("name", base_symbol)).strip() or base_symbol
                         )
                         page_rows = self._fetch_index_kline_page_rows_no_df(
                             route=route,
@@ -3284,6 +3346,8 @@ class UnifiedTdxClient:
                         freq=base_freq,
                         start_dt=start_dt,
                         end_dt=end_dt,
+                        name_field=symbol_field,
+                        include_code=include_code,
                     )
                     for nr in newly:
                         dt_key = self._dt_key_for_raw_kline_row(
@@ -3319,7 +3383,7 @@ class UnifiedTdxClient:
             partition["page_start"] = page_start
             partition["fetched_pages"] = fetched_pages
         finally:
-            self._shared_chunk_cache.soft_delete(base_index_name, base_freq)
+            self._shared_chunk_cache.soft_delete(base_symbol, base_freq)
 
         return {
             "results": results,
@@ -4456,6 +4520,211 @@ class UnifiedTdxClient:
                 continue
             result[prefixed_code] = str(rec.get("name", "")).strip()
         return result
+
+    def _is_block_bars_route(self, route: Dict[str, Any]) -> bool:
+        """
+        输入路由或任务字典，输出是否走板块指数 K 线。
+
+        输入：route 含 bars_api。
+        输出：True 表示命令为 0x0523。
+        用途：分页抓取时切换 get_block_bars，且失败时不改走指数目录。
+        边界条件：缺字段时为 False，普通指数行为不变。
+        """
+        if str(route.get("bars_api") or "") == "get_block_bars":
+            return True
+        return False
+
+    def _std_bars_api_name(self, route: Dict[str, Any]) -> str:
+        """
+        输入路由或任务字典，输出标准行情 K 线方法名。
+
+        输入：route 含 bars_api。
+        输出：`get_block_bars` 或 `get_index_bars`。
+        用途：板块与普通指数共用分页，只换底层命令。
+        边界条件：无法识别时回退 get_index_bars。
+        """
+        if self._is_block_bars_route(route):
+            return "get_block_bars"
+        return "get_index_bars"
+
+    def _download_block_named_files(self) -> Dict[str, bytes]:
+        """
+        输入无，输出三份板块命名文件原文。
+
+        输入：无。使用标准行情连接池。
+        输出：文件名到 bytes 的字典。
+        用途：缓存过期时重新下载。
+        边界条件：任一份为空则抛 ValueError，不写缓存。
+        """
+        files: Dict[str, bytes] = {}
+        for name in REQUIRED_BLOCK_FILES:
+            raw = self._download_named_hq_file(name)
+            if not raw:
+                raise ValueError(f"板块文件下载失败: {name}")
+            files[name] = bytes(raw)
+        return files
+
+    def _load_block_index_catalog(self) -> BlockIndexCatalog:
+        """
+        输入无，输出板块指数目录。
+
+        输入：无。
+        输出：6 小时内有效的 BlockIndexCatalog。
+        用途：名称列表与 K 线名称解析共用。
+        边界条件：
+        1. 缓存未过期则不下载。
+        2. 过期或损坏时重新下载三份文件并覆盖缓存。
+        3. 下载或解析失败时抛 ValueError，不使用过期缓存。
+        """
+        with self._block_catalog_lock:
+            fresh = load_fresh_block_files()
+            cached = getattr(self, "_block_index_catalog", None)
+            cached_at = getattr(self, "_block_index_catalog_at", None)
+            if (
+                fresh is not None
+                and isinstance(cached, BlockIndexCatalog)
+                and cached_at == fresh["fetched_at"]
+            ):
+                return cached
+            if fresh is not None:
+                catalog = parse_block_index_catalog(fresh["files"])
+                if not catalog.names:
+                    raise ValueError("板块目录为空")
+                self._block_index_catalog = catalog
+                self._block_index_catalog_at = fresh["fetched_at"]
+                return catalog
+            files = self._download_block_named_files()
+            catalog = parse_block_index_catalog(files)
+            if not catalog.names:
+                raise ValueError("板块目录为空")
+            stamp = save_block_files(files)
+            self._block_index_catalog = catalog
+            self._block_index_catalog_at = stamp
+            return catalog
+
+    def get_block_names(self) -> List[str]:
+        """
+        输入无，输出「全部板块」名称列表。
+
+        输入：无。三份命名文件走 6 小时缓存。
+        输出：板块名称列表，不含指数代码。
+        用途：供 get_block_kline 的 block_name 使用。
+        边界条件：缓存过期时重新下载；目录为空时抛 ValueError。
+        """
+        return list(self._load_block_index_catalog().names)
+
+    def resolve_block_index_route(self, block_name: str) -> Dict[str, Any]:
+        """
+        输入板块名称，输出内部指数路由。
+
+        输入：block_name 为 get_block_names 返回的名称。
+        输出：`{name, code, market, kind}`。
+        用途：K 线请求前把名称换成 88xxxx。
+        边界条件：名称不在目录中时抛 ValueError。
+        """
+        name = str(block_name or "").strip()
+        if name == "":
+            raise ValueError("板块名称不能为空")
+        record = self._load_block_index_catalog().by_name.get(name)
+        if record is None:
+            raise ValueError(f"未知板块: {name}")
+        return dict(record)
+
+    def build_default_index_kline_tasks(self) -> List[Dict[str, str]]:
+        """
+        输入无，输出默认指数任务。
+
+        输入：无。使用当日指数目录。
+        输出：每个指数一条日线任务，窗口为近 7 天。
+        用途：get_index_kline 在 async 且未传 task 时自动展开。
+        边界条件：目录为空时抛 ValueError。
+        """
+        end_dt = dt.datetime.now()
+        start_dt = end_dt - dt.timedelta(days=7)
+        start_text = start_dt.strftime("%Y-%m-%d")
+        end_text = end_dt.strftime("%Y-%m-%d")
+        tasks_buffer: List[Dict[str, str]] = []
+        seen_names: set[str] = set()
+        for record in self._discover_index_route_records(refresh=False):
+            index_name = str(record.get("name", "")).strip()
+            if index_name == "" or index_name in seen_names:
+                continue
+            seen_names.add(index_name)
+            tasks_buffer.append(
+                {
+                    "index_name": index_name,
+                    "freq": "d",
+                    "start_time": start_text,
+                    "end_time": end_text,
+                }
+            )
+        if not tasks_buffer:
+            raise ValueError("默认指数任务构建失败：未发现可用指数目录")
+        return tasks_buffer
+
+    def prepare_index_kline_tasks(
+        self, tasks: List[Dict[str, str]]
+    ) -> List[Dict[str, Any]]:
+        """
+        输入指数任务，输出带路由字段的任务。
+
+        输入：tasks 含 index_name/freq/start_time/end_time。
+        输出：附带 `_index_route_*` 的任务列表。
+        用途：主进程解析指数名称，worker 不再扫目录。
+        边界条件：已带合法路由的任务原样保留；名称未命中时抛 ValueError。
+        """
+        enriched: List[Dict[str, Any]] = []
+        for task_item in list(tasks or []):
+            task_copy: Dict[str, Any] = dict(task_item)
+            pre_code = str(task_copy.get("_index_route_code", "")).strip()
+            try:
+                pre_market = int(task_copy.get("_index_route_market", -1))
+            except (TypeError, ValueError):
+                pre_market = -1
+            pre_source = str(task_copy.get("_index_route_source", "")).strip().lower()
+            if pre_source in {"std", "ex"} and pre_code != "" and pre_market >= 0:
+                enriched.append(task_copy)
+                continue
+            route = self.resolve_index_name(
+                index_name=task_item.get("index_name", ""), refresh=False
+            )
+            task_copy["_index_route_source"] = (
+                str(route.get("source", "")).strip().lower()
+            )
+            task_copy["_index_route_market"] = int(route.get("market", -1))
+            task_copy["_index_route_code"] = str(route.get("code", "")).strip()
+            task_copy["_index_route_name"] = str(route.get("name", "")).strip()
+            enriched.append(task_copy)
+        return enriched
+
+    def prepare_block_kline_tasks(
+        self, tasks: List[Dict[str, str]]
+    ) -> List[Dict[str, Any]]:
+        """
+        输入板块任务，输出可交给指数抓取器的内部任务。
+
+        输入：tasks 含 block_name/freq/start_time/end_time。
+        输出：带标准行情路由和板块命令标记的任务列表。
+        用途：主进程把名称换成 88xxxx，任务主键保持 block_name。
+        边界条件：名称不在目录中时抛 ValueError。
+        """
+        routed: List[Dict[str, Any]] = []
+        for task_item in list(tasks or []):
+            block_name = str(task_item.get("block_name") or "").strip()
+            route = self.resolve_block_index_route(block_name)
+            routed.append(
+                {
+                    "block_name": block_name,
+                    "freq": task_item.get("freq"),
+                    "start_time": task_item.get("start_time"),
+                    "end_time": task_item.get("end_time"),
+                    "_index_route_source": "std",
+                    "_index_route_market": int(route["market"]),
+                    "_index_route_code": str(route["code"]),
+                    "_index_route_name": block_name,
+                }
+            )
+        return routed
 
     def get_stock_concepts(self) -> Dict[str, Any]:
         """

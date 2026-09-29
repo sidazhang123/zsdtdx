@@ -253,7 +253,7 @@ def run_parallel(
         get_client,
         prewarm_parallel_fetcher,
     )
-    from zsdtdx.parallel_fetcher import fetch_company_info_parallel
+    from zsdtdx.engine.parallel_fetcher import fetch_company_info_parallel
 
     out_dir.mkdir(parents=True, exist_ok=True)
     content_path = out_dir / "content.jsonl"

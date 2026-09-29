@@ -1,5 +1,5 @@
 """
-模块：`helper.py`。
+模块：`util/helper.py`。
 
 职责：
 1. 提供协议解析层共用的二进制解码与 K 线数值格式化工具。
@@ -19,9 +19,24 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 
+from zsdtdx.params import TDXParams
+
 # imported inside functions to avoid circular dependency
-# from zsdtdx.parallel_fetcher import set_active_config_path
-# from zsdtdx.unified_client import UnifiedTdxClient
+# from zsdtdx.engine.parallel_fetcher import set_active_config_path
+# from zsdtdx.engine.unified_client import UnifiedTdxClient
+
+
+def _hms_parts(value: str) -> Tuple[int, int, int]:
+    """
+    输入 HH:MM:SS 字符串，输出 (时, 分, 秒)。
+
+    输入：params 中的默认时刻常量。
+    输出：供 datetime.replace 使用的三元组。
+    用途：日期补齐时分秒。
+    边界条件：格式须为三段冒号分隔的整数。
+    """
+    hour, minute, second = str(value).split(":")
+    return int(hour), int(minute), int(second)
 
 
 def get_price(data, pos):
@@ -328,16 +343,21 @@ def normalize_task_time_window(start_time: Any, end_time: Any) -> tuple[str, str
     输出：
     1. 标准化后的 `(start_time, end_time)` 字符串元组。
     边界条件：
-    1. 日期入参会映射为 start=09:30:00、end=16:00:00。
+    1. 日期入参会映射为 start=`TDXParams.STOCK_DATE_ONLY_START_TIME`、
+       end=`TDXParams.STOCK_DATE_ONLY_END_TIME`。
     """
     start_dt, start_fmt = parse_task_datetime(start_time)
     end_dt, end_fmt = parse_task_datetime(end_time)
+    start_h, start_m, start_s = _hms_parts(TDXParams.STOCK_DATE_ONLY_START_TIME)
+    end_h, end_m, end_s = _hms_parts(TDXParams.STOCK_DATE_ONLY_END_TIME)
 
     if start_fmt in {"ymd_dash", "ymd_slash"}:
-        start_dt = start_dt.replace(hour=9, minute=30, second=0, microsecond=0)
+        start_dt = start_dt.replace(
+            hour=start_h, minute=start_m, second=start_s, microsecond=0
+        )
         start_fmt = "ymd_hms_slash" if start_fmt == "ymd_slash" else "ymd_hms_dash"
     if end_fmt in {"ymd_dash", "ymd_slash"}:
-        end_dt = end_dt.replace(hour=16, minute=0, second=0, microsecond=0)
+        end_dt = end_dt.replace(hour=end_h, minute=end_m, second=end_s, microsecond=0)
         end_fmt = "ymd_hms_slash" if end_fmt == "ymd_slash" else "ymd_hms_dash"
 
     return format_task_datetime(start_dt, start_fmt), format_task_datetime(
@@ -390,21 +410,42 @@ def normalize_future_time_window(start_time: Any, end_time: Any) -> tuple[str, s
     输出：
     1. 标准化后的 `(start_time, end_time)` 字符串元组。
     边界条件：
-    1. 日期入参会映射为 start=09:00:00、end=15:00:00。
+    1. 日期入参会映射为 start=`TDXParams.FUTURE_DATE_ONLY_START_TIME`、
+       end=`TDXParams.FUTURE_DATE_ONLY_END_TIME`。
     """
     start_dt, start_fmt = parse_task_datetime(start_time)
     end_dt, end_fmt = parse_task_datetime(end_time)
+    start_h, start_m, start_s = _hms_parts(TDXParams.FUTURE_DATE_ONLY_START_TIME)
+    end_h, end_m, end_s = _hms_parts(TDXParams.FUTURE_DATE_ONLY_END_TIME)
 
     if start_fmt in {"ymd_dash", "ymd_slash"}:
-        start_dt = start_dt.replace(hour=9, minute=0, second=0, microsecond=0)
+        start_dt = start_dt.replace(
+            hour=start_h, minute=start_m, second=start_s, microsecond=0
+        )
         start_fmt = "ymd_hms_slash" if start_fmt == "ymd_slash" else "ymd_hms_dash"
     if end_fmt in {"ymd_dash", "ymd_slash"}:
-        end_dt = end_dt.replace(hour=15, minute=0, second=0, microsecond=0)
+        end_dt = end_dt.replace(hour=end_h, minute=end_m, second=end_s, microsecond=0)
         end_fmt = "ymd_hms_slash" if end_fmt == "ymd_slash" else "ymd_hms_dash"
 
     return format_task_datetime(start_dt, start_fmt), format_task_datetime(
         end_dt, end_fmt
     )
+
+
+# K 线任务周期：键为用户写法，值为内部周期。
+TASK_FREQ_MAP: Dict[str, str] = {
+    "d": "d",
+    "w": "w",
+    "m": "m",
+    "60": "60",
+    "60min": "60",
+    "30": "30",
+    "30min": "30",
+    "15": "15",
+    "15min": "15",
+    "5": "5",
+    "5min": "5",
+}
 
 
 def normalize_task_input(
@@ -482,7 +523,7 @@ def call_with_client(
 
 
 # Global variables for config management
-_DEFAULT_CONFIG_PATH = str(Path(__file__).resolve().with_name("config.yaml"))
+_DEFAULT_CONFIG_PATH = str(Path(__file__).resolve().parent.parent / "config.yaml")
 _ACTIVE_CONFIG_PATH: Optional[str] = None
 _DEFAULT_CONFIG_NOTICE_PRINTED: bool = False
 
@@ -499,7 +540,7 @@ def _validate_config_or_raise(cfg: Dict[str, Any], resolved_path: str) -> None:
     1. standard hosts 缺失或无效时抛出 ValueError。
     2. extended 配置存在但无效时抛出 ValueError。
     """
-    from zsdtdx.unified_client import normalize_hosts_entries
+    from zsdtdx.engine.unified_client import normalize_hosts_entries
 
     if not isinstance(cfg, dict):
         raise ValueError(f"配置无效（非字典）: {resolved_path}")
@@ -536,8 +577,8 @@ def _apply_active_config_path(
 
     import threading
 
-    from zsdtdx.parallel_fetcher import set_active_config_path
-    from zsdtdx.unified_client import (
+    from zsdtdx.engine.parallel_fetcher import set_active_config_path
+    from zsdtdx.engine.unified_client import (
         _cache_usable_for_cfg,
         _ensure_availability_hosts_cache,
         _load_merged_zsdtdx_config,
@@ -567,7 +608,7 @@ def _apply_active_config_path(
                         cfg=cfg,
                     )
                 except Exception as exc:
-                    from zsdtdx.log import log
+                    from zsdtdx.util.log import log
 
                     log.error(
                         "[set_config_path] 后台 TCP 可用地址探测失败: %s",
@@ -583,7 +624,7 @@ def _apply_active_config_path(
             try:
                 _ensure_availability_hosts_cache(config_path=resolved_str, cfg=cfg)
             except Exception as exc:
-                from zsdtdx.log import log
+                from zsdtdx.util.log import log
 
                 log.error(
                     "[set_config_path] 同步 TCP 可用地址探测失败: %s",
@@ -610,7 +651,7 @@ def _ensure_active_config_ready(caller_name: str) -> str:
 
     if _ACTIVE_CONFIG_PATH:
         # avoid circular import
-        from zsdtdx.parallel_fetcher import set_active_config_path
+        from zsdtdx.engine.parallel_fetcher import set_active_config_path
 
         set_active_config_path(_ACTIVE_CONFIG_PATH)
         return str(_ACTIVE_CONFIG_PATH)

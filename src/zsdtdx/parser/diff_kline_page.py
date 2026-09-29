@@ -2,13 +2,14 @@
 模块：`parser/diff_kline_page.py`。
 
 职责：
-1. 标准行情差分编码 K 线单页解码（个股/指数共用布局）。
+1. 标准行情 K 线单页解码（个股/指数差分；板块指数绝对价，字段布局同构）。
 2. 解码后调用 helper 向量化格式化，作为 socket 层唯一数值刻度出口。
 
 边界：
-1. 仅处理 get_security_bars / get_index_bars 同构回包，不承担分页。
+1. 处理 get_security_bars / get_index_bars / get_block_bars 同构回包，不承担分页。
 2. 时间：本层从二进制解析年月日时分，写入 datetime 为 `YYYY-MM-DD HH:MM:SS`（秒位固定 `:00`）与 `_ts`；不向 dict 返回分列字段。
 3. socket 层以上（unified_client 等）只消费 datetime/_ts，不再解析 year/month/day/hour/minute。
+4. `absolute_ohlc=True` 时 OHLC 四字段各自 `/1000` 为绝对价（0x0523 板块指数）；默认 False 为差分（0x052D）。
 """
 
 # coding=utf-8
@@ -20,7 +21,7 @@ from typing import Any, Dict, List
 
 import numpy as np
 
-from zsdtdx.helper import format_socket_kline_page_inplace, get_price, get_volume
+from zsdtdx.util.helper import format_socket_kline_page_inplace, get_price, get_volume
 
 
 def parse_diff_encoded_kline_page(
@@ -28,12 +29,15 @@ def parse_diff_encoded_kline_page(
     category: int,
     *,
     with_index_counts: bool = False,
+    absolute_ohlc: bool = False,
 ) -> List[Dict[str, Any]]:
     """
-    解析差分编码 K 线单页。
+    解析标准行情 K 线单页（差分或绝对价）。
 
-    输入：body_buf 回包体；category K 线周期；with_index_counts 为 True 时解析涨跌家数。
+    输入：body_buf 回包体；category K 线周期；with_index_counts 为 True 时解析涨跌家数；
+    absolute_ohlc 为 True 时 OHLC 按绝对价 `/1000`（板块 0x0523），否则按差分链。
     输出：已格式化的 K 线 dict 列表（OHLC 2dp，vol/amount 整数，datetime，_ts）。
+    边界条件：空页返回 []；绝对价模式不累积 pre_diff_base。
     """
     ret_count = body_buf[0] | (body_buf[1] << 8)
     if ret_count <= 0:
@@ -99,12 +103,19 @@ def parse_diff_encoded_kline_page(
             down_counts[i] = buf[pos + 2] | (buf[pos + 3] << 8)
             pos += 4
 
-        open_v = (pre_diff_base + price_open_diff) / 1000.0
-        new_base = pre_diff_base + price_open_diff
-        close_v = (new_base + price_close_diff) / 1000.0
-        high_v = (new_base + price_high_diff) / 1000.0
-        low_v = (new_base + price_low_diff) / 1000.0
-        pre_diff_base = new_base + price_close_diff
+        if absolute_ohlc:
+            # 板块指数 0x0523：四价均为绝对整数价，刻度 /1000（抓包 880744 验证）。
+            open_v = price_open_diff / 1000.0
+            close_v = price_close_diff / 1000.0
+            high_v = price_high_diff / 1000.0
+            low_v = price_low_diff / 1000.0
+        else:
+            open_v = (pre_diff_base + price_open_diff) / 1000.0
+            new_base = pre_diff_base + price_open_diff
+            close_v = (new_base + price_close_diff) / 1000.0
+            high_v = (new_base + price_high_diff) / 1000.0
+            low_v = (new_base + price_low_diff) / 1000.0
+            pre_diff_base = new_base + price_close_diff
 
         opens[i] = open_v
         closes[i] = close_v

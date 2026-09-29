@@ -5,9 +5,9 @@ from pathlib import Path
 
 import yaml
 
-from zsdtdx.base_socket_client import BaseSocketClient
-from zsdtdx.exhq import TdxExHq_API
-from zsdtdx.hq import TdxHq_API
+from zsdtdx.net.base_socket_client import BaseSocketClient
+from zsdtdx.net.exhq import TdxExHq_API
+from zsdtdx.net.hq import TdxHq_API
 
 
 def test_heartbeat_module_removed():

@@ -7,7 +7,7 @@
 `zsdtdx` 是一个面向 A 股/期货行情场景的 Python 封装库，参考 pytdx 生态提供统一 API、连接池、重试和并行抓取能力。部分请求组包与回包解析已按实盘抓包重新实现，并非对 `pytdx` 的直接二次封装或运行时依赖；归属说明见 `THIRD_PARTY_NOTICES.md`。
 
 - **名称**：`zsdtdx`
-- **版本**：`2.2.1`（同时定义在 `pyproject.toml` 与 `src/zsdtdx/__init__.py`）
+- **版本**：`2.3.0`（同时定义在 `pyproject.toml` 与 `src/zsdtdx/__init__.py`）
 - **许可证**：MIT（见 `LICENSE`）
 - **Python 要求**：`>=3.10`
 - **核心依赖**：`numpy`、`pandas`、`PyYAML`、`six`、`psutil`
@@ -15,9 +15,9 @@
 主要对外能力：
 
 - 标准/扩展行情连接管理（`get_client`、`set_config_path`）
-- 市场、股票代码表、期货列表查询
+- 股票代码表、期货列表查询
 - 股票所属板块（`get_stock_concepts`：`infoharbor_block.dat` 概念/风格/指数，`tdxhy.cfg` + `zhb.zip` 内 `tdxzs.cfg` 补基础行业）
-- 股票 K 线/指数 K 线（同步 + 异步并行）
+- 股票/指数/板块指数 K 线（同步 + 异步并行；任务类见 `kline_task.py`）
 - 商品期货 K 线
 - 实时最新价（股票/期货）
 - 公司信息
@@ -34,18 +34,30 @@
 ├── LICENSE / THIRD_PARTY_NOTICES.md
 ├── src/zsdtdx/                 # 主包
 │   ├── __init__.py             # 对外导出入口
-│   ├── simple_api.py           # 最外层 get_* 风格 API 与任务模型
-│   ├── unified_client.py       # 统一高层客户端、配置加载、TCP 探测、连接池
-│   ├── parallel_fetcher.py     # 异步并行抓取、进程池、chunk 调度、缓存
-│   ├── base_socket_client.py   # 底层 TCP socket 客户端、流量统计
-│   ├── hq.py                   # 标准行情协议 API（TdxHq_API）
-│   ├── exhq.py                 # 扩展行情协议 API（TdxExHq_API）
-│   ├── helper.py               # 二进制解码、K 线数值格式化、通用工具
+│   ├── simple_api.py           # 最外层 get_* 风格 API
+│   ├── kline_task.py           # 股票/指数/板块 K 线任务类（用户构造入口）
+│   ├── biz/                    # 各领域业务门面（由 simple_api 调用）
+│   │   ├── stock_kline.py      # 股票 K 线
+│   │   ├── index_kline.py      # 指数 K 线
+│   │   ├── block_kline.py      # 板块指数 K 线
+│   │   ├── future_kline.py     # 期货 K 线（codes/freq 批入口）
+│   │   └── company_info.py     # 公司信息
+│   ├── net/                    # TCP 与标准/扩展行情协议
+│   │   ├── base_socket_client.py
+│   │   ├── hq.py
+│   │   └── exhq.py
+│   ├── engine/                 # 统一客户端与并行调度
+│   │   ├── unified_client.py
+│   │   ├── parallel_fetcher.py
+│   │   └── adaptive_scheduler.py
+│   ├── cache/                  # 码表与板块文件磁盘缓存
+│   │   ├── catalog_disk_cache.py
+│   │   └── block_file_cache.py
+│   ├── util/                   # 异常、工具、日志（内部地基）
+│   │   ├── errors.py
+│   │   ├── helper.py
+│   │   └── log.py
 │   ├── params.py               # 市场/K线类型等协议常量
-│   ├── errors.py               # 异常类型
-│   ├── log.py                  # 包级日志，受 TDX_DEBUG 环境变量控制
-│   ├── catalog_disk_cache.py   # 标准/扩展码表与 ETF/LOF 日级磁盘缓存
-│   ├── adaptive_scheduler.py   # 按地址数与总进程数计算 std/ex 同时在飞上限
 │   ├── config.yaml             # 包内默认配置
 │   └── parser/                 # 通达信协议解析器集合
 │       ├── base.py
@@ -86,7 +98,7 @@ python -m build
 py -m pytest tests/ -q
 ```
 
-- 当前共有 248 个用例，全部离线可跑。
+- 当前共有 273 个用例，全部离线可跑。
 - `pyproject.toml` 已配置 `pythonpath = ["src"]`、`testpaths = ["tests"]`、`norecursedirs = ["manual", ...]`。
 - 不要修改 `tests/` 下现有用例的语义，除非修复接口变更导致的编译/调用错误。
 
@@ -127,19 +139,20 @@ set_config_path(r"D:\configs\zsdtdx.yaml")
 需要主进程连接的 API 应包裹在 `with get_client():` 中：
 
 ```python
-from zsdtdx import get_client, get_supported_markets, get_stock_latest_price
+from zsdtdx import get_client, get_stock_latest_price
 
-with get_client():
-    markets = get_supported_markets(return_df=True)
+with get_client() as client:
+    # 市场列表仅保留客户端方法，不再有独立 get_supported_markets 封装
+    markets = client.get_supported_markets(return_df=True)
     prices = get_stock_latest_price(["600000", "000001"])
 ```
 
 属于主进程上下文的 API：
 
-- `get_supported_markets`
 - `get_stock_code_name`
 - `get_stock_concepts`（`infoharbor_block.dat` 加 `tdxhy.cfg` 与 `zhb.zip`/`tdxzs.cfg` 的基础行业；当日码表换成股票名；返回 `{names, map}`；不写 pkl）
 - `get_etf_code_name`（ETF+LOF 并集：`spec/specetfdata.txt` + `spec/speclofdata.txt`；名称优先 `infoharbor_ex.name` 与 `zhb.zip`/`ilong.dat` 合并且同码取 ilong，板块缺名回退 std/`0x044D` 版面短名；当日 `etf_code_name.pkl`；空列表不落盘；不读银河安装目录；不扩宽 `get_stock_code_name`）
+- `get_block_names`
 - `get_all_future_list`
 - `get_future_kline`
 - `get_company_info`
@@ -148,17 +161,27 @@ with get_client():
 - `get_runtime_failures`
 - `get_runtime_metadata`
 
-### 5.3 异步并行 K 线
+### 5.3 股票/指数/板块 K 线（任务类 + sync/async）
 
-`get_stock_kline` / `get_index_kline` 的 `mode="async"` 使用独立 worker 进程池，worker 内部自建连接，**不需要** `with get_client()`。进程池生命周期可通过以下函数管理：
+用户对外入口分两层，均可从 `zsdtdx` 导入：
 
-- `prewarm_parallel_fetcher()`：预热 worker 与连接。
+1. **调用**：`simple_api` 的 `get_stock_kline` / `get_index_kline` / `get_block_kline`。
+2. **任务构造**：`kline_task` 的 `StockKlineTask` / `IndexKlineTask` / `BlockKlineTask`（也可用等价 dict）。
+
+sync/async **都不要求**前置 `with get_client()`。抓取连接由并行层进程内常驻 client 管理，不复用 with 内主进程 client：
+
+- `mode="sync"`：主进程 inproc chunk 调度。
+- `mode="async"`：独立 worker 进程池。
+
+进程池生命周期：
+
+- `prewarm_parallel_fetcher()`：预热 worker（默认不要求全部成功；业务连接按任务侧懒建）。
 - `restart_parallel_fetcher(...)`：强制重启进程池。
 - `destroy_parallel_fetcher()`：释放资源（建议脚本退出前调用）。
 
 K 线数据契约：
 
-- 仅传日期时，股票/指数任务补齐为 `09:30:00` / `16:00:00`。
+- 仅传日期时，股票/指数/板块任务补齐为 `09:30:00` / `16:00:00`。
 - `rows` 中 `datetime` 固定为 `YYYY-MM-DD HH:MM:SS`，秒位 `:00`。
 
 ## 6. 代码风格与开发规范
@@ -244,11 +267,15 @@ K 线数据契约：
 | 修改目标 | 推荐入口文件 |
 |---|---|
 | 新增/调整对外 API | `src/zsdtdx/simple_api.py` |
-| 连接池/重试/TCP 探测 | `src/zsdtdx/unified_client.py` |
-| 异步并行调度 | `src/zsdtdx/parallel_fetcher.py` |
-| 协议解析字段/数值刻度 | `src/zsdtdx/helper.py` + `src/zsdtdx/parser/*.py` |
-| ETF 完整名称（0x02C5/0x06B9） | `src/zsdtdx/parser/get_report_file.py` + `unified_client.get_etf_code_name_map` |
-| 股票所属板块 | `src/zsdtdx/parser/infoharbor_block.py` + `unified_client.get_stock_concepts` |
-| 码表磁盘缓存 | `src/zsdtdx/catalog_disk_cache.py`（含 `etf_code_name.pkl`） |
+| K 线任务类 | `src/zsdtdx/kline_task.py` |
+| 各领域业务门面 | `src/zsdtdx/biz/*.py` |
+| 协议/域常量 | `src/zsdtdx/params.py` |
+| 连接池/重试/TCP 探测 | `src/zsdtdx/engine/unified_client.py` |
+| 异步并行调度 | `src/zsdtdx/engine/parallel_fetcher.py` |
+| TCP/行情协议 API | `src/zsdtdx/net/` |
+| 码表磁盘缓存 | `src/zsdtdx/cache/catalog_disk_cache.py`（含 `etf_code_name.pkl`） |
+| 协议解析字段/数值刻度 | `src/zsdtdx/util/helper.py` + `src/zsdtdx/parser/*.py` |
+| ETF 完整名称（0x02C5/0x06B9） | `src/zsdtdx/parser/get_report_file.py` + `engine.unified_client.get_etf_code_name_map` |
+| 股票所属板块 | `src/zsdtdx/parser/infoharbor_block.py` + `engine.unified_client.get_stock_concepts` |
 | 默认配置项 | `src/zsdtdx/config.yaml` + `README.md` 中的示例 |
 | 版本号 | `pyproject.toml`、`src/zsdtdx/__init__.py`、`CHANGELOG.md` |

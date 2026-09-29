@@ -11,10 +11,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-from zsdtdx.helper import _apply_active_config_path, _validate_config_or_raise
-from zsdtdx.parallel_fetcher import _build_worker_host_slot_assignments
-import zsdtdx.unified_client as uc
-from zsdtdx.unified_client import (
+from zsdtdx.util.helper import _apply_active_config_path, _validate_config_or_raise
+from zsdtdx.engine.parallel_fetcher import _build_worker_host_slot_assignments
+import zsdtdx.engine.unified_client as uc
+from zsdtdx.engine.unified_client import (
     _cache_usable_for_cfg,
     _ensure_availability_hosts_cache,
     compute_hosts_fingerprint,
@@ -41,7 +41,7 @@ def _reset_probe_cache():
 
 @pytest.fixture(autouse=True)
 def reset_cache_and_globals():
-    import zsdtdx.helper as helper_mod
+    import zsdtdx.util.helper as helper_mod
 
     saved_active_path = helper_mod._ACTIVE_CONFIG_PATH
     saved_notice = helper_mod._DEFAULT_CONFIG_NOTICE_PRINTED
@@ -76,7 +76,7 @@ def test_cache_unusable_when_fingerprint_changes():
     assert not _cache_usable_for_cfg(cfg_b)
 
 
-@patch("zsdtdx.unified_client._tcp_probe_and_trim_available_hosts")
+@patch("zsdtdx.engine.unified_client._tcp_probe_and_trim_available_hosts")
 def test_ensure_skips_when_cache_usable(mock_probe):
     cfg = _minimal_cfg()
     std = [("1.1.1.1", 7709)]
@@ -90,7 +90,7 @@ def test_ensure_skips_when_cache_usable(mock_probe):
     mock_probe.assert_not_called()
 
 
-@patch("zsdtdx.unified_client._tcp_probe_and_trim_available_hosts")
+@patch("zsdtdx.engine.unified_client._tcp_probe_and_trim_available_hosts")
 def test_ensure_writes_cache_once(mock_probe):
     mock_probe.side_effect = lambda hosts, timeout, fallback, name: list(hosts)[:1] or list(fallback)
 
@@ -102,7 +102,7 @@ def test_ensure_writes_cache_once(mock_probe):
     assert mock_probe.call_count >= 1
 
 
-@patch("zsdtdx.unified_client._tcp_probe_and_trim_available_hosts")
+@patch("zsdtdx.engine.unified_client._tcp_probe_and_trim_available_hosts")
 def test_concurrent_ensure_single_flight(mock_probe):
     mock_probe.side_effect = lambda hosts, timeout, fallback, name: list(hosts)
 
@@ -138,7 +138,7 @@ def test_resolve_worker_sync_if_missing_false_raises():
         )
 
 
-@patch("zsdtdx.unified_client._tcp_probe_and_trim_available_hosts")
+@patch("zsdtdx.engine.unified_client._tcp_probe_and_trim_available_hosts")
 def test_resolve_uses_presorted_without_ensure(mock_probe, tmp_path):
     presorted = {
         "standard": [("9.9.9.9", 7709)],
@@ -182,7 +182,7 @@ def test_validate_config_or_raise_no_client(tmp_path):
     _validate_config_or_raise(cfg, str(cfg_path.resolve()))
 
 
-@patch("zsdtdx.unified_client._ensure_availability_hosts_cache")
+@patch("zsdtdx.engine.unified_client._ensure_availability_hosts_cache")
 def test_set_config_path_async_returns_before_ensure(mock_ensure, tmp_path):
     cfg_path = tmp_path / "user.yaml"
     cfg_path.write_text(yaml.dump(_minimal_cfg()), encoding="utf-8")
@@ -207,7 +207,7 @@ def test_set_config_path_async_returns_before_ensure(mock_ensure, tmp_path):
     mock_ensure.assert_called()
 
 
-@patch("zsdtdx.unified_client._ensure_availability_hosts_cache")
+@patch("zsdtdx.engine.unified_client._ensure_availability_hosts_cache")
 def test_set_config_path_sync_calls_ensure(mock_ensure, tmp_path):
     cfg_path = tmp_path / "user.yaml"
     cfg_path.write_text(yaml.dump(_minimal_cfg()), encoding="utf-8")
@@ -234,7 +234,7 @@ def _fake_probe_latency_map(latency_by_host):
     return _probe
 
 
-@patch("zsdtdx.unified_client._tcp_probe_one")
+@patch("zsdtdx.engine.unified_client._tcp_probe_one")
 def test_short_host_pool_keeps_all_reachable_no_drop_slowest(mock_probe):
     """配置侧 ≤3：两站都可达时保留全部，不删最慢。"""
     hosts = [("10.0.0.1", 7720), ("10.0.0.2", 7730)]
@@ -247,7 +247,7 @@ def test_short_host_pool_keeps_all_reachable_no_drop_slowest(mock_probe):
     assert out == [("10.0.0.2", 7730), ("10.0.0.1", 7720)]
 
 
-@patch("zsdtdx.unified_client._tcp_probe_one")
+@patch("zsdtdx.engine.unified_client._tcp_probe_one")
 def test_long_host_pool_still_drops_slowest_when_reachable_ge_2(mock_probe):
     """配置侧 >3：可达≥2 时仍去掉最慢 1 个。"""
     hosts = [

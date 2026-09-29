@@ -1,8 +1,8 @@
 """离线验收北交所走标准行情 market=2，扩展行情 market=44 不再作为北交所路由。"""
 
-from zsdtdx.hq import TdxHq_API
+from zsdtdx.net.hq import TdxHq_API
 from zsdtdx.params import TDXParams
-from zsdtdx.unified_client import UnifiedTdxClient
+from zsdtdx.engine.unified_client import UnifiedTdxClient
 
 
 def _client() -> UnifiedTdxClient:

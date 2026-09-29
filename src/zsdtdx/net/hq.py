@@ -17,13 +17,14 @@ from collections import OrderedDict
 
 import pandas as pd
 
-from zsdtdx.base_socket_client import BaseSocketClient, update_last_ack_time
+from zsdtdx.net.base_socket_client import BaseSocketClient, update_last_ack_time
 from zsdtdx.params import TDXParams
 from zsdtdx.parser.get_company_info_category import GetCompanyInfoCategory
 from zsdtdx.parser.get_company_info_content import GetCompanyInfoContent
 from zsdtdx.parser.get_finance_info import GetFinanceInfo
 from zsdtdx.parser.get_history_minute_time_data import GetHistoryMinuteTimeData
 from zsdtdx.parser.get_history_transaction_data import GetHistoryTransactionData
+from zsdtdx.parser.get_block_bars import GetBlockBarsCmd
 from zsdtdx.parser.get_index_bars import GetIndexBarsCmd
 from zsdtdx.parser.get_minute_time_data import GetMinuteTimeData
 from zsdtdx.parser.get_report_file import GetReportFile, GetReportFileMeta
@@ -131,6 +132,27 @@ class TdxHq_API(BaseSocketClient):
         2. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
         """
         cmd = GetIndexBarsCmd(self.client, lock=self.lock)
+        cmd.setParams(category, market, code, start, count)
+        return cmd.call_api()
+
+    @update_last_ack_time
+    def get_block_bars(self, category, market, code, start, count):
+        """
+        输入：
+        1. category: K 线周期；1 分钟=7，日线=4。
+        2. market: 市场号。板块指数为 1。
+        3. code: 板块指数代码，如 880744。
+        4. start: 分页偏移，0 表示从最新一段起取。
+        5. count: 本页条数，服务端硬上限 800。
+        输出：
+        1. 已解析的板块 K 线 dict 列表；失败时为 `None`。
+        用途：
+        1. 发送 54 字节 0x0523 请求；回包 OHLC 为绝对价（与 0x052D 差分不同）。
+        边界条件：
+        1. 无复权语义，reserved0 固定为 0。
+        2. 不解析板块名称；名称到代码由上层目录完成。
+        """
+        cmd = GetBlockBarsCmd(self.client, lock=self.lock)
         cmd.setParams(category, market, code, start, count)
         return cmd.call_api()
 

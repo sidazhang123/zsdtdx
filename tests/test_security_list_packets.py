@@ -8,7 +8,7 @@ from zsdtdx.parser.get_security_list import (
     GetSecurityList,
     pack_security_list_request,
 )
-from zsdtdx.unified_client import UnifiedTdxClient
+from zsdtdx.engine.unified_client import UnifiedTdxClient
 
 # 银河 0x044D 抓包：market=2 首页第一条 899050 北证50。
 _BJ_FIRST_RECORD = bytes.fromhex(

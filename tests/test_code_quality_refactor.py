@@ -7,8 +7,8 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
-from zsdtdx.errors import TdxFunctionCallError
-from zsdtdx.unified_client import UnifiedTdxClient, _DEFAULT_MAX_KLINE_PAGES
+from zsdtdx.util.errors import TdxFunctionCallError
+from zsdtdx.engine.unified_client import UnifiedTdxClient, _DEFAULT_MAX_KLINE_PAGES
 
 
 def test_init_module_no_import_time_tcp_refresh():
@@ -20,7 +20,7 @@ def test_init_module_no_import_time_tcp_refresh():
 def test_default_max_kline_pages_constant():
     assert _DEFAULT_MAX_KLINE_PAGES == 400
     uc_path = (
-        Path(__file__).resolve().parents[1] / "src" / "zsdtdx" / "unified_client.py"
+        Path(__file__).resolve().parents[1] / "src" / "zsdtdx" / "engine" / "unified_client.py"
     )
     text = uc_path.read_text(encoding="utf-8")
     assert 'max_kline_pages", 200)' not in text
@@ -283,7 +283,7 @@ def test_parallel_fetcher_load_config_uses_resolve_and_active_path(tmp_path):
         "parallel:\n  auto_prewarm_timeout_seconds: 42.5\n  auto_prewarm_max_rounds: 7\n",
         encoding="utf-8",
     )
-    from zsdtdx.parallel_fetcher import ParallelKlineFetcher, set_active_config_path
+    from zsdtdx.engine.parallel_fetcher import ParallelKlineFetcher, set_active_config_path
 
     set_active_config_path(str(custom_cfg.resolve()))
     fetcher = ParallelKlineFetcher(config_path=None)
@@ -376,7 +376,7 @@ def test_paginate_kline_pages_no_df_and_pandas_boundaries():
 
 def test_parallel_fetcher_no_chunk_timeout_executor_shutdown():
     pf_path = (
-        Path(__file__).resolve().parents[1] / "src" / "zsdtdx" / "parallel_fetcher.py"
+        Path(__file__).resolve().parents[1] / "src" / "zsdtdx" / "engine" / "parallel_fetcher.py"
     )
     text = pf_path.read_text(encoding="utf-8")
     assert "_shutdown_chunk_timeout_executor" not in text
@@ -390,7 +390,7 @@ def test_parallel_fetcher_loads_coroutine_workers_from_config(tmp_path):
         "parallel:\n  task_chunk_inproc_coroutine_workers: 9\n",
         encoding="utf-8",
     )
-    from zsdtdx.parallel_fetcher import ParallelKlineFetcher, set_active_config_path
+    from zsdtdx.engine.parallel_fetcher import ParallelKlineFetcher, set_active_config_path
 
     set_active_config_path(str(custom_cfg.resolve()))
     fetcher = ParallelKlineFetcher(config_path=None)
@@ -400,7 +400,7 @@ def test_parallel_fetcher_loads_coroutine_workers_from_config(tmp_path):
 def test_fetch_one_task_chunk_async_timeout_marks_all_tasks_failed():
     import asyncio
 
-    from zsdtdx import parallel_fetcher as pf
+    from zsdtdx.engine import parallel_fetcher as pf
 
     chunk_payload = {
         "chunk_id": "c1",
@@ -532,7 +532,7 @@ def test_index_chunk_partition_refresh_at_most_once():
 
 
 def test_tdx_function_call_error_includes_method_and_endpoint():
-    from zsdtdx.base_socket_client import update_last_ack_time
+    from zsdtdx.net.base_socket_client import update_last_ack_time
 
     class DummyClient:
         raise_exception = True

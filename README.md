@@ -10,15 +10,25 @@ pip install zsdtdx
 
 ## API 概览
 
+用户日常只需关注两层对外入口（均可从 `zsdtdx` 直接导入）：
+
+1. **`simple_api`**：`get_*` / `set_config_path` / `get_client` / 进程池生命周期等调用入口。
+2. **`kline_task`**：构造股票/指数/板块 K 线任务列表的类型入口
+   （`StockKlineTask` / `IndexKlineTask` / `BlockKlineTask`）。也可用等价 `dict`，任务类字段校验更明确。
+
+函数清单：
+
 - `set_config_path`
 - `get_client`
-- `get_supported_markets`
 - `get_stock_code_name`
 - `get_stock_concepts`
 - `get_etf_code_name`
 - `get_all_future_list`
+- `StockKlineTask` / `IndexKlineTask` / `BlockKlineTask`（`zsdtdx.kline_task`）
 - `get_stock_kline`
 - `get_index_kline`
+- `get_block_names`
+- `get_block_kline`
 - `prewarm_parallel_fetcher`
 - `restart_parallel_fetcher`
 - `destroy_parallel_fetcher`
@@ -44,6 +54,48 @@ pip install zsdtdx
 
 
 ## 快速开始
+
+
+
+#### 对外入口说明
+
+- **调用入口**：`zsdtdx.simple_api`（或 `from zsdtdx import get_stock_kline, ...`）。
+- **K 线任务构造入口**：`zsdtdx.kline_task`（或 `from zsdtdx import StockKlineTask, IndexKlineTask, BlockKlineTask`）。
+- `get_stock_kline` / `get_index_kline` / `get_block_kline` 的 `task` 参数接受任务类实例或等价 `dict`；
+  推荐任务类，字段与校验更清晰。期货 `get_future_kline` 仍用 `codes/freq/start_time/end_time`，无任务类。
+
+
+
+#### StockKlineTask / IndexKlineTask / BlockKlineTask
+
+定义于 `zsdtdx.kline_task`，是用户构造 K 线任务列表的类型入口；也可从 `zsdtdx` 直接导入。
+
+**字段:**
+
+- `StockKlineTask`: `code`, `freq`, `start_time`, `end_time`
+- `IndexKlineTask`: `index_name`, `freq`, `start_time`, `end_time`
+- `BlockKlineTask`: `block_name`, `freq`, `start_time`, `end_time`（`block_name` 取自 `get_block_names`）
+
+**时间窗口:**
+
+- 仅传日期时补齐为 `09:30:00` / `16:00:00`（与期货的 `09:00` / `15:00` 不同）。
+
+**调用示例:**
+
+```python
+from zsdtdx import BlockKlineTask, IndexKlineTask, StockKlineTask
+
+stock_tasks = [
+    StockKlineTask(code="600000", freq="d", start_time="2026-02-13", end_time="2026-02-13"),
+    {"code": "000001", "freq": "60", "start_time": "2026-02-13", "end_time": "2026-02-14"},  # dict 亦可
+]
+index_tasks = [
+    IndexKlineTask(index_name="中证1000", freq="d", start_time="2026-03-01", end_time="2026-03-31"),
+]
+block_tasks = [
+    BlockKlineTask(block_name="芯片", freq="d", start_time="2026-03-01", end_time="2026-03-31"),
+]
+```
 
 
 
@@ -96,7 +148,6 @@ from zsdtdx import get_client
 
 # 一个 with 中复用同一 client，避免重复建连。
 with get_client():
-    markets = get_supported_markets(return_df=True)
     stock_map = get_stock_code_name()
     prices = get_stock_latest_price(["600000", "000001"])
 ```
@@ -104,36 +155,10 @@ with get_client():
 **作用边界:**
 
 - 该 client 仅管理"当前主进程"上下文中的连接生命周期（进入 with 预连接，退出 with 自动 close）。
-- `get_stock_kline(mode="async")` 的 worker 连接由并行抓取器在 worker 进程内独立维护，不与此处返回的主进程 client 共用连接对象。
-
-
-
-#### get_supported_markets
-
-获取标准+扩展行情支持的市场列表。
-
-**调用前置约定:**
-
-- 请先进入 `with get_client():`；
-
-**输入:**
-
-- return_df: 可选，是否返回 pandas.DataFrame；默认 True。
-
-**调用示例:**
-
-```python
-from zsdtdx import get_client, get_supported_markets
-
-with get_client():
-    df = get_supported_markets(return_df=True)
-```
-
-**返回示例:**
-
-```json
-[{"market": 0, "name": "深圳", "source": "std"}, {"market": 1, "name": "上海", "source": "std"}]
-```
+- `get_stock_kline` / `get_index_kline` / `get_block_kline` 的 sync/async 抓取连接由并行层进程内常驻 client 管理，
+  不与此处 with 返回的主进程 client 共用；with 结束也不会关掉它们。
+- 市场列表不再有独立 `get_*` 封装；需要时在 with 内调用客户端方法：
+  `with get_client() as client: client.get_supported_markets(return_df=True)`。
 
 
 
@@ -148,7 +173,7 @@ with get_client():
 **输入:**
 
 - use_cache: 是否使用股票缓存；默认值为True，置为 False 时强制刷新股票缓存。
-- 本函数属于全量代码接口，返回范围由配置文件的stock_scope控制,默认szsh市场（可增配bj、hk；hk 为港股通）。
+- 本函数属于全量代码接口，返回范围由配置 `stock_scope.defaults_when_codes_none.get_stock_code_name` 控制（包内默认 `szsh+bj`；可增配 `hk` 港股通）。
 
 **输出:**
 
@@ -174,7 +199,9 @@ with get_client():
 
 #### get_stock_concepts
 
-获取股票所属板块。概念、风格、指数来自 `infoharbor_block.dat`。钢铁、煤炭、水泥等通达信基础行业来自 `tdxhy.cfg`（股票→行业码）和 `zhb.zip` 内的 `tdxzs.cfg`（行业码→板块名）。主机用配置里的 `hosts.standard`，都走命名文件下载。股票名称用 `get_stock_code_name` 的当日码表。不写 pkl。
+获取股票所属板块（成分归属）。概念、风格、指数来自 `infoharbor_block.dat`；通达信基础行业来自 `tdxhy.cfg` + `zhb.zip`/`tdxzs.cfg`。股票名称用 `get_stock_code_name` 当日码表。不写盘。
+
+与 `get_block_names` 文件同源，但语义不同：本接口回答「股票属于哪些板块」；可请求 K 线的板块指数名请用 `get_block_names`。
 
 **调用前置约定:**
 
@@ -204,7 +231,7 @@ with get_client():
 
 #### get_etf_code_name
 
-获取场内 ETF/LOF（本语境统称 etf）代码名称字典。成分来自标准行情 `7709` 板块文件（默认 `spec/specetfdata.txt` / `spec/speclofdata.txt`），名称优先 `infoharbor_ex.name` 与 `zhb.zip` 内 `ilong.dat` 合并（同码以 ilong 为准）；板块缺名时回退本库已拉的 std/`0x044D` 码表 16 字节短名（与客户端版面一致）。当日快照写入 `catalog_cache` 的 `etf_code_name.pkl`，仅本地没有当日文件时才下载。不改动 `get_stock_code_name` 口径，不读银河安装目录。
+获取场内 ETF/LOF（本语境统称 etf）代码名称字典。成分来自 `spec/specetfdata.txt` / `spec/speclofdata.txt`；名称优先 `infoharbor_ex.name` 与 `zhb.zip`/`ilong.dat` 合并（同码以 ilong 为准），缺名回退 std 码表版面短名。当日快照写入 `etf_code_name.pkl`，无当日文件才下载。不改动 `get_stock_code_name` 口径，不读银河安装目录。
 
 **调用前置约定:**
 
@@ -212,13 +239,12 @@ with get_client():
 
 **输入:**
 
-- use_cache: True 复用当日磁盘/内存快照；False 强制重新下载命名文件。
-- 板块成分不要求名称含 etf/lof，仍排除 `399*` 与 `etf_name_drop_substr`；名称文件中额外命中 etf/lof 的代码一并纳入。
-- 远程文件为 `infoharbor_ex.name`、`zhb.zip`（取成员 `ilong.dat`）与 `spec/specetfdata.txt`、`spec/speclofdata.txt`；单页 30000 字节。名称剔除子串仍由 `market_rules.etf_name_drop_substr` 配置。
+- use_cache: True 复用当日磁盘/内存快照；False 强制重新下载。
+- 另纳入名称文件中命中 etf/lof 的代码；排除深指 `399*` 与 `market_rules.etf_name_drop_substr`。
 
 **输出:**
 
-- 返回 `Dict[str, str]`：key 为 `sz.`/`sh.` 前缀代码，value 为名称（优先 ilong/infoharbor，否则 `0x044D` 版面短名）；排除深指 `399*` 与名称命中剔除子串的品种。
+- 返回 `Dict[str, str]`：key 为 `sz.`/`sh.` 前缀代码，value 为名称。
 
 **调用示例:**
 
@@ -247,7 +273,7 @@ with get_client():
 
 **输入:**
 
-- return_df: 可选，是否返回 pandas.DataFrame；默认 True。
+- return_df: 可选，是否返回 pandas.DataFrame；None 时跟随 `output.return_df_default`（包内默认 True）。
 - use_cache: 是否使用期货清单缓存；为 False 时强制刷新期货清单缓存。
 
 **调用示例:**
@@ -273,118 +299,76 @@ with get_client():
 
 **调用前置约定:**
 
-- `mode="sync"`：可进入 `with get_client():` 在主进程复用连接并统一资源释放。
-- `mode="async"`：可直接调用；async 抓取使用 worker 进程内独立连接。
-若同一流程还要连续调用主进程 `get_*` 接口，可把这些主进程调用放在 with 块内执行。
+- sync/async 均不要求前置 `with get_client()`；可选 with 以便同块调用其它主进程 `get_*`。
+- 抓取连接由并行层进程内常驻 client 管理，不复用 with 内主进程 client。
+- `mode="async"`：worker 子进程内抓取；`mode="sync"`：主进程 inproc 调度。
 
 **输入:**
 
-- task: 任务列表，元素是 `StockKlineTask` 或 dict，模板字段:
-`{code, freq, start_time, end_time}`。
-- queue: 可选队列，需支持 `put()`。
-  - `mode="sync"` 且不传 queue：仅通过返回值拿到结果。
-  - `mode="sync"` 且传 queue：返回值仍是完整结果列表，同时会向 queue 增量写入 data/done 事件。
-  - `mode="async"` 且不传 queue：函数会自动创建 queue 并挂到返回的 `job.queue`。
-  - `mode="async"` 且传 queue：返回的 `job.queue` 即该 queue。
-- preprocessor_operator: 可选钩子，签名 `f(payload)->dict|None`；
-返回 None 或空 dict 时该条结果不入队也不进入返回值（默认 OHLC 两位小数、成交额/量为整数由协议解析层统一）。
-- mode: `"sync"` 或 `"async"`，默认 `"async"`。sync 阻塞直到完成；async 立即返回句柄。
-- start_time/end_time: 支持字符串/date/datetime。若仅传入日期（无时分秒），自动补齐为 `start_time="… 09:30:00"`、`end_time="… 16:00:00"`（股票/指数任务共用，与 `get_future_kline` 的 09:00/15:00 不同）。
+- task: `StockKlineTask` 或等价 dict，字段 `{code, freq, start_time, end_time}`（任务类见上文 `kline_task`）。
+- queue: 可选，需 `put()`。sync 不传则仅返回值；传则返回值 + 队列双写。async 不传则自动创建并挂到 `job.queue`。
+- preprocessor_operator: `f(payload)->dict|None`；返回 None 或空 dict 时丢弃该条。
+- mode: `"sync"` 或 `"async"`，默认 `"async"`。
+- qfq: 默认 `True` 前复权，`False` 不复权；A 股与港股共用。指数/期货无此参数。
+- start_time/end_time: 仅日期时补齐 `09:30:00` / `16:00:00`（股票/指数/板块共用；期货为 `09:00`/`15:00`）。
 
 **K 线** `datetime` **输出契约:**
 
-- `rows` 中每条 K 线的 `datetime` 为 `YYYY-MM-DD HH:MM:SS`，秒位固定 `:00`（例如 `"2026-02-02 15:00:00"`）。
+- `rows` 中 `datetime` 为 `YYYY-MM-DD HH:MM:SS`，秒位固定 `:00`。
 
-**复权:**
-
-- `get_stock_kline` 增加参数 `qfq`（默认 `True`=前复权，`False`=不复权），接在原有参数之后；A 股与港股共用该开关。
-- `get_index_kline` 不提供 `qfq`：指数无复权语义，标准行情 reserved0 固定为 0。
-- `get_future_kline` 不提供 `qfq`：期货无复权，扩展行情 extra 固定为 0。
-- task 字段与返回结构不变。
-
-**调用示例（写法一：with 主进程上下文 + sync + 其它接口）:**
+**调用示例（写法一：with + sync）:**
 
 ```python
 import queue as py_queue
-from zsdtdx import (
-    StockKlineTask,
-    get_client,
-    get_stock_kline,
-    get_stock_latest_price,
-    get_supported_markets,
-)
+from zsdtdx import StockKlineTask, get_client, get_stock_kline, get_stock_latest_price
 
 with get_client():
-    markets = get_supported_markets(return_df=True)
     prices = get_stock_latest_price(["600000", "000001"])
-    # sync 模式可传入队列，边产出边消费（也可不传，仅用返回值）。
     q = py_queue.Queue()
     result = get_stock_kline(
         task=[
-            # 使用任务对象写法，字段校验更明确
             StockKlineTask(code="600000", freq="d", start_time="2026-02-13", end_time="2026-02-13"),
-            # 也支持 dict 写法
             {"code": "000001", "freq": "60", "start_time": "2026-02-13", "end_time": "2026-02-14"},
         ],
         queue=q,
         mode="sync",
     )
-    print(len(markets), prices)
-    # result 为完整 payload 列表；q 中也会收到相同 data 事件和最终 done 事件
-    print(result)
 ```
 
-**调用示例（写法二：async 独立进程池调用 + prewarm/restart/destroy）:**
+**调用示例（写法二：async）:**
 
 ```python
-from zsdtdx import (
-    destroy_parallel_fetcher,
-    get_stock_kline,
-    prewarm_parallel_fetcher,
-    restart_parallel_fetcher,
-)
-#不建议主动调用，在get_stock_kline()时会按yaml配置快速自动创建。
-prewarm_parallel_fetcher()
+from zsdtdx import destroy_parallel_fetcher, get_stock_kline, restart_parallel_fetcher
 
+# 一般不必手动 prewarm；首次 async 会自动预热。
 job = get_stock_kline(
     task=[{"code": "600000", "freq": "d", "start_time": "2026-02-13", "end_time": "2026-02-13"}],
     mode="async",
 )
 try:
     while True:
-        # 实时读取 data 事件，直到 done
         event = job.queue.get(timeout=20)
         if event.get("event") == "done":
             break
-        # event="data" 时可按 task/rows/error 增量处理
-        print(event.get("task"), event.get("error"))
-    # 等待后台任务完全结束并传播异常
     job.result()
 except Exception:
-    # 任务执行链路出现持续异常时，可强制重启并重建 worker 连接
-    restart_parallel_fetcher(prewarm=True, prewarm_timeout_seconds=60, max_rounds=3)
+    restart_parallel_fetcher(prewarm=True)
     raise
 finally:
-    # 服务停机或脚本结束前主动销毁进程池
     destroy_parallel_fetcher()
 ```
 
-**连接生命周期说明:**
+**连接生命周期:**
 
-- `mode="sync"`：主要使用主进程连接；with 结束会关闭主进程 client 连接。
-- `mode="async"`：父进程先固化每个股票/指数任务的 std/ex 路由；worker 只为当前 bundle 对应侧懒建连接，纯 std 不建立 ex 业务连接，纯 ex 不建立 std 业务连接。
-- CPU 推导的进程数只是硬上限。某一侧同时在飞进程数按可达地址数 H 与总进程数 C 计算：地址不少于进程时用满 C；进程多于地址时上限为 `min(C, H × per_host)`。标准/扩展的 `per_host` 分开配置。父进程提交窗口为进程数 × `task_chunk_max_inflight_multiplier`，标准侧地址配额按该倍率放大以填满进程池队列；扩展侧不放大。
-- 重试耗尽后的连接不可用、超时或 watchdog 降低对应地址配额并冷却；chunk 重试成功或成功切到其他地址不降配额。冷却结束后成功时每次 +1 回到拥塞前上限，不向外探测更高上限。多个同时运行的 async job 共用该容量状态。纯单侧任务不占另一侧连接；混合任务按两侧各自预算并行。
+- `mode="sync"`：主进程 inproc 调度，连接为抓取器进程内常驻 client；with 结束只关主进程 with client。
+- `mode="async"`：worker 子进程内按任务侧（std/ex）懒建连接；进程池见 prewarm/restart/destroy。
+- 同时在飞上限、地址配额与冷却等调度细节见下文默认配置 `parallel` 段说明。
 
 **返回:**
 
-- mode="sync": 始终返回 `list[task_payload]`（无论是否传 queue）。
-  - 未传 queue：结果仅在返回值中。
-  - 传了 queue：结果既在返回值中，也会同步推送到 queue。
-- mode="async": 始终返回 `StockKlineJob`（无论是否传 queue）。
-  - 未传 queue：可从自动创建的 `job.queue` 消费事件。
-  - 传了 queue：可从传入的 queue（即 `job.queue`）消费事件。
-- task_payload 结构:
+- mode="sync": `list[task_payload]`（传 queue 时同时推送 data/done）。
+- mode="async": `StockKlineJob`（从 `job.queue` 消费到 done）。
+- task_payload:
 `{"event":"data","task":{...},"rows":[...],"error":str|None,"worker_pid":int}`。
   > 示例：
   >
@@ -394,8 +378,7 @@ finally:
   >  "rows": [{"code": "sh.600000", "freq": "d", "open": 10.07, "close": 10.06, "high": 10.25, "low": 10.03, "volume": 105771232, "amount": 1072786048, "datetime": "2026-02-02 15:00:00"}],
   >  "error": null, "worker_pid": 7200}
   > ```
-- 队列最终会额外推送 done 事件:
-`{"event":"done","total_tasks":...,"success_tasks":...,"failed_tasks":...}`。
+- done: `{"event":"done","total_tasks":...,"success_tasks":...,"failed_tasks":...}`。
 
 
 
@@ -405,53 +388,112 @@ finally:
 
 **调用前置约定:**
 
-- `mode="sync"`：走 `ParallelFetcher` 的主进程 inproc chunk 路径；若当前已进入 `with get_client():`，其它主进程 API 仍可继续复用该上下文连接。
-- `mode="async"`：走 `ParallelFetcher` 的进程池 chunk 路径，worker 会独立创建并复用自己的连接，不依赖 with 上下文。
+- sync/async 均不要求前置 `with get_client()`；无 with 时名称路由解析会临时建连。
+- 抓取连接由并行层常驻 client 管理（sync 主进程 inproc；async worker 子进程）。
+- sync 走主进程 inproc chunk；async 走进程池 worker。
 
 **输入:**
 
-- task: 任务列表，元素是 `IndexKlineTask` 或 dict，字段:
-`{index_name, freq, start_time, end_time}`。
-- queue: 可选队列，需支持 `put()`。
-- preprocessor_operator: 可选钩子，签名 `f(payload)->dict|None`（默认数值刻度由协议解析层统一）。
-- mode: `"sync"` 或 `"async"`，默认 `"async"`。
-- start_time/end_time: 规则与 `get_stock_kline` 相同（仅日期时补齐为 09:30:00 / 16:00:00）。
-- task 缺省行为：`mode="async"` 且 `task` 为 `None` 或空列表时，自动构建默认任务（全量指数目录 × 日线 × 近 7 天）；`mode="sync"` 必须显式传入非空 task。
+- task: `IndexKlineTask` 或等价 dict，字段 `{index_name, freq, start_time, end_time}`。
+- queue / preprocessor_operator / mode：与 `get_stock_kline` 相同（空 dict 亦丢弃）。
+- 无 `qfq`。
+- start_time/end_time: 仅日期时补齐 09:30:00 / 16:00:00。
+- task 缺省：async 且 `None`/空列表时自动展开（全量指数 × 日线 × 近 7 天）；sync 必须非空。
 
 **K 线** `datetime` **输出契约:**
 
-- 与 `get_stock_kline` 相同：`YYYY-MM-DD HH:MM:SS`，秒位固定 `:00`。
+- 与 `get_stock_kline` 相同。
 
 **调用示例:**
 
 ```python
-import queue as py_queue
 from zsdtdx import IndexKlineTask, get_index_kline
 
-q = py_queue.Queue()
 result = get_index_kline(
     task=[
         IndexKlineTask(index_name="中证1000", freq="d", start_time="2026-03-01", end_time="2026-03-31"),
         {"index_name": "中证2000", "freq": "60", "start_time": "2026-03-01", "end_time": "2026-03-31"},
     ],
-    queue=q,
     mode="sync",
 )
-print(result)
 ```
 
 **名称匹配与报错:**
 
-- 先做精确匹配（支持别名标准化），例如 `上证综指 -> 上证指数`。
-- 未命中时抛错并返回“名称片段候选”。
-- 路由由后台动态发现：标准行情 `get_security_list`（深沪京）+ 扩展 `get_instrument_info`（中证等）。
-- 抓取失败时，会自动刷新路由后重试一次。
+- 先精确匹配（支持别名，如 `上证综指 -> 上证指数`）。
+- 未命中时抛错并给出名称片段候选。
+- 路由来自标准 `get_security_list` + 扩展 `get_instrument_info`；失败会刷新路由后重试一次。
+
+
+
+#### get_block_names
+
+获取可请求 K 线的「全部板块」指数名称列表（概念、非统计风格、地区、研究行业中类）。
+
+与 `get_stock_concepts` 共用三份命名文件（`infoharbor_block.dat`、`tdxhy.cfg`、`zhb.zip`），但本接口是板块指数名单，不是股票归属。与 `get_block_kline` 共用 6 小时本地缓存。
+
+**调用前置约定:**
+
+- 请先进入 `with get_client():`；
+
+**输出:**
+
+- 板块名称列表，不含指数代码；可直接作为 `get_block_kline` 的 `block_name`。
+
+**调用示例:**
+
+```python
+from zsdtdx import get_client, get_block_names
+
+with get_client():
+    names = get_block_names()
+```
+
+
+
+#### get_block_kline
+
+获取板块指数 K 线（按板块名称，支持 sync/async）。
+
+**调用前置约定:**
+
+- sync/async 均不要求前置 `with get_client()`；无 with 时名称解析会临时建连。
+- 抓取连接由并行层常驻 client 管理（与 `get_stock_kline` 相同）。
+- 必须显式传入非空 task；不会自动拉全部板块。
+- `block_name` 使用 `get_block_names` 的返回值；与其共用 6 小时文件缓存。
+
+**输入:**
+
+- task: `BlockKlineTask` 或等价 dict，字段 `{block_name, freq, start_time, end_time}`。
+- queue / preprocessor_operator / mode：与 `get_index_kline` 相同。
+- 无 `qfq`。底层命令为板块指数 `0x0523`；回包 OHLC 为绝对价（与个股/指数 `0x052D` 差分不同）。
+
+**调用示例:**
+
+```python
+from zsdtdx import BlockKlineTask, get_block_kline, get_block_names, get_client
+
+with get_client():
+    names = get_block_names()
+
+result = get_block_kline(
+    task=[
+        BlockKlineTask(block_name=names[0], freq="d", start_time="2026-03-01", end_time="2026-03-31"),
+    ],
+    mode="sync",
+)
+```
+
+**返回:**
+
+- sync: `list[task_payload]`；async: `StockKlineJob`。
+- rows 含 `block_name/freq/open/close/high/low/volume/amount/datetime`。
 
 
 
 #### （一般无需手动调用）prewarm_parallel_fetcher
 
-手动预热 async 并行抓取进程池。预热只拉起 worker 进程，不建立 std/ex 行情连接；实际连接由 route-homogeneous bundle 按任务侧懒建。预热超时固定 60 秒、最多 3 轮，不从 YAML 读取。
+手动预热 async 并行抓取进程池。仅拉起 worker，不建 std/ex 业务连接。默认不要求全部 worker 成功；超时 60 秒、最多 3 轮，不读 YAML。首次 async 任务会自动预热，一般不必手动调用。
 
 **输出:**
 
@@ -459,12 +501,12 @@ print(result)
 
 **什么时候调用:**
 
-- 服务启动阶段：希望把 async 首次冷启动成本前移。
-- 压测/批跑前：希望先完成 Windows spawn 与模块加载成本。
+- 服务启动或压测前，希望把冷启动成本前移。
 
 **边界条件:**
 
-- `require_all_workers=True` 时只校验目标 worker 进程是否已启动，不再要求 std/ex 同时建连成功。
+- 只校验目标 worker 是否已启动，不要求 std/ex 同时建连。
+- 仅当 `require_all_workers=True` 且预热不足时抛 RuntimeError；默认 False，不足只记入摘要。
 
 
 
@@ -519,23 +561,22 @@ print(result)
 
 #### get_future_kline
 
-获取商品期货 K 线（支持多周期并行获取，返回合并后的 DataFrame）。
+获取商品期货 K 线（多周期批处理，返回合并 DataFrame）。
 
 **调用前置约定:**
 
-- 请先进入 `with get_client():`；
+- 建议 `with get_client():` 以便同块调用其它主进程 API。
+- 进程数 > 1 时 worker 并行（不占用主进程连接）；≤ 1 时串行并可复用 with 内连接。
+- 与 `get_stock_kline` 的 task 路径不同。
 
 **输入:**
 
-- codes: 期货代码，支持 str/list/tuple/set；纯品种代码按码表名称含「主连」的合约补全（如 `AL` -> `ALL8`，`CU` -> `CUL8`）。
-为空时获取全部商品期货。带 3~4 位合约月份或 `L7/L8/L9` 连续合约原样查询（如 `CU2603`、`CUL9` 加权）。
-该品种码表中无主连时抛错。
+- codes: 期货代码，支持 str/list/tuple/set；纯品种按码表「主连」补全（如 `AL` -> `ALL8`）。
+为空时获取全部商品期货。带合约月或 `L7/L8/L9` 原样查询；无主连时抛错。
 - freq: 周期，支持 str 或列表，如 `"d"` / `["d", "60", "30"]`。
 支持周期: d/w/m/60min/30min/15min/5min 与 60/30/15/5。
-- start_time/end_time: 支持字符串/date/datetime，底层过滤按闭区间 `[start_time, end_time]` 执行。
-若传入不带时分秒的日期字符串，自动补齐为 start=09:00:00、end=15:00:00。
-例如 `2026-02-13` 等价于 `start_time="2026-02-13 09:00:00"`、`end_time="2026-02-13 15:00:00"`。
-- 期货无复权，不提供 `qfq`。
+- start_time/end_time: 闭区间；仅日期时补齐 09:00:00 / 15:00:00。
+- 无 `qfq`。
 
 **调用示例:**
 
@@ -543,21 +584,18 @@ print(result)
 from zsdtdx import get_client, get_future_kline
 
 with get_client():
-    # 获取多个期货、多个周期的数据，返回一个合并 DataFrame
     df = get_future_kline(
-        codes=["CU", "AL"], 
+        codes=["CU", "AL"],
         freq=["d", "60"],
-        start_time="2026-02-01", 
-        end_time="2026-02-13"
+        start_time="2026-02-01",
+        end_time="2026-02-13",
     )
-    # df 已按统一字段规范输出，可直接过滤 code/freq 继续处理
-    print(df)
 ```
 
 **返回:**
 
-- pd.DataFrame: 包含所有获取的数据，字段:
-code, freq, open, close, high, low, settlement_price, volume, datetime
+- DataFrame 字段: code, freq, open, close, high, low, settlement_price, volume, datetime
+- 大批量建议自行分批；无成交数据可能为空。
 
 
 
@@ -881,7 +919,8 @@ market_rules:
 
 stock_scope:
   # 当股票接口不传 codes（即 codes=None）时，默认抓取范围。
-  # 作用对象: get_stock_code_name / get_stock_latest_price / get_stock_kline
+  # 作用对象: get_stock_code_name / get_stock_latest_price；
+  # 以及客户端批路径 get_stock_kline(codes=None)。simple_api 任务化 get_stock_kline 必须显式传 task.code，不受本段影响。
   defaults_when_codes_none:
     # 取值支持:
     # - szsh: 标准市场（深圳+上海）

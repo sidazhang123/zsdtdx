@@ -1,39 +1,41 @@
 # zsdtdx 交接文档（工程维护）
 
-更新时间：2026-09-22
+更新时间：2026-09-29
 
 ## 1. 接管基线
 
-1. 对外入口：`src/zsdtdx/simple_api.py` 的 `get_*` 系列函数。
+1. 对外入口：`src/zsdtdx/simple_api.py` 的 `get_*` 系列函数；K 线任务类在 `src/zsdtdx/kline_task.py`。
 2. 推荐调用方式：`with get_client() as client:` 中复用同一上下文。
-3. 并行核心：`src/zsdtdx/parallel_fetcher.py`；父进程准入在 `src/zsdtdx/adaptive_scheduler.py`。
-4. 数据封装核心：`src/zsdtdx/unified_client.py`。
-5. 配置入口：`src/zsdtdx/config.yaml`。
+3. 并行核心：`src/zsdtdx/engine/parallel_fetcher.py`；父进程准入在 `src/zsdtdx/engine/adaptive_scheduler.py`。
+4. 数据封装核心：`src/zsdtdx/engine/unified_client.py`。
+5. 配置入口：`src/zsdtdx/config.yaml`；协议/域常量在 `src/zsdtdx/params.py`；内部地基在 `src/zsdtdx/util/`（errors/helper/log）。
 
 ## 2. 分层结构
 
-1. API 层：`simple_api.py`
-2. 并行层：`parallel_fetcher.py`、`adaptive_scheduler.py`
-3. 封装层：`unified_client.py`
-4. 协议层：`parser/*.py`
-5. 网络层：`base_socket_client.py`
+1. API 层：`simple_api.py`、`kline_task.py`
+2. 业务门面：`biz/`（股票/指数/板块/期货 K 线、公司信息）
+3. 并行与客户端：`engine/parallel_fetcher.py`、`engine/adaptive_scheduler.py`、`engine/unified_client.py`
+4. 协议解析：`parser/*.py`
+5. 网络层：`net/base_socket_client.py`、`net/hq.py`、`net/exhq.py`
+6. 磁盘缓存：`cache/catalog_disk_cache.py`、`cache/block_file_cache.py`
+7. 内部地基：`util/errors.py`、`util/helper.py`、`util/log.py`
 
 ## 3. 术语定义
 
-1. `task`：单个 K 线请求，股票任务字段 `{code,freq,start_time,end_time}`，指数任务字段 `{index_name,freq,start_time,end_time}`。
-2. `chunk`：同 `code+freq` 的 task 集合，按 `start_time` 升序执行。
+1. `task`：单个 K 线请求，股票任务字段 `{code,freq,start_time,end_time}`，指数任务字段 `{index_name,freq,start_time,end_time}`，板块任务字段 `{block_name,freq,start_time,end_time}`。
+2. `chunk`：同 `code+freq`（或指数/板块对应键）的 task 集合，按 `start_time` 升序执行。
 3. `bundle`：提交给单个进程池 future 的 chunk 批次。
 4. `inproc 协程`：worker/主进程内的 chunk 协程并发。上限写死为 3，不读 YAML。
 
 ## 4. 关键调用链
 
 1. 用户调用 `simple_api.get_stock_kline(task, mode=...)`。
-2. `parallel_fetcher` 将 task 分组为 chunk，并构建 bundle。
+2. `biz/stock_kline` 校验后交给 `engine/parallel_fetcher`，将 task 分组为 chunk 并构建 bundle。
 3. async 模式下，父进程通过 `ProcessPoolExecutor.submit(_fetch_chunk_bundle, ...)` 派发 bundle。
 4. worker 进程内通过 `asyncio` 协程 + `to_thread` 并发执行 chunk（`Semaphore` 上限写死为 3）。K 线进程按行情站拆池：进程创建时绑定自家站，该站的任务只进入这些进程；连接还在自家站上时不因下一批任务断开。
 5. chunk 内通过 `unified_client.get_stock_kline_rows_for_chunk_tasks(...)` 拉取并复用缓存。
 6. 主进程按 bundle 完成顺序归集结果并写入队列，最终追加 `event=done`。
-7. 指数入口 `simple_api.get_index_kline(task, mode=...)` 现已接入 `ParallelFetcher`：sync 走主进程 inproc chunk，async 走进程池 bundle + worker chunk；chunk 内按 `(index_name, freq)` 分组后顺序调用 `unified_client.get_index_kline_rows_for_chunk_tasks(...)`。
+7. 指数入口 `simple_api.get_index_kline(task, mode=...)` 经 `biz/index_kline` 接入同一并行层：sync 走主进程 inproc chunk，async 走进程池 bundle + worker chunk；chunk 内按 `(index_name, freq)` 分组后顺序调用 `unified_client.get_index_kline_rows_for_chunk_tasks(...)`。
 
 ## 5. sync/async 当前语义
 
@@ -72,7 +74,7 @@
 
 ## 9. 建议回归清单
 
-1. 离线单元/验收：`py -m pytest tests/ -q`（不收集 `tests/manual/`，不依赖真实行情网络）。
+1. 离线单元/验收：`py -m pytest tests/ -q`（不收集 `tests/manual/`，不依赖真实行情网络；当前约 273 用例）。
 2. 手工脚本清单与命令见 `tests/manual/README.md`（冒烟、单点探测、chunk/弱网离线单测）。
 3. 队列保障：async 消费端用 `timeout=20s` 验证连续返回与 done 收敛。
 

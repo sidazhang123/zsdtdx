@@ -21,7 +21,7 @@ import struct
 import numpy as np
 import six
 
-from zsdtdx.helper import format_socket_kline_page_inplace, get_datetime
+from zsdtdx.util.helper import format_socket_kline_page_inplace, get_datetime
 from zsdtdx.parser.base import BaseParser
 
 # 首包 cmd=0xD808，翻页 cmd=0xD908；inner 固定 0x2489。

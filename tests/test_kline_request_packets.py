@@ -83,7 +83,7 @@ def test_security_and_index_cmds_share_official_layout():
 
 def test_unified_daily_category_is_official_four():
     """输入：高层频率 d；输出：官方日线 category=4。"""
-    from zsdtdx.unified_client import UnifiedTdxClient
+    from zsdtdx.engine.unified_client import UnifiedTdxClient
 
     assert UnifiedTdxClient.PERIOD_MAP["d"] == 4
 
@@ -104,7 +104,7 @@ def test_pack_standard_kline_request_count_800_first_page():
 def test_default_standard_kline_page_size_is_800():
     """输入：协议常量与客户端缺省；输出：标准 K 线单页 800。"""
     from zsdtdx.params import TDXParams
-    from zsdtdx.unified_client import UnifiedTdxClient
+    from zsdtdx.engine.unified_client import UnifiedTdxClient
 
     assert TDXParams.MAX_KLINE_COUNT == 800
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)

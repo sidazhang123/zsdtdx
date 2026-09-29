@@ -167,13 +167,13 @@ def case_supported_markets() -> Dict[str, Any]:
     """
     输入：无。
     输出：市场数量与必要市场是否齐全。
-    用途：验收 get_supported_markets 解析 market/name/source。
+    用途：验收 UnifiedTdxClient.get_supported_markets 解析 market/name/source。
     边界：必须同时有标准与扩展市场。
     """
-    from zsdtdx import get_client, get_supported_markets
+    from zsdtdx import get_client
 
-    with get_client():
-        rows = get_supported_markets(return_df=False)
+    with get_client() as client:
+        rows = client.get_supported_markets(return_df=False)
     _require(isinstance(rows, list) and rows, "市场列表为空")
     names = {str(r.get("name", "")).strip() for r in rows}
     sources = {str(r.get("source", "")).strip() for r in rows}

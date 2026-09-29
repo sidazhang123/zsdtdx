@@ -116,7 +116,8 @@ market_rules:
 
 stock_scope:
   # 当股票接口不传 codes（即 codes=None）时，默认抓取范围。
-  # 作用对象: get_stock_code_name / get_stock_latest_price / get_stock_kline
+  # 作用对象: get_stock_code_name / get_stock_latest_price；
+  # 以及客户端批路径 get_stock_kline(codes=None)。simple_api 任务化 get_stock_kline 必须显式传 task.code，不受本段影响。
   defaults_when_codes_none:
     # 取值支持:
     # - szsh: 标准市场（深圳+上海）

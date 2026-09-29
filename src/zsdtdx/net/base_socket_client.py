@@ -24,8 +24,8 @@ import time
 
 import pandas as pd
 
-from zsdtdx.errors import TdxConnectionError, TdxFunctionCallError
-from zsdtdx.log import log
+from zsdtdx.util.errors import TdxConnectionError, TdxFunctionCallError
+from zsdtdx.util.log import log
 from zsdtdx.parser.raw_parser import RawParser
 
 # 连接超时（秒）

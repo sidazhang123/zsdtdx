@@ -102,7 +102,7 @@ def _is_ashare_stock(code: str, name: str) -> bool:
 
 def _connect_first(hosts: Sequence[Tuple[str, int]]):
     """依次探测直到连上第一台可用 std host。"""
-    from zsdtdx.hq import TdxHq_API
+    from zsdtdx.net.hq import TdxHq_API
 
     last_err = "no_hosts"
     for host, port in hosts:
@@ -243,7 +243,7 @@ def _fetch_one_host(
     times: Set[str],
 ) -> Dict[str, Any]:
     """单站拉取全部样本股票最近一页 15 分钟 K 线并裁剪到目标时间点。"""
-    from zsdtdx.hq import TdxHq_API
+    from zsdtdx.net.hq import TdxHq_API
 
     endpoint = f"{host}:{port}"
     api = TdxHq_API(raise_exception=False)

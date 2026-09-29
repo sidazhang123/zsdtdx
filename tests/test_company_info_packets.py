@@ -11,7 +11,7 @@ from zsdtdx.parser.get_company_info_content import (
     COMPANY_INFO_CONTENT_PAGE_SIZE,
     GetCompanyInfoContent,
 )
-from zsdtdx.unified_client import UnifiedTdxClient
+from zsdtdx.engine.unified_client import UnifiedTdxClient
 
 
 def _attach_pinned_pool(client, fake_call, hosts=None):
@@ -603,7 +603,7 @@ def test_company_info_raises_when_every_host_fails():
 
 def test_fetch_company_info_parallel_payload_forwards_category(monkeypatch):
     """输入：带 category 的并行请求；输出：worker payload 含同一 category，非整表默认全分类。"""
-    from zsdtdx import parallel_fetcher as pf
+    from zsdtdx.engine import parallel_fetcher as pf
 
     captured: list[dict] = []
 

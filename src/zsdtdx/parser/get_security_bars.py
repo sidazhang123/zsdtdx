@@ -27,21 +27,23 @@ _KLINE_TAIL_PAD = bytes(16)
 
 
 def pack_standard_kline_request(
-    category, market, code, start, count, qfq=True
+    category, market, code, start, count, qfq=True, command=0x052D
 ) -> bytearray:
     """
-    组装标准行情 0x052D K 线请求（个股与指数共用）。
+    组装标准行情 K 线请求（个股、指数、板块指数同布局）。
 
     输入：
     1. category: K 线周期（1 分钟=7，日线=4）。
     2. market/code/start/count: 市场、代码、分页偏移、本页条数。
     3. qfq: True 为前复权（reserved0=1），False 为不复权（reserved0=0）。
+    4. command: 命令号。个股与指数为 0x052D，板块指数为 0x0523。
     输出：
     1. 54 字节 send_pkg。
     用途：
-    1. GetSecurityBarsCmd / GetIndexBarsCmd 共用组包，避免两处漂移。
+    1. GetSecurityBarsCmd / GetIndexBarsCmd / GetBlockBarsCmd 共用组包。
     边界：
     1. 单页 count 服务端硬上限 800；start==0 与翻页使用不同 inner 字段。
+    2. 缺省 command 为 0x052D，不改变个股与指数请求。
     """
     if type(code) is six.text_type:
         code = code.encode("utf-8")
@@ -53,7 +55,7 @@ def pack_standard_kline_request(
         inner,
         0x2C,
         0x2C,
-        0x052D,
+        int(command),
         int(market),
         code,
         int(category),

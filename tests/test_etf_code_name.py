@@ -10,7 +10,7 @@
 1. 不访问网络；mock 远程名称记录。
 """
 
-from zsdtdx.unified_client import UnifiedTdxClient
+from zsdtdx.engine.unified_client import UnifiedTdxClient
 
 
 def _etf_client() -> UnifiedTdxClient:

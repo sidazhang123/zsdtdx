@@ -18,7 +18,7 @@ from collections import OrderedDict
 
 import six
 
-from zsdtdx.helper import get_datetime, get_volume
+from zsdtdx.util.helper import get_datetime, get_volume
 from zsdtdx.parser.base import BaseParser
 
 XDXR_CATEGORY_MAPPING = {

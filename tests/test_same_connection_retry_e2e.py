@@ -13,7 +13,7 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from zsdtdx.unified_client import PersistentFailoverPool, UnifiedTdxClient
+from zsdtdx.engine.unified_client import PersistentFailoverPool, UnifiedTdxClient
 
 
 def _pool_with_connected_api(
@@ -126,7 +126,7 @@ class TestPoolHostCallLadder(unittest.TestCase):
         api.get_security_bars = MagicMock(side_effect=[None, []])
         pool = _pool_with_connected_api(api)
 
-        with patch("zsdtdx.unified_client.time.sleep") as sleep_mock:
+        with patch("zsdtdx.engine.unified_client.time.sleep") as sleep_mock:
             pool.call(
                 "get_security_bars",
                 4,
@@ -207,7 +207,7 @@ class TestChunkBehaviorUnchangedOnNone(unittest.TestCase):
     def test_persistent_none_does_not_trigger_chunk_recover(self):
         import asyncio
 
-        import zsdtdx.parallel_fetcher as pf
+        import zsdtdx.engine.parallel_fetcher as pf
 
         chunk_payload = {
             "chunk_id": "c1",
@@ -249,7 +249,7 @@ class TestChunkBehaviorUnchangedOnNone(unittest.TestCase):
             new_callable=AsyncMock,
             return_value=stub_report,
         ) as fetch_mock, patch(
-            "zsdtdx.parallel_fetcher._recover_worker_standard_connection_current_thread"
+            "zsdtdx.engine.parallel_fetcher._recover_worker_standard_connection_current_thread"
         ) as recover_mock:
             result = asyncio.run(pf._fetch_one_task_chunk_async(chunk_payload))
 

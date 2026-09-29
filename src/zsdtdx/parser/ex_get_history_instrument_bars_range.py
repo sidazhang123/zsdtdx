@@ -21,7 +21,7 @@ from typing import Any, Dict, List
 
 import numpy as np
 
-from zsdtdx.helper import format_socket_kline_page_inplace
+from zsdtdx.util.helper import format_socket_kline_page_inplace
 from zsdtdx.parser.base import BaseParser
 
 

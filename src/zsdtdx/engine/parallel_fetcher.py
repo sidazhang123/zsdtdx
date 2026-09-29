@@ -1,4 +1,6 @@
 """
+模块：`engine/parallel_fetcher.py`。
+
 并行数据获取模块：使用全局 ProcessPoolExecutor
 
 职责：
@@ -39,12 +41,43 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
-from zsdtdx.adaptive_scheduler import (
+from zsdtdx.engine.adaptive_scheduler import (
     AdaptiveConcurrencyController,
     AdaptivePermit,
 )
-from zsdtdx.helper import parse_future_symbol
-from zsdtdx.unified_client import UnifiedTdxClient
+from zsdtdx.util.helper import parse_future_symbol
+from zsdtdx.params import TDXParams
+from zsdtdx.engine.unified_client import UnifiedTdxClient
+
+
+def _kline_symbol_field(kind: str) -> str:
+    """
+    输入任务种类，输出主键字段名。
+
+    输入：kind 为 stock/index/block。
+    输出：code、index_name 或 block_name。
+    用途：分片与 payload 共用主键。
+    边界条件：未知种类按 code。
+    """
+    key = str(kind or "").strip().lower()
+    if key == "block":
+        return "block_name"
+    if key == "index":
+        return "index_name"
+    return "code"
+
+
+def _is_symbol_kline_kind(kind: str) -> bool:
+    """
+    输入任务种类，输出是否按名称分片。
+
+    输入：kind。
+    输出：指数与板块为 True。
+    用途：这两种任务都按名称加周期分组。
+    边界条件：股票为 False。
+    """
+    return str(kind or "").strip().lower() in {"index", "block"}
+
 
 try:
     import psutil
@@ -108,7 +141,7 @@ def _get_global_adaptive_controller(
     边界：每次调用以当前可达 host 快照刷新地址，但保留未变化 host 的拥塞状态。
     """
     global _global_adaptive_controller
-    from zsdtdx.unified_client import get_probe_result_cache
+    from zsdtdx.engine.unified_client import get_probe_result_cache
 
     with _global_adaptive_controller_lock:
         if _global_adaptive_controller is None:
@@ -386,7 +419,7 @@ def _get_global_process_pool(max_workers: int) -> ProcessPoolExecutor:
 
             import multiprocessing as _mp
 
-            from zsdtdx.unified_client import (
+            from zsdtdx.engine.unified_client import (
                 _normalize_hosts_from_cfg,
                 compute_hosts_fingerprint,
                 get_probe_result_cache,
@@ -398,7 +431,7 @@ def _get_global_process_pool(max_workers: int) -> ProcessPoolExecutor:
             per_host_std = 4
             per_host_ex = 4
             try:
-                from zsdtdx.unified_client import _load_merged_zsdtdx_config
+                from zsdtdx.engine.unified_client import _load_merged_zsdtdx_config
 
                 cfg_for_fp = _load_merged_zsdtdx_config(_active_config_path)
                 std_hosts, ex_hosts = _normalize_hosts_from_cfg(cfg_for_fp)
@@ -666,7 +699,7 @@ def _submit_routed_bundle(
 
 def _side_host_snapshot(source: str) -> List[Tuple[str, int]]:
     """输入 std/ex，输出该侧当前探测地址。"""
-    from zsdtdx.unified_client import get_probe_result_cache
+    from zsdtdx.engine.unified_client import get_probe_result_cache
 
     snapshot = get_probe_result_cache()
     side_key = "standard" if str(source) == "std" else "extended"
@@ -1520,81 +1553,6 @@ def prewarm_parallel_fetcher(
 # 业务逻辑
 # =============================================================================
 
-FUTURE_PATTERNS = {
-    "CU",
-    "AL",
-    "ZN",
-    "PB",
-    "NI",
-    "SN",
-    "AU",
-    "AG",
-    "RB",
-    "HC",
-    "FU",
-    "BU",
-    "RU",
-    "WR",
-    "SS",
-    "SP",
-    "C",
-    "CS",
-    "A",
-    "B",
-    "M",
-    "Y",
-    "P",
-    "FB",
-    "BB",
-    "JD",
-    "L",
-    "V",
-    "PP",
-    "J",
-    "JM",
-    "I",
-    "EG",
-    "EB",
-    "PG",
-    "LH",
-    "RR",
-    "SR",
-    "CF",
-    "RI",
-    "OI",
-    "WH",
-    "PM",
-    "FG",
-    "RS",
-    "RM",
-    "JR",
-    "LR",
-    "SF",
-    "SM",
-    "TA",
-    "MA",
-    "ZC",
-    "CY",
-    "AP",
-    "CJ",
-    "UR",
-    "SA",
-    "PF",
-    "PK",
-    "SC",
-    "NR",
-    "LU",
-    "BC",
-    "EC",
-    "IF",
-    "IC",
-    "IH",
-    "TF",
-    "T",
-    "TS",
-    "IM",
-}
-
 
 def _init_worker(
     config_path: Optional[str] = None,
@@ -1620,7 +1578,7 @@ def _init_worker(
     """
     global _active_config_path, _worker_sorted_hosts
 
-    from zsdtdx.unified_client import _seed_probe_result_cache_from_snapshot
+    from zsdtdx.engine.unified_client import _seed_probe_result_cache_from_snapshot
 
     if config_path is not None:
         _active_config_path = config_path
@@ -1684,7 +1642,7 @@ def is_future_code(code: str) -> bool:
     边界条件：
     1. 空值返回 False。
     2. `CUL8`/`ALL8` 等 L+数字连续合约视为期货，不把 `L` 并进品种字母。
-    3. 带 3~4 位合约月份的代码（如 `CU2603`）按品种前缀匹配 `FUTURE_PATTERNS`。
+    3. 带 3~4 位合约月份的代码（如 `CU2603`）按品种前缀匹配 `TDXParams.FUTURE_PATTERNS`。
     4. 纯品种代码（如 `CU`、`L-F`）按品种名匹配；带连字符的品种视为期货。
     """
     if not code:
@@ -1697,7 +1655,9 @@ def is_future_code(code: str) -> bool:
     if kind == "variety" and "-" in variety:
         return True
     compact = variety.replace("-", "")
-    return variety in FUTURE_PATTERNS or compact in FUTURE_PATTERNS
+    return (
+        variety in TDXParams.FUTURE_PATTERNS or compact in TDXParams.FUTURE_PATTERNS
+    )
 
 
 def get_optimal_process_count(core_multiplier: float = 1.5) -> int:
@@ -1918,26 +1878,34 @@ def _normalize_task_payload(task: Dict[str, Any]) -> Dict[str, str]:
 
 
 def _normalize_index_task_payload(task: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    标准化指数 task 字段，确保进程间传输结构稳定。
+    """输入指数任务，输出标准化字典。边界：缺 index_name 时抛 ValueError。"""
+    return _normalize_symbol_kline_task(task, "index_name")
 
-    输入：
-    1. task: 任务字典，需包含 index_name/freq/start_time/end_time。
-    输出：
-    1. 标准化后的指数任务字典（全部字符串字段）。
-    用途：
-    1. 统一指数 sync/async、串行/并行路径的任务结构。
-    边界条件：
-    1. 缺失必填字段时抛 ValueError。
+
+def _normalize_block_task_payload(task: Dict[str, Any]) -> Dict[str, Any]:
+    """输入板块任务，输出标准化字典。边界：缺 block_name 时抛 ValueError。"""
+    return _normalize_symbol_kline_task(task, "block_name")
+
+
+def _normalize_symbol_kline_task(
+    task: Dict[str, Any], symbol_field: str
+) -> Dict[str, Any]:
+    """
+    输入名称类 K 线任务，输出可跨进程传递的字典。
+
+    输入：task 含 symbol_field、freq、start_time、end_time，可带路由字段。
+    输出：标准化任务字典。
+    用途：指数与板块共用字段整理。
+    边界条件：名称或时间为空时抛 ValueError。
     """
     if not isinstance(task, dict):
         raise ValueError("task 必须是 dict")
-    index_name = str(task.get("index_name", "")).strip()
+    symbol = str(task.get(symbol_field, "")).strip()
     freq = str(task.get("freq", "")).strip().lower()
     start_time = str(task.get("start_time", "")).strip()
     end_time = str(task.get("end_time", "")).strip()
-    if index_name == "":
-        raise ValueError("task.index_name 不能为空")
+    if symbol == "":
+        raise ValueError(f"task.{symbol_field} 不能为空")
     if freq == "":
         raise ValueError("task.freq 不能为空")
     if start_time == "":
@@ -1945,7 +1913,7 @@ def _normalize_index_task_payload(task: Dict[str, Any]) -> Dict[str, Any]:
     if end_time == "":
         raise ValueError("task.end_time 不能为空")
     normalized: Dict[str, Any] = {
-        "index_name": index_name,
+        symbol_field: symbol,
         "freq": freq,
         "start_time": start_time,
         "end_time": end_time,
@@ -2056,6 +2024,14 @@ def _build_task_payload_for_kind(
             error=error,
             worker_pid=worker_pid,
         )
+    if kind == "block":
+        return _build_symbol_kline_payload(
+            "block_name",
+            task=task,
+            rows=rows,
+            error=error,
+            worker_pid=worker_pid,
+        )
     return _build_task_payload(
         task=task,
         rows=rows,
@@ -2086,10 +2062,31 @@ def _build_index_task_payload(
     边界条件：
     1. rows 为空时输出空列表，不返回 None。
     """
+    return _build_symbol_kline_payload(
+        "index_name", task=task, rows=rows, error=error, worker_pid=worker_pid
+    )
+
+
+def _build_symbol_kline_payload(
+    symbol_field: str,
+    *,
+    task: Dict[str, Any],
+    rows: Optional[List[Dict[str, Any]]] = None,
+    error: Optional[str] = None,
+    worker_pid: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    输入主键字段与任务结果，输出事件 payload。
+
+    输入：symbol_field 为 index_name 或 block_name。
+    输出：event=data 的字典。
+    用途：指数与板块共用出口，不再互相改写字段。
+    边界条件：rows 为空时输出空列表。
+    """
     return {
         "event": "data",
         "task": {
-            "index_name": str(task.get("index_name", "")),
+            symbol_field: str(task.get(symbol_field, "")),
             "freq": str(task.get("freq", "")),
             "start_time": str(task.get("start_time", "")),
             "end_time": str(task.get("end_time", "")),
@@ -2119,6 +2116,16 @@ def _chunk_task_kind_profile(task_kind: str) -> Dict[str, Any]:
             "normalize_item": _normalize_index_task_payload,
             "build_payload": _build_index_task_payload,
             "log_tag": "index chunk",
+        }
+    if kind == "block":
+        return {
+            "kind": "block",
+            "symbol_field": "block_name",
+            "normalize_item": _normalize_block_task_payload,
+            "build_payload": lambda **kwargs: _build_symbol_kline_payload(
+                "block_name", **kwargs
+            ),
+            "log_tag": "block chunk",
         }
     return {
         "kind": "stock",
@@ -2269,7 +2276,12 @@ def _fetch_one_chunk_fetch_attempt(prep: Dict[str, Any]) -> Dict[str, Any]:
         client_context, attempt_deadline, target=route_source
     )
     try:
-        if task_kind == "index":
+        if task_kind == "block":
+            chunk_result = client_context.get_block_kline_rows_for_chunk_tasks(
+                tasks=normalized_tasks,
+                enable_cache=enable_cache,
+            )
+        elif task_kind == "index":
             chunk_result = client_context.get_index_kline_rows_for_chunk_tasks(
                 tasks=normalized_tasks,
                 enable_cache=enable_cache,
@@ -2494,7 +2506,7 @@ def _submit_attempt_call(
     用途：让单次尝试和重连都能在超时时关闭自己的 socket。
     边界：调用方负责在超时后 closer.close()，并 shutdown executor 且不等待线程。
     """
-    from zsdtdx.unified_client import AttemptSocketCloser, _attempt_socket_closer
+    from zsdtdx.engine.unified_client import AttemptSocketCloser, _attempt_socket_closer
 
     closer = AttemptSocketCloser()
 
@@ -3362,7 +3374,7 @@ class ParallelKlineFetcher:
         用途：与 UnifiedTdxClient、set_config_path 共用 _resolve_zsdtdx_config_path 规则。
         边界条件：文件不存在时由 _resolve_zsdtdx_config_path 抛出 FileNotFoundError。
         """
-        from zsdtdx.unified_client import _resolve_zsdtdx_config_path
+        from zsdtdx.engine.unified_client import _resolve_zsdtdx_config_path
 
         if self.config_path:
             return _resolve_zsdtdx_config_path(self.config_path)
@@ -3380,7 +3392,7 @@ class ParallelKlineFetcher:
         用户文件与内置深合并（未知键丢弃、列表整段替换）。
         """
         try:
-            from zsdtdx.unified_client import _load_merged_zsdtdx_config
+            from zsdtdx.engine.unified_client import _load_merged_zsdtdx_config
 
             resolved = self._resolve_fetcher_config_path()
             self.config_path = str(resolved)
@@ -3668,9 +3680,11 @@ class ParallelKlineFetcher:
         """
         kind = str(task_kind or "stock").strip().lower()
         build_chunks = (
-            self._build_index_task_chunks
-            if kind == "index"
-            else self._build_task_chunks
+            self._build_task_chunks
+            if kind == "stock"
+            else lambda items: self._build_grouped_task_chunks(
+                items, group_key=_kline_symbol_field(kind)
+            )
         )
         task_list = list(tasks or [])
         if not task_list:
@@ -3858,9 +3872,11 @@ class ParallelKlineFetcher:
         """
         kind = str(task_kind or "stock").strip().lower()
         build_chunks = (
-            self._build_index_task_chunks
-            if kind == "index"
-            else self._build_task_chunks
+            self._build_task_chunks
+            if kind == "stock"
+            else lambda items: self._build_grouped_task_chunks(
+                items, group_key=_kline_symbol_field(kind)
+            )
         )
         task_list = list(tasks or [])
         if not task_list:
@@ -3875,7 +3891,7 @@ class ParallelKlineFetcher:
                 "standard" if str(chunk.route_source) == "std" else "extended"
                 for chunk in chunks
             }
-            from zsdtdx.unified_client import _ensure_availability_hosts_cache
+            from zsdtdx.engine.unified_client import _ensure_availability_hosts_cache
 
             _ensure_availability_hosts_cache(
                 config_path=getattr(self, "config_path", None),
@@ -4336,7 +4352,11 @@ class ParallelKlineFetcher:
         kind = str(task_kind or "stock").strip().lower()
         normalize_item = _chunk_task_kind_profile(kind)["normalize_item"]
         sync_log_label = (
-            "主进程指数 chunk 执行模式" if kind == "index" else "主进程 chunk 执行模式"
+            "主进程板块 chunk 执行模式"
+            if kind == "block"
+            else "主进程指数 chunk 执行模式"
+            if kind == "index"
+            else "主进程 chunk 执行模式"
         )
 
         self._validate_queue(queue)
@@ -4433,6 +4453,31 @@ class ParallelKlineFetcher:
             qfq=bool(qfq),
         )
 
+    def fetch_block_tasks_sync(
+        self,
+        *,
+        tasks: List[Dict[str, Any]],
+        queue: Optional[Any] = None,
+        preprocessor_operator: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        输入板块任务，输出同步结果列表。
+
+        输入：tasks 含 block_name 与路由。
+        输出：payload 列表。
+        用途：板块 K 线 sync 入口。
+        边界条件：空任务返回空列表并发送 done。
+        """
+        return self._fetch_tasks_sync(
+            task_kind="block",
+            tasks=tasks,
+            queue=queue,
+            preprocessor_operator=preprocessor_operator,
+            qfq=False,
+        )
+
     def _fetch_tasks_async(
         self,
         *,
@@ -4454,10 +4499,16 @@ class ParallelKlineFetcher:
         kind = str(task_kind or "stock").strip().lower()
         normalize_item = _chunk_task_kind_profile(kind)["normalize_item"]
         async_log_label = (
-            "进程池指数 chunk 执行模式" if kind == "index" else "进程池 chunk 执行模式"
+            "进程池板块 chunk 执行模式"
+            if kind == "block"
+            else "进程池指数 chunk 执行模式"
+            if kind == "index"
+            else "进程池 chunk 执行模式"
         )
         thread_prefix = (
-            "zsdtdx_index_kline_async"
+            "zsdtdx_block_kline_async"
+            if kind == "block"
+            else "zsdtdx_index_kline_async"
             if kind == "index"
             else "zsdtdx_stock_kline_async"
         )
@@ -4465,7 +4516,7 @@ class ParallelKlineFetcher:
         self._validate_queue(queue)
         normalized_tasks = [normalize_item(item) for item in list(tasks or [])]
         total_tasks = int(len(normalized_tasks))
-        symbol_field = "index_name" if kind == "index" else "code"
+        symbol_field = _kline_symbol_field(kind)
         unique_chunks = {
             (
                 str(item.get("_route_source", "")).strip().lower(),
@@ -4594,6 +4645,31 @@ class ParallelKlineFetcher:
             queue=queue,
             preprocessor_operator=preprocessor_operator,
             qfq=bool(qfq),
+        )
+
+    def fetch_block_tasks_async(
+        self,
+        *,
+        tasks: List[Dict[str, Any]],
+        queue: Optional[Any] = None,
+        preprocessor_operator: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
+    ) -> StockKlineJob:
+        """
+        输入板块任务，输出异步句柄。
+
+        输入：tasks 含 block_name 与路由。
+        输出：StockKlineJob。
+        用途：板块 K 线 async 入口。
+        边界条件：异常由 job.result() 暴露。
+        """
+        return self._fetch_tasks_async(
+            task_kind="block",
+            tasks=tasks,
+            queue=queue,
+            preprocessor_operator=preprocessor_operator,
+            qfq=False,
         )
 
     def fetch_stock(

@@ -46,7 +46,7 @@ class TestChunkLocalRowCache:
     """
 
     def _new_cache(self):
-        from zsdtdx.unified_client import ChunkLocalRowCache
+        from zsdtdx.engine.unified_client import ChunkLocalRowCache
 
         return ChunkLocalRowCache()
 
@@ -97,7 +97,7 @@ class TestChunkLocalRowCache:
 
     def test_shared_chunk_cache_alias(self):
         """SharedChunkCache 仍可作为兼容别名引用（外部测试与遗留代码可继续用）。"""
-        from zsdtdx.unified_client import ChunkLocalRowCache, SharedChunkCache
+        from zsdtdx.engine.unified_client import ChunkLocalRowCache, SharedChunkCache
 
         assert SharedChunkCache is ChunkLocalRowCache
 
@@ -128,7 +128,7 @@ class TestRecoverWorkerPoolsTarget:
 
     def test_target_std_skips_ex(self, monkeypatch):
         """target="std" 时不触碰 ex pool；std 走真正的恢复路径。"""
-        import zsdtdx.parallel_fetcher as pf
+        import zsdtdx.engine.parallel_fetcher as pf
 
         std_calls: List[str] = []
 
@@ -164,7 +164,7 @@ class TestRecoverWorkerPoolsTarget:
 
     def test_target_ex_skips_std(self, monkeypatch):
         """target="ex" 时不触碰 std；ex 走真正的恢复路径。"""
-        import zsdtdx.parallel_fetcher as pf
+        import zsdtdx.engine.parallel_fetcher as pf
 
         std_called = {"n": 0}
 
@@ -192,7 +192,7 @@ class TestRecoverWorkerPoolsTarget:
 
     def test_target_both_runs_both_sides(self, monkeypatch):
         """target="both"（默认）触发 std + ex 同时重置。"""
-        import zsdtdx.parallel_fetcher as pf
+        import zsdtdx.engine.parallel_fetcher as pf
 
         std_called = {"n": 0}
 
@@ -219,7 +219,7 @@ class TestRecoverWorkerPoolsTarget:
 
     def test_invalid_target_falls_back_to_both(self, monkeypatch):
         """非法 target 值退化为 both。"""
-        import zsdtdx.parallel_fetcher as pf
+        import zsdtdx.engine.parallel_fetcher as pf
 
         monkeypatch.setattr(
             pf,
@@ -246,7 +246,7 @@ class TestInferRecoverTargetFromChunk:
     """
 
     def test_stock_chunk_returns_std(self):
-        from zsdtdx.parallel_fetcher import _infer_recover_target_from_chunk
+        from zsdtdx.engine.parallel_fetcher import _infer_recover_target_from_chunk
 
         prep = {
             "task_kind": "stock",
@@ -255,7 +255,7 @@ class TestInferRecoverTargetFromChunk:
         assert _infer_recover_target_from_chunk(prep) == "std"
 
     def test_index_chunk_all_std_source(self):
-        from zsdtdx.parallel_fetcher import _infer_recover_target_from_chunk
+        from zsdtdx.engine.parallel_fetcher import _infer_recover_target_from_chunk
 
         prep = {
             "task_kind": "index",
@@ -267,7 +267,7 @@ class TestInferRecoverTargetFromChunk:
         assert _infer_recover_target_from_chunk(prep) == "std"
 
     def test_index_chunk_all_ex_source(self):
-        from zsdtdx.parallel_fetcher import _infer_recover_target_from_chunk
+        from zsdtdx.engine.parallel_fetcher import _infer_recover_target_from_chunk
 
         prep = {
             "task_kind": "index",
@@ -276,7 +276,7 @@ class TestInferRecoverTargetFromChunk:
         assert _infer_recover_target_from_chunk(prep) == "ex"
 
     def test_index_chunk_mixed_falls_back_to_both(self):
-        from zsdtdx.parallel_fetcher import _infer_recover_target_from_chunk
+        from zsdtdx.engine.parallel_fetcher import _infer_recover_target_from_chunk
 
         prep = {
             "task_kind": "index",
@@ -289,7 +289,7 @@ class TestInferRecoverTargetFromChunk:
 
     def test_unknown_task_kind_falls_back_to_both(self):
         """非 stock/index 的 task_kind 退化为 both；空 dict 等价于 task_kind="stock"（代码默认值）。"""
-        from zsdtdx.parallel_fetcher import _infer_recover_target_from_chunk
+        from zsdtdx.engine.parallel_fetcher import _infer_recover_target_from_chunk
 
         assert _infer_recover_target_from_chunk({"task_kind": "future"}) == "both"
         # 空 dict 默认 task_kind="stock" → "std"（与函数签名默认值一致）。
@@ -318,7 +318,7 @@ class TestLogChunkRetryNoSecondRecover:
 
     def test_connection_unavailable_only_logs(self, monkeypatch):
         """连接不可用关键字命中时只记 log，不调 _recover_*。"""
-        import zsdtdx.parallel_fetcher as pf
+        import zsdtdx.engine.parallel_fetcher as pf
 
         recover_calls = {"n": 0}
         monkeypatch.setattr(
@@ -348,7 +348,7 @@ class TestLogChunkRetryNoSecondRecover:
 
     def test_generic_error_only_logs(self, monkeypatch):
         """普通异常（非连接不可用）也只记 log。"""
-        import zsdtdx.parallel_fetcher as pf
+        import zsdtdx.engine.parallel_fetcher as pf
 
         recover_calls = {"n": 0}
         monkeypatch.setattr(
@@ -389,7 +389,7 @@ class TestFetchChunkBundleAsyncSchema:
     def test_empty_chunks_no_bundle_payloads(self):
         """空 chunks 返回字典不含 payloads key。"""
         import asyncio
-        from zsdtdx.parallel_fetcher import _fetch_chunk_bundle_async
+        from zsdtdx.engine.parallel_fetcher import _fetch_chunk_bundle_async
 
         result = asyncio.run(_fetch_chunk_bundle_async({"chunks": [], "bundle_id": 7}))
         assert "payloads" not in result, "bundle 级 payloads 字段应被删除"
@@ -400,7 +400,7 @@ class TestFetchChunkBundleAsyncSchema:
     def test_nonempty_chunks_only_chunk_reports_carry_payloads(self, monkeypatch):
         """非空 chunks 返回字典也不含 bundle-level payloads；payloads 只在 chunk_reports 内。"""
         import asyncio
-        import zsdtdx.parallel_fetcher as pf
+        import zsdtdx.engine.parallel_fetcher as pf
 
         # 桩 worker client context 与 chunk 执行器，避免真建连。
         monkeypatch.setattr(pf, "_ensure_worker_client_context", lambda: object())
@@ -470,7 +470,7 @@ class TestTcpNoDelayEnabled:
     def test_connect_sets_tcp_nodelay(self, monkeypatch):
         """connect 成功 → 应观察到 TCP_NODELAY setsockopt 调用。"""
         import socket
-        from zsdtdx import base_socket_client as bsc
+        from zsdtdx.net import base_socket_client as bsc
 
         recorded: List[tuple] = []
 
@@ -536,7 +536,7 @@ class TestSocketReadTimeoutRestore:
 
     def test_restore_invoked_on_chunk_finally(self, monkeypatch):
         """模拟 client_context 验证 _restore_chunk_socket_read_timeout 调用每个池的 restorer。"""
-        from zsdtdx.parallel_fetcher import _restore_chunk_socket_read_timeout
+        from zsdtdx.engine.parallel_fetcher import _restore_chunk_socket_read_timeout
 
         restored: List[str] = []
 
@@ -556,7 +556,7 @@ class TestSocketReadTimeoutRestore:
 
     def test_restore_safe_when_pool_missing(self):
         """池不存在/无 restorer 方法时静默跳过，不抛错。"""
-        from zsdtdx.parallel_fetcher import _restore_chunk_socket_read_timeout
+        from zsdtdx.engine.parallel_fetcher import _restore_chunk_socket_read_timeout
 
         class _Ctx:
             std_pool = None
@@ -573,7 +573,7 @@ class TestPoolRestoreDefaultTimeout:
 
     def test_restore_uses_pool_default(self, monkeypatch):
         """模拟 pool 实例调用 restore，验证 settimeout(default) 被触发。"""
-        from zsdtdx.unified_client import PersistentFailoverPool
+        from zsdtdx.engine.unified_client import PersistentFailoverPool
 
         # 构造一个最小 pool 子类实例（避免完整初始化）
         pool = PersistentFailoverPool.__new__(PersistentFailoverPool)
@@ -610,7 +610,7 @@ class TestPoolChunkDeadline:
 
     def test_timeout_set_before_connect_applies_to_new_socket(self):
         """先设置线程读超时、再建连；新 socket 应收到 settimeout。"""
-        from zsdtdx.unified_client import PersistentFailoverPool
+        from zsdtdx.engine.unified_client import PersistentFailoverPool
 
         class _Sock:
             def __init__(self):
@@ -644,7 +644,7 @@ class TestPoolChunkDeadline:
 
     def test_expired_deadline_fails_before_api_call(self, monkeypatch):
         """deadline 已过期时，_attempt_call_step 不应调用底层 API。"""
-        from zsdtdx.unified_client import PersistentFailoverPool
+        from zsdtdx.engine.unified_client import PersistentFailoverPool
 
         called = {"n": 0}
 
@@ -692,7 +692,7 @@ class TestBundleWatchdog:
         import queue as py_queue
         from concurrent.futures import Future
 
-        import zsdtdx.parallel_fetcher as pf
+        import zsdtdx.engine.parallel_fetcher as pf
 
         class _NeverDoneExecutor:
             def submit(self, *_args, **_kwargs):
@@ -762,7 +762,7 @@ class TestLogDetailOptionsRCU:
 
     def test_write_replaces_snapshot_object(self):
         """set 后全局 dict 引用应是新对象。"""
-        import zsdtdx.parallel_fetcher as pf
+        import zsdtdx.engine.parallel_fetcher as pf
 
         before = pf._read_log_detail_options()
         before_id = id(before)
@@ -778,7 +778,7 @@ class TestLogDetailOptionsRCU:
 
     def test_read_returns_snapshot_reference(self):
         """_read_log_detail_options 直接返回当前全局快照（不拷贝）。"""
-        import zsdtdx.parallel_fetcher as pf
+        import zsdtdx.engine.parallel_fetcher as pf
 
         snap1 = pf._read_log_detail_options()
         snap2 = pf._read_log_detail_options()
@@ -786,7 +786,7 @@ class TestLogDetailOptionsRCU:
 
     def test_concurrent_read_write_no_crash(self):
         """并发读 + 写不抛异常、不死锁。"""
-        import zsdtdx.parallel_fetcher as pf
+        import zsdtdx.engine.parallel_fetcher as pf
 
         stop = threading.Event()
         errors: List[Exception] = []
@@ -825,7 +825,7 @@ class TestLogDetailOptionsRCU:
 
     def test_invalid_sample_size_clamped(self):
         """sample_size 越界会被收敛到 [1, 200]。"""
-        import zsdtdx.parallel_fetcher as pf
+        import zsdtdx.engine.parallel_fetcher as pf
 
         prev = pf.set_log_detail_options(sample_size=0)
         try:
@@ -858,7 +858,7 @@ class TestGetVolumeParityFuzz:
         return pytdx_get_volume
 
     def _zs_get_volume(self):
-        from zsdtdx.helper import get_volume as zs_get_volume
+        from zsdtdx.util.helper import get_volume as zs_get_volume
 
         return zs_get_volume
 
@@ -994,7 +994,7 @@ class TestChunkLocalRowCacheRowAccumulate:
     """
 
     def test_n_monotonic_within_chunk(self):
-        from zsdtdx.unified_client import ChunkLocalRowCache
+        from zsdtdx.engine.unified_client import ChunkLocalRowCache
 
         cache = ChunkLocalRowCache()
         partition = cache.acquire_partition("000001", "d")

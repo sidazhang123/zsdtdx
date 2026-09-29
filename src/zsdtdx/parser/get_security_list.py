@@ -15,7 +15,7 @@
 import struct
 from collections import OrderedDict
 
-from zsdtdx.helper import get_volume
+from zsdtdx.util.helper import get_volume
 from zsdtdx.params import TDXParams
 from zsdtdx.parser.base import BaseParser
 

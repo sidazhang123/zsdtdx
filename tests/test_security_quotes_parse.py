@@ -1,7 +1,7 @@
 """离线验收标准行情五档解析：未上市占位码不得毒死同批其它代码，也不得触发拆单重试。"""
 
 from zsdtdx.parser.get_security_quotes import GetSecurityQuotesCmd
-from zsdtdx.unified_client import UnifiedTdxClient
+from zsdtdx.engine.unified_client import UnifiedTdxClient
 
 # 2026-09-18 现场回包：sz.301569 联亚药业未上市占位，61 字节；与 600000 同批 141 字节。
 _BODY_301569_UNLISTED = bytes.fromhex(

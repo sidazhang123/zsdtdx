@@ -466,7 +466,6 @@ def main() -> int:
         get_stock_code_name,
         get_stock_kline,
         get_stock_latest_price,
-        get_supported_markets,
         prewarm_parallel_fetcher,
         restart_parallel_fetcher,
         set_config_path,
@@ -499,8 +498,8 @@ def main() -> int:
         # ---- catalogs ----
         with get_client() as client:
             sections["get_client"] = {"type": type(client).__name__}
-            _log("get_supported_markets ...")
-            markets = get_supported_markets(return_df=False)
+            _log("client.get_supported_markets ...")
+            markets = client.get_supported_markets(return_df=False)
             mnames = {str(r.get("name", "")).strip() for r in markets}
             for need in ("深圳", "上海", "北京"):
                 if need not in mnames:

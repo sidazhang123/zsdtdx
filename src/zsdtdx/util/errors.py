@@ -1,5 +1,5 @@
 """
-模块：`errors.py`。
+模块：`util/errors.py`。
 
 职责：
 1. 定义 zsdtdx 连接与协议调用相关的异常类型。

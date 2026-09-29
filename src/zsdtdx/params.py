@@ -2,11 +2,12 @@
 模块：`params.py`。
 
 职责：
-1. 定义通达信协议相关的市场、K 线周期等常量。
-2. 供 parser 与客户端在组包时引用。
+1. 定义通达信协议相关的市场、K 线周期、远程文件名与域约定常量。
+2. 供 parser 与客户端在组包、路由、时间补齐时引用。
 
 边界：
 1. 仅包含常量类 `TDXParams`，不含运行时逻辑。
+2. 用户可调旋钮仍在 `config.yaml`；内部调度超时等继续写死在调用处。
 """
 
 # coding=utf-8
@@ -73,6 +74,8 @@ class TDXParams:
     STOCK_PREFIX_SH = ("600", "601", "603", "605", "688", "689")
     # 纳入商品期货的扩展市场名称
     FUTURE_MARKET_NAMES = ("郑州商品", "大连商品", "上海期货", "广州期货")
+    # 扩展行情港股通市场名（抓包 0x2422；不含香港主板）
+    HK_EX_MARKET_NAME = "港股通"
     # 场内 ETF/LOF 远程名称文件与板块成分文件
     ETF_NAME_REMOTE_FILE = "infoharbor_ex.name"
     ETF_BOARD_REMOTE_FILES = ("spec/specetfdata.txt", "spec/speclofdata.txt")
@@ -83,4 +86,89 @@ class TDXParams:
     # 行业板块名称表打在该 zip 内，成员为 tdxzs.cfg；长名补表成员为 ilong.dat
     ZHB_ZIP_REMOTE_FILE = "zhb.zip"
     TDXZS_ZIP_MEMBER = "tdxzs.cfg"
+    TDXZS3_ZIP_MEMBER = "tdxzs3.cfg"
     ILONG_ZIP_MEMBER = "ilong.dat"
+
+    # 仅传日期时的默认时分秒（股票/指数/板块 vs 期货）
+    STOCK_DATE_ONLY_START_TIME = "09:30:00"
+    STOCK_DATE_ONLY_END_TIME = "16:00:00"
+    FUTURE_DATE_ONLY_START_TIME = "09:00:00"
+    FUTURE_DATE_ONLY_END_TIME = "15:00:00"
+
+    # 商品期货品种代码表（纯品种代码识别与主连补全）
+    FUTURE_PATTERNS = frozenset(
+        {
+            "CU",
+            "AL",
+            "ZN",
+            "PB",
+            "NI",
+            "SN",
+            "AU",
+            "AG",
+            "RB",
+            "HC",
+            "FU",
+            "BU",
+            "RU",
+            "WR",
+            "SS",
+            "SP",
+            "C",
+            "CS",
+            "A",
+            "B",
+            "M",
+            "Y",
+            "P",
+            "FB",
+            "BB",
+            "JD",
+            "L",
+            "V",
+            "PP",
+            "J",
+            "JM",
+            "I",
+            "EG",
+            "EB",
+            "PG",
+            "LH",
+            "RR",
+            "SR",
+            "CF",
+            "RI",
+            "OI",
+            "WH",
+            "PM",
+            "FG",
+            "RS",
+            "RM",
+            "JR",
+            "LR",
+            "SF",
+            "SM",
+            "TA",
+            "MA",
+            "ZC",
+            "CY",
+            "AP",
+            "CJ",
+            "UR",
+            "SA",
+            "PF",
+            "PK",
+            "SC",
+            "NR",
+            "LU",
+            "BC",
+            "EC",
+            "IF",
+            "IC",
+            "IH",
+            "TF",
+            "T",
+            "TS",
+            "IM",
+        }
+    )

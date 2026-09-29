@@ -54,7 +54,7 @@ def _make_minimal_prep(task_kind: str, normalized_tasks: List[Dict[str, Any]]) -
 
 def scenario_stock_chunk_timeout_resets_std_only() -> Dict[str, Any]:
     """模拟 stock chunk 每次尝试都超时，验证 _recover_worker_pools_current_thread 仅以 target='std' 被调用。"""
-    import zsdtdx.parallel_fetcher as pf
+    import zsdtdx.engine.parallel_fetcher as pf
 
     recover_calls: List[Dict[str, Any]] = []
 
@@ -94,7 +94,7 @@ def scenario_stock_chunk_timeout_resets_std_only() -> Dict[str, Any]:
 
 def scenario_index_chunk_ex_source_resets_ex_only() -> Dict[str, Any]:
     """模拟 index chunk (_index_route_source='ex') 超时，验证 target='ex'。"""
-    import zsdtdx.parallel_fetcher as pf
+    import zsdtdx.engine.parallel_fetcher as pf
 
     recover_calls: List[Dict[str, Any]] = []
 
@@ -135,7 +135,7 @@ def scenario_index_chunk_ex_source_resets_ex_only() -> Dict[str, Any]:
 
 def scenario_connection_unavailable_no_second_recover() -> Dict[str, Any]:
     """模拟 _log_chunk_retry 收到连接不可用错误时不再二次触发 _recover_*。"""
-    import zsdtdx.parallel_fetcher as pf
+    import zsdtdx.engine.parallel_fetcher as pf
 
     recover_calls: List[Dict[str, Any]] = []
     emit_calls: List[Dict[str, Any]] = []

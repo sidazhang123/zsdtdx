@@ -47,11 +47,30 @@ def test_get_future_kline_has_no_qfq():
     assert "qfq" not in params
 
 
+def test_get_future_kline_forwards_to_fetcher():
+    """输入：codes/freq/时间窗；输出：biz 层标准化后交给 fetch_stock。"""
+    with patch("zsdtdx.engine.parallel_fetcher.get_fetcher") as get_fetcher:
+        fetcher = MagicMock()
+        fetcher.fetch_stock.return_value = MagicMock()
+        get_fetcher.return_value = fetcher
+        get_future_kline(
+            codes=["CU"],
+            freq="d",
+            start_time="2026-02-13",
+            end_time="2026-02-13",
+        )
+        kwargs = fetcher.fetch_stock.call_args.kwargs
+        assert kwargs["codes"] == ["CU"]
+        assert kwargs["freqs"] == ["d"]
+        assert kwargs["start_time"] == "2026-02-13 09:00:00"
+        assert kwargs["end_time"] == "2026-02-13 15:00:00"
+
+
 def test_get_stock_kline_sync_forwards_default_qfq():
     """输入：不传 qfq；输出：fetcher 收到 qfq=True。"""
     with (
-        patch("zsdtdx.simple_api._ensure_active_config_ready"),
-        patch("zsdtdx.simple_api.get_fetcher") as get_fetcher,
+        patch("zsdtdx.biz.stock_kline._ensure_active_config_ready"),
+        patch("zsdtdx.engine.parallel_fetcher.get_fetcher") as get_fetcher,
     ):
         fetcher = MagicMock()
         fetcher.fetch_stock_tasks_sync.return_value = []
@@ -66,8 +85,8 @@ def test_get_stock_kline_sync_forwards_default_qfq():
 def test_get_stock_kline_sync_forwards_qfq_false():
     """输入：qfq=False；输出：fetcher 收到 False。"""
     with (
-        patch("zsdtdx.simple_api._ensure_active_config_ready"),
-        patch("zsdtdx.simple_api.get_fetcher") as get_fetcher,
+        patch("zsdtdx.biz.stock_kline._ensure_active_config_ready"),
+        patch("zsdtdx.engine.parallel_fetcher.get_fetcher") as get_fetcher,
     ):
         fetcher = MagicMock()
         fetcher.fetch_stock_tasks_sync.return_value = []
@@ -90,9 +109,9 @@ def test_get_index_kline_sync_does_not_forward_qfq():
         return fn(fake_client)
 
     with (
-        patch("zsdtdx.simple_api._ensure_active_config_ready"),
-        patch("zsdtdx.simple_api.get_fetcher") as get_fetcher,
-        patch("zsdtdx.simple_api._call_with_client", side_effect=_run_with_client),
+        patch("zsdtdx.biz.index_kline._ensure_active_config_ready"),
+        patch("zsdtdx.engine.parallel_fetcher.get_fetcher") as get_fetcher,
+        patch("zsdtdx.biz.index_kline.call_with_client", side_effect=_run_with_client),
     ):
         fetcher = MagicMock()
         fetcher.fetch_index_tasks_sync.return_value = []
@@ -104,7 +123,7 @@ def test_get_index_kline_sync_does_not_forward_qfq():
 
 def test_std_page_fetch_honors_qfq_false():
     """输入：_fetch_kline_page_rows_no_df(qfq=False)；输出：pool.call 带 qfq=False。"""
-    from zsdtdx.unified_client import UnifiedTdxClient
+    from zsdtdx.engine.unified_client import UnifiedTdxClient
 
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
     mock_pool = MagicMock()
@@ -124,7 +143,7 @@ def test_std_page_fetch_honors_qfq_false():
 
 def test_ex_page_fetch_honors_qfq():
     """输入：扩展行情港股页抓取；输出：pool.call 带对应 qfq。"""
-    from zsdtdx.unified_client import UnifiedTdxClient
+    from zsdtdx.engine.unified_client import UnifiedTdxClient
 
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
     mock_pool = MagicMock()

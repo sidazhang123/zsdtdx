@@ -695,7 +695,7 @@ def main() -> int:
 
         # 降低并行层逐 chunk 刷屏，避免日志拖慢与编码膨胀
         try:
-            from zsdtdx.parallel_fetcher import set_log_callback
+            from zsdtdx.engine.parallel_fetcher import set_log_callback
 
             def _quiet_parallel_log(
                 level: str, message: str, detail: Optional[Dict[str, Any]] = None

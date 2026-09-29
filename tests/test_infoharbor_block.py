@@ -20,7 +20,7 @@ from zsdtdx.parser.infoharbor_block import (
     parse_tdx_industry_blocks,
     read_zip_entry,
 )
-from zsdtdx.unified_client import UnifiedTdxClient
+from zsdtdx.engine.unified_client import UnifiedTdxClient
 
 
 def _sample_raw() -> bytes:

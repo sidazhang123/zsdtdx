@@ -39,15 +39,15 @@ def report(label: str, page, start: int) -> bool:
 
 
 def probe_zsdtdx_exhq(host: str) -> bool:
-    from zsdtdx.exhq import TdxExHq_API
+    from zsdtdx.net.exhq import TdxExHq_API
 
     h, p = host.rsplit(":", 1)
     api = TdxExHq_API()
     with api.connect(h, int(p)):
         p0 = list(api.get_instrument_bars(CATEGORY, MARKET, CODE, 0, 50) or [])
         p1 = list(api.get_instrument_bars(CATEGORY, MARKET, CODE, 50, 50) or [])
-    ok0 = report(f"zsdtdx.exhq @ {host}", p0, 0)
-    report(f"zsdtdx.exhq @ {host}", p1, 50)
+    ok0 = report(f"zsdtdx.net.exhq @ {host}", p0, 0)
+    report(f"zsdtdx.net.exhq @ {host}", p1, 50)
     return ok0
 
 
@@ -89,7 +89,7 @@ def main() -> None:
         try:
             results[f"zsdtdx:{host}"] = probe_zsdtdx_exhq(host)
         except Exception as exc:
-            print(f"zsdtdx.exhq @ {host} ERROR: {exc}")
+            print(f"zsdtdx.net.exhq @ {host} ERROR: {exc}")
             results[f"zsdtdx:{host}"] = False
         try:
             results[f"pytdx:{host}"] = probe_pytdx(host)

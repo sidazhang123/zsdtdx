@@ -6,8 +6,8 @@ from pathlib import Path
 
 import yaml
 
-from zsdtdx.helper import _apply_active_config_path
-from zsdtdx.unified_client import (
+from zsdtdx.util.helper import _apply_active_config_path
+from zsdtdx.engine.unified_client import (
     _DEFAULT_CONFIG_PATH,
     _deep_merge_config_overlay,
     _load_builtin_zsdtdx_config,
@@ -71,11 +71,11 @@ def test_set_config_path_accepts_partial_without_hosts(tmp_path, monkeypatch):
     )
 
     monkeypatch.setattr(
-        "zsdtdx.unified_client._ensure_availability_hosts_cache",
+        "zsdtdx.engine.unified_client._ensure_availability_hosts_cache",
         lambda **kwargs: {"skipped": True},
     )
     monkeypatch.setattr(
-        "zsdtdx.parallel_fetcher.set_active_config_path",
+        "zsdtdx.engine.parallel_fetcher.set_active_config_path",
         lambda path: None,
     )
 

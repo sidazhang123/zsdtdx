@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from zsdtdx.catalog_disk_cache import (
+from zsdtdx.cache.catalog_disk_cache import (
     KIND_ETF,
     KIND_EX,
     KIND_STD,

@@ -13,7 +13,7 @@
 
 # coding=utf-8
 
-from zsdtdx.base_socket_client import BaseSocketClient, update_last_ack_time
+from zsdtdx.net.base_socket_client import BaseSocketClient, update_last_ack_time
 from zsdtdx.params import TDXParams
 from zsdtdx.parser.ex_get_history_instrument_bars_range import (
     GetHistoryInstrumentBarsRange,

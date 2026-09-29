@@ -19,7 +19,7 @@ from zsdtdx.parser.get_report_file import (
     parse_named_file_chunk_body,
     parse_named_file_meta_body,
 )
-from zsdtdx.unified_client import UnifiedTdxClient
+from zsdtdx.engine.unified_client import UnifiedTdxClient
 
 
 def test_meta_pack_matches_capture():
@@ -332,7 +332,7 @@ def test_ensure_etf_name_catalog_rejects_empty_names():
 
 def test_ensure_etf_name_catalog_disk_hit_skips_download(tmp_path):
     """输入：当日 etf pickle。输出：不调用下载。用途：日级磁盘缓存。边界：离线。"""
-    from zsdtdx.catalog_disk_cache import (
+    from zsdtdx.cache.catalog_disk_cache import (
         KIND_ETF,
         catalog_cache_file_path,
         save_etf_catalog_cache,
@@ -360,7 +360,7 @@ def test_ensure_etf_name_catalog_disk_hit_skips_download(tmp_path):
 
 def test_ensure_etf_refresh_ignores_disk_and_redownloads(tmp_path):
     """输入：磁盘已有当日缓存但 refresh=True。输出：仍下载并覆盖。用途：use_cache=False。边界：离线。"""
-    from zsdtdx.catalog_disk_cache import (
+    from zsdtdx.cache.catalog_disk_cache import (
         KIND_ETF,
         catalog_cache_file_path,
         save_etf_catalog_cache,
@@ -397,7 +397,7 @@ def test_ensure_etf_refresh_ignores_disk_and_redownloads(tmp_path):
 
 def test_ensure_etf_download_persists_disk_cache(tmp_path):
     """输入：无当日 pickle。输出：下载后写出 etf_code_name.pkl。用途：冷启动落盘。边界：离线。"""
-    from zsdtdx.catalog_disk_cache import (
+    from zsdtdx.cache.catalog_disk_cache import (
         KIND_ETF,
         catalog_cache_file_path,
         load_etf_catalog_cache,
@@ -424,7 +424,7 @@ def test_ensure_etf_download_persists_disk_cache(tmp_path):
 
 def test_ensure_etf_empty_board_does_not_persist(tmp_path):
     """输入：LOF 板块空且缓存开启。输出：不写 pickle。用途：空快照不得落盘。边界：离线。"""
-    from zsdtdx.catalog_disk_cache import KIND_ETF, catalog_cache_file_path
+    from zsdtdx.cache.catalog_disk_cache import KIND_ETF, catalog_cache_file_path
 
     client = _ensure_client(
         {
@@ -461,7 +461,7 @@ def test_download_named_hq_file_uses_get_report_file_by_size():
 
 def test_get_report_file_by_size_pages_and_slices():
     """输入：两页 mock。输出：按 chunksize 截取后拼接。用途：HQ 唯一翻页循环。边界：离线。"""
-    from zsdtdx.hq import TdxHq_API
+    from zsdtdx.net.hq import TdxHq_API
 
     api = TdxHq_API.__new__(TdxHq_API)
     pages = {

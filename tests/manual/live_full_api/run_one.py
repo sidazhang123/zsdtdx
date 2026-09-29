@@ -221,10 +221,10 @@ def round_get_client() -> Dict[str, Any]:
 
 def round_get_supported_markets() -> Dict[str, Any]:
     _boot()
-    from zsdtdx import get_client, get_supported_markets
+    from zsdtdx import get_client
 
-    with get_client():
-        rows = get_supported_markets(return_df=False)
+    with get_client() as client:
+        rows = client.get_supported_markets(return_df=False)
     names = sorted({str(r.get("name", "")) for r in rows})
     sources = sorted({str(r.get("source", "")) for r in rows})
     need = {"深圳", "上海", "北京", "港股通", "上海期货"}

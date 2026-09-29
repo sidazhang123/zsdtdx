@@ -213,7 +213,7 @@ def _sample_scheduler(peak: Dict[str, Any], stop: threading.Event) -> None:
     输出：就地更新配额、进程峰值、拥塞与冷却等机制采样。
     边界：调度器尚未创建时跳过本次采样。
     """
-    import zsdtdx.parallel_fetcher as pf
+    import zsdtdx.engine.parallel_fetcher as pf
 
     prev_caps: Dict[str, Dict[str, int]] = {"std": {}, "ex": {}}
     while not stop.wait(SAMPLE_INTERVAL):

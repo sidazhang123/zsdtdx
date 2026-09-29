@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from zsdtdx.adaptive_scheduler import (
+from zsdtdx.engine.adaptive_scheduler import (
     AdaptiveConcurrencyController,
     compute_side_process_budget,
 )
@@ -244,7 +244,7 @@ def test_multiple_callers_share_global_process_budget():
 
 def test_stock_and_index_chunks_keep_route_homogeneous():
     """股票/指数父进程 chunk 均固化 route_source，bundle 不混侧。"""
-    import zsdtdx.parallel_fetcher as pf
+    import zsdtdx.engine.parallel_fetcher as pf
 
     fetcher = pf.ParallelKlineFetcher.__new__(pf.ParallelKlineFetcher)
     fetcher.num_processes = 4
@@ -288,7 +288,7 @@ def test_stock_and_index_chunks_keep_route_homogeneous():
 
 def test_worker_context_does_not_preconnect_for_worker_client(monkeypatch):
     """worker 进入上下文时不调用双侧预连接。"""
-    from zsdtdx.unified_client import UnifiedTdxClient
+    from zsdtdx.engine.unified_client import UnifiedTdxClient
 
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
     context = UnifiedTdxClient.__new__(UnifiedTdxClient)
@@ -299,7 +299,7 @@ def test_worker_context_does_not_preconnect_for_worker_client(monkeypatch):
     context._worker_client_flag = True
     context._warmup_connections = MagicMock()
     monkeypatch.setattr(
-        "zsdtdx.unified_client.UnifiedTdxClient",
+        "zsdtdx.engine.unified_client.UnifiedTdxClient",
         MagicMock(return_value=context),
     )
     client._push_context_client = MagicMock()
@@ -311,7 +311,7 @@ def test_worker_context_does_not_preconnect_for_worker_client(monkeypatch):
 
 def test_stock_recovery_uses_explicit_ex_route():
     """港股 stock chunk 连接异常时恢复目标为 ex。"""
-    from zsdtdx.parallel_fetcher import _infer_recover_target_from_chunk
+    from zsdtdx.engine.parallel_fetcher import _infer_recover_target_from_chunk
 
     prep = {
         "task_kind": "stock",
@@ -322,7 +322,7 @@ def test_stock_recovery_uses_explicit_ex_route():
 
 def test_side_specific_probe_does_not_touch_other_pool(monkeypatch):
     """按侧 ensure 只探测任务实际需要的地址池。"""
-    import zsdtdx.unified_client as uc
+    import zsdtdx.engine.unified_client as uc
 
     with uc._probe_result_cache_lock:
         uc._probe_result_cache.clear()
@@ -350,7 +350,7 @@ def test_side_specific_probe_does_not_touch_other_pool(monkeypatch):
 
 def test_submit_failure_rolls_back_adaptive_permit(monkeypatch):
     """进程池 submit 抛错时必须归还 permit，不能永久缩减全局容量。"""
-    import zsdtdx.parallel_fetcher as pf
+    import zsdtdx.engine.parallel_fetcher as pf
 
     controller = AdaptiveConcurrencyController(max_processes=2, inproc_limit=1)
     controller.update_hosts("std", [("s1", 7709)])
@@ -377,7 +377,7 @@ def test_submit_failure_rolls_back_adaptive_permit(monkeypatch):
     fetcher.config = {}
 
     monkeypatch.setattr(
-        "zsdtdx.unified_client._ensure_availability_hosts_cache",
+        "zsdtdx.engine.unified_client._ensure_availability_hosts_cache",
         lambda **_kwargs: {},
     )
     monkeypatch.setattr(
@@ -402,7 +402,7 @@ def test_submit_failure_rolls_back_adaptive_permit(monkeypatch):
 
 def test_full_host_slots_do_not_abort_remaining_bundles(monkeypatch):
     """host 槽位占满时，内置 TimeoutError 不能中断后续 bundle。"""
-    import zsdtdx.parallel_fetcher as pf
+    import zsdtdx.engine.parallel_fetcher as pf
     from concurrent.futures import Future
 
     controller = AdaptiveConcurrencyController(max_processes=4, inproc_limit=1)
@@ -431,7 +431,7 @@ def test_full_host_slots_do_not_abort_remaining_bundles(monkeypatch):
     fetcher.config = {}
 
     monkeypatch.setattr(
-        "zsdtdx.unified_client._ensure_availability_hosts_cache",
+        "zsdtdx.engine.unified_client._ensure_availability_hosts_cache",
         lambda **_kwargs: {},
     )
     monkeypatch.setattr(
@@ -458,7 +458,7 @@ def test_full_host_slots_do_not_abort_remaining_bundles(monkeypatch):
 
 def test_force_restart_resets_adaptive_state(monkeypatch):
     """强制终止旧 worker 时同步清空其 permit 与 host 学习状态。"""
-    import zsdtdx.parallel_fetcher as pf
+    import zsdtdx.engine.parallel_fetcher as pf
 
     controller = AdaptiveConcurrencyController(max_processes=2, inproc_limit=1)
     controller.update_hosts("std", [("s1", 7709)])
@@ -476,7 +476,7 @@ def test_force_restart_resets_adaptive_state(monkeypatch):
 @pytest.mark.skipif(sys.platform != "win32", reason="仅验证 Windows spawn")
 def test_windows_spawn_process_only_warmup():
     """真实 spawn 拉起 worker，但预热阶段不建立 std/ex 行情 socket。"""
-    import zsdtdx.parallel_fetcher as pf
+    import zsdtdx.engine.parallel_fetcher as pf
 
     pf.destroy_parallel_fetcher()
     try:
@@ -498,7 +498,7 @@ def test_windows_spawn_process_only_warmup():
 
 def test_chunk_attempt_reports_actual_failover_host(monkeypatch):
     """worker 将线程实际活跃 host 回传，父进程可识别首选站 failover。"""
-    import zsdtdx.parallel_fetcher as pf
+    import zsdtdx.engine.parallel_fetcher as pf
 
     pool = MagicMock()
     pool.get_active_host.return_value = "s2:7709"
@@ -531,7 +531,7 @@ def test_chunk_attempt_reports_actual_failover_host(monkeypatch):
 
 def test_watchdog_waits_for_worker_stop_before_releasing_permit(monkeypatch):
     """无法取消的运行中 future 不得在 watchdog 返回失败时提前释放容量。"""
-    import zsdtdx.parallel_fetcher as pf
+    import zsdtdx.engine.parallel_fetcher as pf
     from concurrent.futures import Future
 
     controller = AdaptiveConcurrencyController(max_processes=1, inproc_limit=1)
@@ -561,7 +561,7 @@ def test_watchdog_waits_for_worker_stop_before_releasing_permit(monkeypatch):
     fetcher.config = {}
 
     monkeypatch.setattr(
-        "zsdtdx.unified_client._ensure_availability_hosts_cache",
+        "zsdtdx.engine.unified_client._ensure_availability_hosts_cache",
         lambda **_kwargs: {},
     )
     monkeypatch.setattr(
@@ -595,7 +595,7 @@ def test_retry_success_does_not_mark_chunk_congested():
     import asyncio
     from unittest.mock import patch
 
-    import zsdtdx.parallel_fetcher as pf
+    import zsdtdx.engine.parallel_fetcher as pf
 
     calls = {"n": 0}
 
@@ -650,7 +650,7 @@ def test_retry_success_does_not_mark_chunk_congested():
 
 def test_inflight_multiplier_widens_std_admission_only(monkeypatch):
     """提交窗口为进程数×倍率；标准侧配额随倍率放大，扩展侧保持配置值。"""
-    import zsdtdx.parallel_fetcher as pf
+    import zsdtdx.engine.parallel_fetcher as pf
     from concurrent.futures import Future
 
     pf._reset_global_adaptive_controller()
@@ -663,11 +663,11 @@ def test_inflight_multiplier_widens_std_admission_only(monkeypatch):
 
     monkeypatch.setattr(pf, "_get_global_adaptive_controller", _wrap)
     monkeypatch.setattr(
-        "zsdtdx.unified_client._ensure_availability_hosts_cache",
+        "zsdtdx.engine.unified_client._ensure_availability_hosts_cache",
         lambda **_kwargs: {},
     )
     monkeypatch.setattr(
-        "zsdtdx.unified_client.get_probe_result_cache",
+        "zsdtdx.engine.unified_client.get_probe_result_cache",
         lambda: {
             "standard": [(f"10.0.0.{index}", 7709) for index in range(10)],
             "extended": [("114.117.72.207", 7720), ("118.31.28.30", 7730)],
@@ -730,16 +730,16 @@ def test_inflight_multiplier_widens_std_admission_only(monkeypatch):
 
 def test_successful_failover_does_not_reduce_host_cap(monkeypatch):
     """数据已取回且只是换了站点时，父进程释放凭证不得降低原地址配额。"""
-    import zsdtdx.parallel_fetcher as pf
+    import zsdtdx.engine.parallel_fetcher as pf
     from concurrent.futures import Future
 
     pf._reset_global_adaptive_controller()
     monkeypatch.setattr(
-        "zsdtdx.unified_client._ensure_availability_hosts_cache",
+        "zsdtdx.engine.unified_client._ensure_availability_hosts_cache",
         lambda **_kwargs: {},
     )
     monkeypatch.setattr(
-        "zsdtdx.unified_client.get_probe_result_cache",
+        "zsdtdx.engine.unified_client.get_probe_result_cache",
         lambda: {"standard": [("10.0.0.1", 7709)], "extended": []},
     )
 
@@ -817,7 +817,7 @@ def test_successful_failover_does_not_reduce_host_cap(monkeypatch):
 
 def test_one_overdue_bundle_does_not_abort_running_siblings(monkeypatch):
     """一条 bundle 超过时限时只失败这一条，仍在跑的其它 bundle 继续返回。"""
-    import zsdtdx.parallel_fetcher as pf
+    import zsdtdx.engine.parallel_fetcher as pf
     from concurrent.futures import Future
 
     controller = AdaptiveConcurrencyController(
@@ -833,7 +833,7 @@ def test_one_overdue_bundle_does_not_abort_running_siblings(monkeypatch):
         pf, "_get_global_adaptive_controller", lambda **_kwargs: controller
     )
     monkeypatch.setattr(
-        "zsdtdx.unified_client._ensure_availability_hosts_cache",
+        "zsdtdx.engine.unified_client._ensure_availability_hosts_cache",
         lambda **_kwargs: {},
     )
 
@@ -900,8 +900,8 @@ def test_chunk_timeout_returns_while_socket_and_recover_block():
     import threading
     from unittest.mock import patch
 
-    import zsdtdx.parallel_fetcher as pf
-    from zsdtdx.unified_client import _bind_attempt_socket
+    import zsdtdx.engine.parallel_fetcher as pf
+    from zsdtdx.engine.unified_client import _bind_attempt_socket
 
     server = socket.socket()
     server.bind(("127.0.0.1", 0))
@@ -980,7 +980,7 @@ def test_aborted_attempt_does_not_connect_the_next_host():
     """超时放弃后，不再对下一台地址建连。"""
     import socket
 
-    from zsdtdx.unified_client import (
+    from zsdtdx.engine.unified_client import (
         AttemptSocketCloser,
         PersistentFailoverPool,
         _attempt_socket_closer,
@@ -1038,7 +1038,7 @@ def test_acquire_fails_fast_when_side_has_no_selectable_host():
 
 def test_allocate_host_worker_counts_caps_each_host_and_total():
     """进程在建池时按站摊开，单站不超过上限，总数不超过进程数。"""
-    from zsdtdx.parallel_fetcher import allocate_host_worker_counts
+    from zsdtdx.engine.parallel_fetcher import allocate_host_worker_counts
 
     hosts = [(f"10.0.0.{index}", 7709) for index in range(11)]
     wide = allocate_host_worker_counts(hosts, 40, 4)
@@ -1053,7 +1053,7 @@ def test_allocate_host_worker_counts_caps_each_host_and_total():
 
 def test_std_and_ex_homes_share_the_same_process_slots():
     """标准侧和扩展侧的自家站都落在同一批进程槽位上，名额仍由按站分配决定。"""
-    from zsdtdx.parallel_fetcher import (
+    from zsdtdx.engine.parallel_fetcher import (
         _build_worker_host_slot_assignments,
         allocate_host_worker_counts,
     )
@@ -1084,7 +1084,7 @@ def test_std_and_ex_homes_share_the_same_process_slots():
 
 def test_chunk_reports_mark_congested_ignores_payload_error_text():
     """任务错误里的 timeout 文本不能单独降配额。"""
-    from zsdtdx.parallel_fetcher import (
+    from zsdtdx.engine.parallel_fetcher import (
         _chunk_reports_mark_congested,
         _is_transport_congestion_error,
     )
@@ -1115,7 +1115,7 @@ def test_socket_timed_out_marks_chunk_congested():
     import asyncio
     from unittest.mock import patch
 
-    from zsdtdx import parallel_fetcher as pf
+    from zsdtdx.engine import parallel_fetcher as pf
 
     chunk_payload = {
         "chunk_id": "c-timed-out",
