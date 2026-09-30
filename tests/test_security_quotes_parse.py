@@ -1,4 +1,4 @@
-"""离线验收标准行情五档解析：未上市占位码不得毒死同批其它代码，也不得触发拆单重试。"""
+"""离线验收标准行情五档解析：未上市占位码不得毒死同批其它代码。"""
 
 from zsdtdx.parser.get_security_quotes import GetSecurityQuotesCmd
 from zsdtdx.engine.unified_client import UnifiedTdxClient
@@ -56,32 +56,3 @@ def test_quote_last_price_fallback_to_last_close():
     assert client._quote_last_price({"price": 0.0, "last_close": 0.0}) is None
     assert client._quote_last_price({"price": None, "last_close": None}) is None
     assert client._quote_last_price(None) is None
-
-
-def test_latest_price_unlisted_uses_one_batch_no_split_retry():
-    """未上市占位与正常票同批：只发一次五档请求，占位记 None，正常票取现价。"""
-    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
-    client.output_cfg = {"latest_quote_batch_size": 80}
-    client.std_pool = object()
-    client.ex_pool = object()
-    client._runtime_failures = []
-    routes = {
-        "301569": {"market": 0, "source": "std", "code": "301569"},
-        "600000": {"market": 1, "source": "std", "code": "600000"},
-    }
-    client._lookup_stock_route = lambda code: routes.get(code)
-    calls = []
-
-    def _fake_pool_call(pool, method, req):
-        calls.append((method, list(req)))
-        return [
-            {"market": 0, "code": "301569", "price": 0.0, "last_close": 0.0},
-            {"market": 1, "code": "600000", "price": 9.08, "last_close": 9.06},
-        ]
-
-    client._pool_call_allow_none = _fake_pool_call
-    got = client.get_stock_latest_price(["301569", "600000"])
-    assert got == {"301569": None, "600000": 9.08}
-    assert len(calls) == 1
-    assert calls[0][0] == "get_security_quotes"
-    assert calls[0][1] == [(0, "301569"), (1, "600000")]

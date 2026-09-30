@@ -7,7 +7,7 @@
 `zsdtdx` 是一个面向 A 股/期货行情场景的 Python 封装库，参考 pytdx 生态提供统一 API、连接池、重试和并行抓取能力。部分请求组包与回包解析已按实盘抓包重新实现，并非对 `pytdx` 的直接二次封装或运行时依赖；归属说明见 `THIRD_PARTY_NOTICES.md`。
 
 - **名称**：`zsdtdx`
-- **版本**：`2.3.0`（同时定义在 `pyproject.toml` 与 `src/zsdtdx/__init__.py`）
+- **版本**：`2.3.1`（同时定义在 `pyproject.toml` 与 `src/zsdtdx/__init__.py`）
 - **许可证**：MIT（见 `LICENSE`）
 - **Python 要求**：`>=3.10`
 - **核心依赖**：`numpy`、`pandas`、`PyYAML`、`six`、`psutil`
@@ -19,7 +19,7 @@
 - 股票所属板块（`get_stock_concepts`：`infoharbor_block.dat` 概念/风格/指数，`tdxhy.cfg` + `zhb.zip` 内 `tdxzs.cfg` 补基础行业）
 - 股票/指数/板块指数 K 线（同步 + 异步并行；任务类见 `kline_task.py`）
 - 商品期货 K 线
-- 实时最新价（股票/期货）
+- 全市场股票统计宽表（`get_stock_stat`）与期货实时最新价
 - 公司信息
 - 运行时失败/元数据 introspection
 
@@ -38,6 +38,7 @@
 │   ├── kline_task.py           # 股票/指数/板块 K 线任务类（用户构造入口）
 │   ├── biz/                    # 各领域业务门面（由 simple_api 调用）
 │   │   ├── stock_kline.py      # 股票 K 线
+│   │   ├── stock_stat.py       # 全市场股票统计宽表
 │   │   ├── index_kline.py      # 指数 K 线
 │   │   ├── block_kline.py      # 板块指数 K 线
 │   │   ├── future_kline.py     # 期货 K 线（codes/freq 批入口）
@@ -139,12 +140,12 @@ set_config_path(r"D:\configs\zsdtdx.yaml")
 需要主进程连接的 API 应包裹在 `with get_client():` 中：
 
 ```python
-from zsdtdx import get_client, get_stock_latest_price
+from zsdtdx import get_client, get_stock_stat
 
 with get_client() as client:
     # 市场列表仅保留客户端方法，不再有独立 get_supported_markets 封装
     markets = client.get_supported_markets(return_df=True)
-    prices = get_stock_latest_price(["600000", "000001"])
+    board = get_stock_stat()
 ```
 
 属于主进程上下文的 API：
@@ -156,7 +157,7 @@ with get_client() as client:
 - `get_all_future_list`
 - `get_future_kline`
 - `get_company_info`
-- `get_stock_latest_price`
+- `get_stock_stat`（054B+0010+zhb/tdxstat 宽表；复用板块命名文件 6h 缓存）
 - `get_future_latest_price`
 - `get_runtime_failures`
 - `get_runtime_metadata`
@@ -276,6 +277,7 @@ K 线数据契约：
 | 码表磁盘缓存 | `src/zsdtdx/cache/catalog_disk_cache.py`（含 `etf_code_name.pkl`） |
 | 协议解析字段/数值刻度 | `src/zsdtdx/util/helper.py` + `src/zsdtdx/parser/*.py` |
 | ETF 完整名称（0x02C5/0x06B9） | `src/zsdtdx/parser/get_report_file.py` + `engine.unified_client.get_etf_code_name_map` |
+| 股票统计宽表 | `src/zsdtdx/biz/stock_stat.py` + `parser/get_board_quote_page.py` / `get_finance_info_batch.py` / `tdxstat.py` |
 | 股票所属板块 | `src/zsdtdx/parser/infoharbor_block.py` + `engine.unified_client.get_stock_concepts` |
 | 默认配置项 | `src/zsdtdx/config.yaml` + `README.md` 中的示例 |
 | 版本号 | `pyproject.toml`、`src/zsdtdx/__init__.py`、`CHANGELOG.md` |

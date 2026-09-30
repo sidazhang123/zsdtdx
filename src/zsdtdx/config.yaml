@@ -116,7 +116,7 @@ market_rules:
 
 stock_scope:
   # 当股票接口不传 codes（即 codes=None）时，默认抓取范围。
-  # 作用对象: get_stock_code_name / get_stock_latest_price；
+  # 作用对象: get_stock_code_name；
   # 以及客户端批路径 get_stock_kline(codes=None)。simple_api 任务化 get_stock_kline 必须显式传 task.code，不受本段影响。
   defaults_when_codes_none:
     # 取值支持:
@@ -139,10 +139,19 @@ stock_scope:
     # 3) 显式传入 codes 时，不受这里配置影响。
     get_stock_code_name:
       - "szsh+bj"
-    get_stock_latest_price:
-      - "szsh+bj"
     get_stock_kline:
       - "szsh+bj"
+
+# 全市场股票统计宽表 get_stock_stat（0x054B + 0x0010 + zhb/tdxstat）。
+stock_stat:
+  # 054B 每页条数；服务端硬顶 80。
+  page_size: 80
+  # 0010 每批代码数；服务端硬顶 100。
+  finance_batch_size: 100
+  # 是否保留指数/板块占位（399/880 等）。
+  include_indices: false
+  # 054B 最大翻页数；0=翻到空页为止。
+  max_pages: 0
 
 output:
   # 默认返回 DataFrame 还是 list[dict]。
@@ -151,9 +160,6 @@ output:
   # 批量接口默认 batch_size（按“代码数”分批，不是按K线行数）。
   # 取值: 正整数
   default_batch_size: 100
-  # 股票实时行情批量查询每次请求代码数。
-  # 取值: 正整数
-  latest_quote_batch_size: 80
   # 是否过滤停牌/占位K线。
   # 取值: true/false
   filter_suspended_placeholder_bar: true

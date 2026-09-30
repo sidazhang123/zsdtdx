@@ -24,7 +24,9 @@
 - `ex_setup_commands.py`
 - `get_company_info_category.py`
 - `get_company_info_content.py`
-- `get_finance_info.py`
+- `get_finance_info_batch.py`（批量 0x0010 财务/股本）
+- `get_board_quote_page.py`（0x054B 版面分页）
+- `tdxstat.py`（zhb 内 tdxstat/tdxstat2、地区与行业名表）
 - `get_history_minute_time_data.py`
 - `get_history_transaction_data.py`
 - `get_index_bars.py`

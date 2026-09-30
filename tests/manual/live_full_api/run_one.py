@@ -267,28 +267,27 @@ def round_get_all_future_list() -> Dict[str, Any]:
     return {"n": len(rows), "markets": markets, "zhulian": zhulian}
 
 
-def round_get_stock_latest_price() -> Dict[str, Any]:
+def round_get_stock_stat() -> Dict[str, Any]:
     _boot()
-    from zsdtdx import get_client, get_stock_latest_price
+    from zsdtdx import get_client, get_stock_stat
 
-    with get_client() as client:
-        rows = client.get_all_stock_list(return_df=False)
-        codes = [str(r.get("code", "")).strip() for r in rows if str(r.get("code", "")).strip()]
-        default_map = get_stock_latest_price()
-        full_map = get_stock_latest_price(codes)
-    def_ok = sum(1 for v in default_map.values() if v is not None and float(v) > 0)
-    full_ok = sum(1 for v in full_map.values() if v is not None and float(v) > 0)
-    if default_map.get("600000") in (None, 0) and default_map.get("000001") in (None, 0):
-        # 收盘后仍应有最新价
-        if def_ok < 1000:
-            raise RuntimeError("默认szsh最新价有效数量过低")
-    return {
-        "default_n": len(default_map),
-        "default_positive": def_ok,
-        "full_n": len(full_map),
-        "full_positive": full_ok,
-        "sample_600000": default_map.get("600000"),
-    }
+    with get_client():
+        df = get_stock_stat()
+    n = int(len(df))
+    if n < 1000:
+        raise RuntimeError(f"全市场宽表行数过低: {n}")
+    by_code = {str(r["code"]): r for _, r in df.iterrows()}
+    sample = {}
+    for code in ("600000", "000001"):
+        row = by_code.get(code)
+        if row is None:
+            raise RuntimeError(f"缺少 {code}")
+        px = row.get("price")
+        if px is None or float(px) <= 0:
+            raise RuntimeError(f"{code} 价异常: {px}")
+        sample[code] = float(px)
+    pos = int((df["price"].fillna(0).astype(float) > 0).sum())
+    return {"n": n, "positive_price": pos, "sample": sample}
 
 
 def round_get_future_latest_price() -> Dict[str, Any]:
@@ -328,10 +327,10 @@ def round_get_company_info() -> Dict[str, Any]:
 
 def round_get_runtime_failures() -> Dict[str, Any]:
     _boot()
-    from zsdtdx import get_client, get_runtime_failures, get_stock_latest_price
+    from zsdtdx import get_client, get_runtime_failures, get_stock_stat
 
     with get_client():
-        get_stock_latest_price("600000")
+        get_stock_stat()
         df = get_runtime_failures()
     return {"type": type(df).__name__, "rows": int(getattr(df, "shape", [0])[0])}
 
@@ -500,7 +499,7 @@ ROUNDS = {
     "get_supported_markets": round_get_supported_markets,
     "get_stock_code_name": round_get_stock_code_name,
     "get_all_future_list": round_get_all_future_list,
-    "get_stock_latest_price": round_get_stock_latest_price,
+    "get_stock_stat": round_get_stock_stat,
     "get_future_latest_price": round_get_future_latest_price,
     "get_company_info": round_get_company_info,
     "get_runtime_failures": round_get_runtime_failures,

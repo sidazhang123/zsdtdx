@@ -465,7 +465,7 @@ def main() -> int:
         get_runtime_metadata,
         get_stock_code_name,
         get_stock_kline,
-        get_stock_latest_price,
+        get_stock_stat,
         prewarm_parallel_fetcher,
         restart_parallel_fetcher,
         set_config_path,
@@ -660,45 +660,27 @@ def main() -> int:
                 ],
             }
 
-            # ---- latest prices（多样本）----
-            stock_keys = sorted(stock_map.keys())
-            price_codes = _sample_codes(stock_keys, PRICE_SAMPLE_N, ANCHOR_STOCKS)
-            _log(f"get_stock_latest_price n={len(price_codes)} ...")
-            stock_prices = get_stock_latest_price(price_codes)
-            missing_price_keys = [c for c in price_codes if c not in stock_prices]
-            price_scan = _scan_prices(stock_prices, label="stock")
-            sections["get_stock_latest_price"] = {
-                **price_scan,
-                "missing_keys": missing_price_keys[:20],
-                "anchor": {c: stock_prices.get(c) for c in ANCHOR_STOCKS if c in price_codes},
+            # ---- stock_stat 全市场宽表 ----
+            _log("get_stock_stat ...")
+            stock_df = get_stock_stat()
+            by_code = {str(r["code"]): r for _, r in stock_df.iterrows()}
+            price_map = {
+                code: (None if row.get("price") is None else float(row.get("price")))
+                for code, row in by_code.items()
             }
-            if missing_price_keys:
-                warn(
-                    "get_stock_latest_price",
-                    f"缺键 {len(missing_price_keys)}",
-                    sample=missing_price_keys[:20],
-                )
-            # A 股锚点必须正价；港股允许 None（收盘后偶发）
+            price_scan = _scan_prices(price_map, label="stock")
+            sections["get_stock_stat"] = {
+                **price_scan,
+                "n": int(len(stock_df)),
+                "anchor": {
+                    c: price_map.get(c)
+                    for c in ("000001", "600000", "600519", "300750")
+                },
+            }
             for code in ("000001", "600000", "600519", "300750"):
-                v = stock_prices.get(code)
+                v = price_map.get(code)
                 if v is None or float(v) <= 0:
-                    prob("get_stock_latest_price", f"锚点 {code} 无效价={v}")
-            for code in ("09988", "00700", "920000"):
-                v = stock_prices.get(code)
-                if v is not None and float(v) <= 0:
-                    prob("get_stock_latest_price", f"{code} 非正价={v}")
-                elif v is None:
-                    warn("get_stock_latest_price", f"{code} 价为 None（可能未上市/无报价）")
-
-            etf_keys = sorted(etf_map.keys())
-            etf_codes = _sample_codes(etf_keys, ETF_PRICE_SAMPLE_N, ["159915", "510050", "159105", "161725"])
-            _log(f"get_stock_latest_price(etf sample) n={len(etf_codes)} ...")
-            etf_prices = get_stock_latest_price(etf_codes)
-            sections["etf_latest_price"] = _scan_prices(etf_prices, label="etf")
-            for code in ("159915", "510050"):
-                v = etf_prices.get(code)
-                if v is None or float(v) <= 0:
-                    warn("etf_latest_price", f"{code} 无效价={v}")
+                    prob("get_stock_stat", f"锚点 {code} 无效价={v}")
 
             fut_codes_all = [
                 str(r.get("code", "")).strip()
@@ -930,7 +912,7 @@ def main() -> int:
 
         # ---- runtime ----
         with get_client():
-            get_stock_latest_price(["600000"])
+            get_stock_stat()
             fails = get_runtime_failures()
             meta = get_runtime_metadata()
         sections["get_runtime_failures"] = {

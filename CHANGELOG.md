@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.3.1 - 2026-09-30
+
+### Summary
+1. 以 `get_stock_stat` 替换 `get_stock_latest_price`：返回全市场宽表 DataFrame（054B 实时 + 批量 0010 财务 + zhb/tdxstat 多日统计）。
+2. 新增解析器 `get_board_quote_page` / `get_finance_info_batch` / `tdxstat`，经 `net/hq.py` 与 `biz/stock_stat` 分层接入。
+3. D 类文件复用 `block_file_cache` 中的 `zhb.zip` / `tdxhy.cfg`（6 小时 TTL），不另起日缓存。
+4. 配置新增 `stock_stat`；删除 `stock_scope...get_stock_latest_price` 与 `output.latest_quote_batch_size`。
+5. 删除未使用的单票 `get_finance_info`（pytdx 旧字段名/量纲）；批量 0x0010 仅保留 `get_finance_info_batch`（对齐看板标定）。
+6. 版本号：`pyproject.toml` 与 `__init__.__version__` 对齐为 `2.3.1`。
+
 ## v2.3.0 - 2026-09-29
 
 ### Summary

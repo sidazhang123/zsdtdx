@@ -35,17 +35,19 @@ stock_scope:
     get_stock_code_name:
       - "szsh"
       - "bj"
-    get_stock_latest_price:
-      - "szsh"
-      - "bj"
     get_stock_kline:
       - "szsh"
       - "bj"
 
+stock_stat:
+  page_size: 80
+  finance_batch_size: 100
+  include_indices: false
+  max_pages: 0
+
 output:
   return_df_default: true
   default_batch_size: 100
-  latest_quote_batch_size: 80
   filter_suspended_placeholder_bar: true
 
 index_kline:

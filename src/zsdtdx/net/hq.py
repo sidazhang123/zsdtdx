@@ -4,7 +4,7 @@
 职责：
 1. 提供 zsdtdx 体系中的协议封装、解析或对外接口能力。
 2. 对上层暴露稳定调用契约，屏蔽底层协议数据细节。
-3. 当前统计：类 1 个，函数 20 个。
+3. 当前统计：类 1 个，函数 21 个。
 
 边界：
 1. 本模块仅负责当前文件定义范围，不承担其它分层编排职责。
@@ -21,7 +21,8 @@ from zsdtdx.net.base_socket_client import BaseSocketClient, update_last_ack_time
 from zsdtdx.params import TDXParams
 from zsdtdx.parser.get_company_info_category import GetCompanyInfoCategory
 from zsdtdx.parser.get_company_info_content import GetCompanyInfoContent
-from zsdtdx.parser.get_finance_info import GetFinanceInfo
+from zsdtdx.parser.get_board_quote_page import GetBoardQuotePageCmd
+from zsdtdx.parser.get_finance_info_batch import GetFinanceInfoBatchCmd
 from zsdtdx.parser.get_history_minute_time_data import GetHistoryMinuteTimeData
 from zsdtdx.parser.get_history_transaction_data import GetHistoryTransactionData
 from zsdtdx.parser.get_block_bars import GetBlockBarsCmd
@@ -347,20 +348,27 @@ class TdxHq_API(BaseSocketClient):
         return cmd.call_api()
 
     @update_last_ack_time
-    def get_finance_info(self, market, code):
+    def get_board_quote_page(self, start, count=80):
         """
-        输入：
-        1. market: 输入参数，约束以协议定义与函数实现为准。
-        2. code: 输入参数，约束以协议定义与函数实现为准。
-        输出：
-        1. 返回值语义由函数实现定义；无返回时为 `None`。
-        用途：
-        1. 执行 `get_finance_info` 对应的协议处理、数据解析或调用适配逻辑。
-        边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        输入：列表偏移 start、本页条数 count（硬顶 80）。
+        输出：版面 A/B 字段行列表。
+        用途：0x054B 分页拉全市场实时行（不先查码表）。
+        边界：服务端硬顶约 80/页；空页返回 []。
         """
-        cmd = GetFinanceInfo(self.client, lock=self.lock)
-        cmd.setParams(market, code)
+        cmd = GetBoardQuotePageCmd(self.client, lock=self.lock)
+        cmd.setParams(start, count)
+        return cmd.call_api()
+
+    @update_last_ack_time
+    def get_finance_info_batch(self, stocks):
+        """
+        输入：[(market, code), ...]，1..100 条。
+        输出：C 类财务/股本行列表。
+        用途：批量 0x0010。
+        边界：条数越界由解析器抛 ValueError；单批失败由连接池重试策略处理。
+        """
+        cmd = GetFinanceInfoBatchCmd(self.client, lock=self.lock)
+        cmd.setParams(stocks)
         return cmd.call_api()
 
     @update_last_ack_time

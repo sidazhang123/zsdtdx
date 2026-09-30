@@ -88,6 +88,9 @@ class TDXParams:
     TDXZS_ZIP_MEMBER = "tdxzs.cfg"
     TDXZS3_ZIP_MEMBER = "tdxzs3.cfg"
     ILONG_ZIP_MEMBER = "ilong.dat"
+    TDXSTAT_ZIP_MEMBER = "tdxstat.cfg"
+    TDXSTAT2_ZIP_MEMBER = "tdxstat2.cfg"
+    INCON_ZIP_MEMBER = "incon.dat"
 
     # 仅传日期时的默认时分秒（股票/指数/板块 vs 期货）
     STOCK_DATE_ONLY_START_TIME = "09:30:00"

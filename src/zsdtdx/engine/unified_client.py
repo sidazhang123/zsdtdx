@@ -1601,6 +1601,7 @@ class UnifiedTdxClient:
         )
         self.index_kline_cfg = self.config.get("index_kline", {}) or {}
         self.index_kline_aliases_cfg = self.index_kline_cfg.get("aliases", {}) or {}
+        self.stock_stat_cfg = self.config.get("stock_stat", {}) or {}
         # 指数目录由码表聚合层在使用时过滤得到，仅保留进程内快照。
         self._index_catalog_records: List[Dict[str, Any]] = []
         self._index_name_route_map: Dict[str, Dict[str, Any]] = {}
@@ -4564,6 +4565,20 @@ class UnifiedTdxClient:
             files[name] = bytes(raw)
         return files
 
+    def _ensure_block_named_files(self) -> Dict[str, bytes]:
+        """
+        输入：无。
+        输出：文件名到 bytes 的字典（infoharbor_block.dat / tdxhy.cfg / zhb.zip）。
+        用途：`get_stock_stat` 与板块目录共用 6 小时缓存，命中则不下载。
+        边界条件：缓存未过期直接返回；过期或损坏时下载三件套并写回缓存。
+        """
+        fresh = load_fresh_block_files()
+        if fresh is not None:
+            return dict(fresh["files"])
+        files = self._download_block_named_files()
+        save_block_files(files)
+        return files
+
     def _load_block_index_catalog(self) -> BlockIndexCatalog:
         """
         输入无，输出板块指数目录。
@@ -5240,122 +5255,151 @@ class UnifiedTdxClient:
             return df.copy()
         return df.to_dict(orient="records")
 
-    def get_stock_latest_price(
-        self, codes: Optional[Any] = None
-    ) -> Dict[str, Optional[float]]:
+    def get_stock_stat(self) -> pd.DataFrame:
         """
-        输入股票代码列表，输出最新价字典。
+        输入无，输出全市场股票统计宽表 DataFrame。
 
-        输入：
-        1. codes: 可选代码列表；为空时按配置默认范围拉取。
-        输出：
-        1. `{code: price}`；无有效报价为 None。
-        用途：
-        1. 实时最新价；现价非正时回退昨收。
+        输入：无。范围与分页由 `config.yaml` 的 `stock_stat` 控制。
+        输出：一行一只股票的宽表；金额统一为万元；无 codes 过滤。
+        用途：一次聚合 054B 实时行 + 0010 财务 + zhb/tdxstat 多日统计。
         边界条件：
-        1. 未上市占位码随整批一次解析，现价与昨收都非正则记 None，不再拆单重试。
+        1. 不先查码表；054B 回包自带代码。
+        2. zhb.zip / tdxhy.cfg 复用板块命名文件 6 小时缓存，不强制刷新。
+        3. 不含港股扩展行情。
         """
-        query_codes = self._normalize_code_list(codes)
+        from zsdtdx.biz.stock_stat import (
+            assemble_stock_stat_rows,
+            is_stock_stat_row,
+            rows_to_stock_stat_df,
+        )
+        from zsdtdx.parser.get_board_quote_page import MAX_BOARD_QUOTE_PAGE
+        from zsdtdx.parser.get_finance_info_batch import MAX_FINANCE_INFO_BATCH
+        from zsdtdx.parser.tdxstat import (
+            merge_tdxstat_maps,
+            parse_industry_name_map_from_incon,
+            parse_region_map_from_tdxzs,
+            parse_tdxhy_code_map,
+            parse_tdxstat2_cfg,
+            parse_tdxstat_cfg,
+            read_zhb_stat_payload,
+        )
 
-        if query_codes is None:
-            self.get_all_stock_list(return_df=True)
-            targets = self._get_default_scoped_stock_codes("get_stock_latest_price")
-        else:
-            targets = []
-            missing = []
-            for raw_code in query_codes:
-                try:
-                    code = self._normalize_stock_query_code(raw_code)
-                except Exception:
-                    continue
-                if self._lookup_stock_route(code) is not None:
-                    targets.append(code)
-                else:
-                    missing.append(code)
-            if missing:
-                self.get_all_stock_list(return_df=True, refresh=True)
-                for code in missing:
-                    if self._lookup_stock_route(code) is not None:
-                        targets.append(code)
+        cfg = self.stock_stat_cfg or {}
+        page_size = min(
+            max(1, int(cfg.get("page_size", MAX_BOARD_QUOTE_PAGE))),
+            MAX_BOARD_QUOTE_PAGE,
+        )
+        batch_n = min(
+            max(1, int(cfg.get("finance_batch_size", MAX_FINANCE_INFO_BATCH))),
+            MAX_FINANCE_INFO_BATCH,
+        )
+        max_pages = int(cfg.get("max_pages", 0) or 0)
+        include_indices = bool(cfg.get("include_indices", False))
 
-        targets = list(dict.fromkeys(targets))
-        result: Dict[str, Optional[float]] = {code: None for code in targets}
-        if not targets:
-            return result
-
-        std_targets: List[Tuple[str, int, str]] = []
-        ex_targets: List[Tuple[str, int, str]] = []
-        for code in targets:
-            route = self._lookup_stock_route(code)
-            if route is None:
-                self._record_failure(
-                    "stock_latest_price", code, "code_not_found", "route_missing"
-                )
-                continue
-            market = int(route.get("market", -1))
-            source = str(route.get("source", "")).strip().lower()
-            if source == "std":
-                std_targets.append((code, market, code))
-            elif source == "ex":
-                ex_targets.append((code, market, code))
-            else:
-                self._record_failure(
-                    "stock_latest_price", code, "unsupported_source", source
-                )
-
-        quote_batch_size = int(self.output_cfg.get("latest_quote_batch_size", 80))
-        quote_batch_size = max(1, quote_batch_size)
-
-        for start in range(0, len(std_targets), quote_batch_size):
-            chunk = std_targets[start : start + quote_batch_size]
-            req = [(int(market), str(code)) for _, market, code in chunk]
-            pair_to_key = {(int(market), str(code)): key for key, market, code in chunk}
-            resolved: set = set()
+        ab_rows: List[Dict[str, Any]] = []
+        seen: set = set()
+        start = 0
+        page_i = 0
+        while True:
+            if max_pages > 0 and page_i >= max_pages:
+                break
             try:
-                rows = self._pool_call_allow_none(
+                page = self._pool_call_allow_none(
                     self.std_pool,
-                    "get_security_quotes",
-                    req,
+                    "get_board_quote_page",
+                    start,
+                    page_size,
                 )
             except Exception as exc:
-                for key, _, _ in chunk:
-                    self._record_failure(
-                        "stock_latest_price", key, "exception", str(exc)
-                    )
-                rows = []
-
-            for row in rows or []:
-                try:
-                    market = int(row.get("market", -1))
-                except Exception:
-                    market = -1
-                code = str(row.get("code", "")).strip().rstrip("\x00")
-                key = pair_to_key.get((market, code))
-                if key is None:
+                self._record_failure(
+                    "stock_stat", f"page@{start}", "exception", str(exc)
+                )
+                break
+            page = list(page or [])
+            if not page:
+                break
+            for r in page:
+                if r.get("parse_error"):
                     continue
-                result[key] = self._quote_last_price(row)
-                resolved.add(key)
+                try:
+                    m = int(r.get("market", -1))
+                except (TypeError, ValueError):
+                    continue
+                c = str(r.get("code", "")).strip()
+                key = (m, c)
+                if key in seen:
+                    continue
+                if is_stock_stat_row(m, c, include_indices=include_indices):
+                    seen.add(key)
+                    ab_rows.append(r)
+            page_i += 1
+            if len(page) < page_size:
+                break
+            start += page_size
 
-            for key, _, _ in chunk:
-                if key not in resolved:
-                    result.setdefault(key, None)
-
-        for key, market, code in ex_targets:
+        codes = [(int(r["market"]), str(r["code"])) for r in ab_rows]
+        fin_map: Dict[str, Dict[str, Any]] = {}
+        for i in range(0, len(codes), batch_n):
+            chunk = codes[i : i + batch_n]
             try:
-                rows = self._pool_call_allow_none(
-                    self.ex_pool,
-                    "get_instrument_quote",
-                    int(market),
-                    str(code),
+                fin_rows = self._pool_call_allow_none(
+                    self.std_pool,
+                    "get_finance_info_batch",
+                    chunk,
                 )
             except Exception as exc:
-                self._record_failure("stock_latest_price", key, "exception", str(exc))
-                result[key] = None
+                self._record_failure(
+                    "stock_stat",
+                    f"finance@{i}",
+                    "exception",
+                    str(exc),
+                )
                 continue
-            one = (rows or [None])[0]
-            result[key] = self._quote_last_price(one)
+            for fr in fin_rows or []:
+                if fr.get("parse_error"):
+                    continue
+                fin_map[str(fr["code"])] = fr
 
-        return result
+        stat_map: Dict[str, Dict[str, Any]] = {}
+        region_map: Dict[int, str] = {}
+        industry_name_map: Dict[str, str] = {}
+        code_hy_map: Dict[str, str] = {}
+        try:
+            files = self._ensure_block_named_files()
+            zhb = files.get(TDXParams.ZHB_ZIP_REMOTE_FILE) or b""
+            payload = read_zhb_stat_payload(zhb)
+            st1 = (
+                parse_tdxstat_cfg(payload["tdxstat.cfg"])
+                if "tdxstat.cfg" in payload
+                else {}
+            )
+            st2 = (
+                parse_tdxstat2_cfg(payload["tdxstat2.cfg"])
+                if "tdxstat2.cfg" in payload
+                else {}
+            )
+            stat_map = merge_tdxstat_maps(st1, st2)
+            if "tdxzs.cfg" in payload:
+                region_map = parse_region_map_from_tdxzs(payload["tdxzs.cfg"])
+            if "incon.dat" in payload:
+                industry_name_map = parse_industry_name_map_from_incon(
+                    payload["incon.dat"]
+                )
+            hy_raw = files.get(TDXParams.TDXHY_REMOTE_FILE) or b""
+            if hy_raw:
+                code_hy_map = parse_tdxhy_code_map(hy_raw)
+        except Exception as exc:
+            self._record_failure("stock_stat", "block_files", "exception", str(exc))
+
+        rows = assemble_stock_stat_rows(
+            ab_rows,
+            fin_map,
+            stat_map,
+            region_map,
+            industry_name_map,
+            code_hy_map,
+        )
+        return rows_to_stock_stat_df(rows)
 
     def get_future_latest_price(
         self, codes: Optional[Any] = None

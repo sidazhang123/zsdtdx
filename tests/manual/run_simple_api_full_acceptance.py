@@ -113,7 +113,7 @@ def main() -> int:
         get_runtime_metadata,
         get_stock_code_name,
         get_stock_kline,
-        get_stock_latest_price,
+        get_stock_stat,
         set_config_path,
     )
 
@@ -145,7 +145,7 @@ def main() -> int:
             warn,
             get_stock_code_name,
             get_all_future_list,
-            get_stock_latest_price,
+            get_stock_stat,
             get_future_latest_price,
             get_client,
             get_stock_kline,
@@ -196,7 +196,7 @@ def _run_body(
     warn,
     get_stock_code_name,
     get_all_future_list,
-    get_stock_latest_price,
+    get_stock_stat,
     get_future_latest_price,
     get_client,
     get_stock_kline,
@@ -240,15 +240,16 @@ def _run_body(
             prob("get_all_future_list", f"期货市场不全: {sorted(fmarkets)}")
         sections["future_list"] = {"n": len(futures), "markets": sorted(fmarkets)}
 
-        price_codes = list(STOCKS.values())
-        prices = get_stock_latest_price(price_codes)
+        df = get_stock_stat()
+        by_code = {str(r["code"]): r for _, r in df.iterrows()}
         price_detail = {}
         for label, code in STOCKS.items():
-            v = prices.get(code)
+            row = by_code.get(code)
+            v = None if row is None else row.get("price")
             price_detail[label] = v
             if v is None or float(v) <= 0:
-                prob("get_stock_latest_price", f"{label}:{code} 无效价={v}")
-        sections["stock_latest_price"] = price_detail
+                prob("get_stock_stat", f"{label}:{code} 无效价={v}")
+        sections["stock_stat"] = {"n": int(len(df)), "anchors": price_detail}
 
         fprices = get_future_latest_price(["CUL8", "ALL8"])
         for code, v in fprices.items():

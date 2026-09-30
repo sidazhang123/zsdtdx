@@ -34,7 +34,7 @@ pip install zsdtdx
 - `destroy_parallel_fetcher`
 - `get_future_kline`
 - `get_company_info`
-- `get_stock_latest_price`
+- `get_stock_stat`
 - `get_future_latest_price`
 - `get_runtime_failures`
 - `get_runtime_metadata`
@@ -149,7 +149,7 @@ from zsdtdx import get_client
 # 一个 with 中复用同一 client，避免重复建连。
 with get_client():
     stock_map = get_stock_code_name()
-    prices = get_stock_latest_price(["600000", "000001"])
+    board = get_stock_stat()
 ```
 
 **作用边界:**
@@ -320,10 +320,10 @@ with get_client():
 
 ```python
 import queue as py_queue
-from zsdtdx import StockKlineTask, get_client, get_stock_kline, get_stock_latest_price
+from zsdtdx import StockKlineTask, get_client, get_stock_kline, get_stock_stat
 
 with get_client():
-    prices = get_stock_latest_price(["600000", "000001"])
+    board = get_stock_stat()
     q = py_queue.Queue()
     result = get_stock_kline(
         task=[
@@ -653,9 +653,9 @@ with get_client():
 
 
 
-#### get_stock_latest_price
+#### get_stock_stat
 
-获取股票实时最新价字典。
+获取全市场股票统计宽表（实时价量 + 财务/股本 + 多日涨幅等）。
 
 **调用前置约定:**
 
@@ -663,41 +663,26 @@ with get_client():
 
 **输入:**
 
-- codes: 可选股票代码列表；支持 `sh./sz./bj./hk.` 前缀；
-为空时按 `config.yaml.stock_scope.defaults_when_codes_none.get_stock_latest_price`
-拉取默认范围全量股票；显式传入代码时不受该范围开关影响。
-停牌时回退昨收；未上市占位（现价与昨收都非正）为 None，随整批一次解析，不额外重试。
-单票无有效报价不会把同批其它代码打成 None。
+- 无。分页与过滤由 `config.yaml` 的 `stock_stat` 控制
+  （`page_size` / `finance_batch_size` / `include_indices` / `max_pages`）。
+- A/B 来自 `0x054B` 分页；C 来自批量 `0x0010`；D 来自板块命名文件缓存中的
+  `zhb.zip`（`tdxstat.cfg` / `tdxstat2.cfg`）与 `tdxhy.cfg`，复用 6 小时缓存，不强制刷新。
+- 不含港股扩展行情；无 `codes` 入参。
 
 **调用示例:**
 
-- 1个code:
-
 ```python
-from zsdtdx import get_client, get_stock_latest_price
+from zsdtdx import get_client, get_stock_stat
 
 with get_client():
-    one = get_stock_latest_price("600000")
+    df = get_stock_stat()
 ```
 
-- 2个code:
+**返回示例（列节选）:**
 
-```python
-with get_client():
-    two = get_stock_latest_price(["600000", "09988"])
-```
-
-- 全部code:
-
-```python
-with get_client():
-    all_prices = get_stock_latest_price()
-```
-
-**返回示例:**
-
-```json
-{"600000": 9.98, "09988": 158.5}
+```text
+market code   price  last_close  ...  pe_ttm  chg_pct_5d  industry
+1      600000  9.98   9.90        ...  5.2     1.23        银行
 ```
 
 
@@ -919,7 +904,7 @@ market_rules:
 
 stock_scope:
   # 当股票接口不传 codes（即 codes=None）时，默认抓取范围。
-  # 作用对象: get_stock_code_name / get_stock_latest_price；
+  # 作用对象: get_stock_code_name；
   # 以及客户端批路径 get_stock_kline(codes=None)。simple_api 任务化 get_stock_kline 必须显式传 task.code，不受本段影响。
   defaults_when_codes_none:
     # 取值支持:
@@ -942,10 +927,15 @@ stock_scope:
     # 3) 显式传入 codes 时，不受这里配置影响。
     get_stock_code_name:
       - "szsh+bj"
-    get_stock_latest_price:
-      - "szsh+bj"
     get_stock_kline:
       - "szsh+bj"
+
+stock_stat:
+  # 全市场股票统计宽表 get_stock_stat。
+  page_size: 80
+  finance_batch_size: 100
+  include_indices: false
+  max_pages: 0
 
 output:
   # 默认返回 DataFrame 还是 list[dict]。
@@ -954,9 +944,6 @@ output:
   # 批量接口默认 batch_size（按“代码数”分批，不是按K线行数）。
   # 取值: 正整数
   default_batch_size: 100
-  # 股票实时行情批量查询每次请求代码数。
-  # 取值: 正整数
-  latest_quote_batch_size: 80
   # 是否过滤停牌/占位K线。
   # 取值: true/false
   filter_suspended_placeholder_bar: true

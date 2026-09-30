@@ -230,26 +230,27 @@ def case_future_list() -> Dict[str, Any]:
     return {"n": len(rows), "markets": sorted(markets), "CUL8": sample}
 
 
-def case_stock_latest_price() -> Dict[str, Any]:
+def case_stock_stat() -> Dict[str, Any]:
     """
     输入：无。
-    输出：样本最新价。
-    用途：验收 get_stock_latest_price 能解析 A 股与港股最新价。
-    边界：A 股价必须为正；港股若服务端无数据允许 None，但接口必须返回键。
+    输出：宽表样本价。
+    用途：验收 get_stock_stat 全市场宽表含 A 股锚点正价。
+    边界：不含港股扩展行情；锚点 600000/000001 必须存在且 price>0。
     """
-    from zsdtdx import get_client, get_stock_latest_price
+    from zsdtdx import get_client, get_stock_stat
 
     with get_client():
-        mp = get_stock_latest_price(["600000", "000001", "09988"])
-    _require(isinstance(mp, dict), f"最新价非 dict: {type(mp)}")
+        df = get_stock_stat()
+    _require(df is not None and len(df) > 0, f"宽表为空: {type(df)}")
+    by_code = {str(r["code"]): r for _, r in df.iterrows()}
+    out = {}
     for code in ("600000", "000001"):
-        val = mp.get(code)
-        _require(val is not None and float(val) > 0, f"{code} 最新价异常: {val}")
-    _require("09988" in mp, "缺少港股 09988 键")
-    hk = mp.get("09988")
-    if hk is not None:
-        _require(float(hk) > 0, f"09988 最新价非正: {hk}")
-    return {"600000": mp.get("600000"), "000001": mp.get("000001"), "09988": hk}
+        _require(code in by_code, f"缺少 {code}")
+        val = by_code[code].get("price")
+        _require(val is not None and float(val) > 0, f"{code} 价异常: {val}")
+        out[code] = float(val)
+    out["n"] = int(len(df))
+    return out
 
 
 def case_future_latest_price() -> Dict[str, Any]:
@@ -415,10 +416,10 @@ def case_runtime() -> Dict[str, Any]:
     用途：验收 get_runtime_failures / get_runtime_metadata。
     边界：metadata 必须为非空 dict，并含当前银河 host 线索。
     """
-    from zsdtdx import get_client, get_runtime_failures, get_runtime_metadata, get_stock_latest_price
+    from zsdtdx import get_client, get_runtime_failures, get_runtime_metadata, get_stock_stat
 
     with get_client():
-        get_stock_latest_price("600000")
+        get_stock_stat()
         failures = get_runtime_failures()
         meta = get_runtime_metadata()
     _require(failures is not None, "failures 为空对象")
@@ -440,7 +441,7 @@ CASES = [
     ("get_supported_markets", case_supported_markets),
     ("get_stock_code_name", case_stock_code_name),
     ("get_all_future_list", case_future_list),
-    ("get_stock_latest_price", case_stock_latest_price),
+    ("get_stock_stat", case_stock_stat),
     ("get_future_latest_price", case_future_latest_price),
     ("get_company_info", case_company_info),
     ("get_stock_kline_sync", case_stock_kline_sync),

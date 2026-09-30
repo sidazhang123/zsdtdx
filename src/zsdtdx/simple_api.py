@@ -35,6 +35,7 @@ from zsdtdx.biz.company_info import fetch_company_info
 from zsdtdx.biz.future_kline import fetch_future_kline
 from zsdtdx.biz.index_kline import fetch_index_kline
 from zsdtdx.biz.stock_kline import fetch_stock_kline
+from zsdtdx.biz.stock_stat import fetch_stock_stat
 from zsdtdx.util.helper import (
     _apply_active_config_path,
     _ensure_active_config_ready,
@@ -98,7 +99,7 @@ def get_client(
     # 一个 with 中复用同一 client，避免重复建连。
     with get_client():
         stock_map = get_stock_code_name()
-        prices = get_stock_latest_price(["600000", "000001"])
+        board = get_stock_stat()
     ```
 
     返回示例:
@@ -324,10 +325,10 @@ def get_stock_kline(
     调用示例（写法一：with + sync + 其它接口）:
     ```python
     import queue as py_queue
-    from zsdtdx import StockKlineTask, get_client, get_stock_kline, get_stock_latest_price
+    from zsdtdx import StockKlineTask, get_client, get_stock_kline, get_stock_stat
 
     with get_client():
-        prices = get_stock_latest_price(["600000", "000001"])
+        board = get_stock_stat()
         q = py_queue.Queue()
         result = get_stock_kline(
             task=[
@@ -380,47 +381,36 @@ def get_stock_kline(
     )
 
 
-def get_stock_latest_price(codes: Optional[Any] = None) -> Dict[str, Optional[float]]:
-    """获取股票实时最新价字典。
+def get_stock_stat() -> pd.DataFrame:
+    """获取全市场股票统计宽表。
 
     调用前置约定:
     - 请先进入 `with get_client():`；
       一个 with 块内可连续调用多个 `get_*` 函数。
 
     输入:
-    - codes: 可选股票代码列表；支持 `sh./sz./bj./hk.` 前缀；
-      为空时按 `config.yaml.stock_scope.defaults_when_codes_none.get_stock_latest_price`
-      拉取默认范围全量股票；显式传入代码时不受该范围开关影响。
-      停牌时回退昨收；未上市占位（现价与昨收都非正）为 None，随整批一次解析，不额外重试。
-      单票无有效报价不会把同批其它代码打成 None。
+    - 无。分页与过滤由 `config.yaml` 的 `stock_stat` 控制
+      （`page_size`/`finance_batch_size`/`include_indices`/`max_pages`）。
+      A/B 来自 0x054B 分页；C 来自批量 0x0010；D 来自板块命名文件缓存中的
+      `zhb.zip`（tdxstat/tdxstat2）与 `tdxhy.cfg`（行业），不强制刷新缓存。
+
+    输出:
+    - 一行一只股票的宽表 DataFrame；金额统一为万元；总量/现量为手。
+      不含港股扩展行情；无 codes 入参。
 
     调用示例:
-    - 1个code:
     ```python
     with get_client():
-        one = get_stock_latest_price("600000")
-    ```
-    - 2个code:
-    ```python
-    with get_client():
-        two = get_stock_latest_price(["600000", "09988"])
-    ```
-    - 全部code:
-    ```python
-    with get_client():
-        all_prices = get_stock_latest_price()
+        df = get_stock_stat()
     ```
 
-    返回示例:
-    ```json
-    {"600000": 9.98, "09988": 158.5}
+    返回示例（列节选）:
+    ```text
+    market code   price  last_close  ...  pe_ttm  chg_pct_5d  industry
+    1      600000  9.98   9.90        ...  5.2     1.23        银行
     ```
     """
-    return _call_with_client(
-        lambda client: client.get_stock_latest_price(codes=codes),
-        get_active_context_client=UnifiedTdxClient.get_active_context_client,
-        build_client=lambda: get_client(),
-    )
+    return fetch_stock_stat()
 
 
 def get_company_info(
@@ -812,7 +802,7 @@ __all__ = [
     "get_block_names",
     "get_all_future_list",
     "get_stock_kline",
-    "get_stock_latest_price",
+    "get_stock_stat",
     "get_company_info",
     "get_index_kline",
     "get_block_kline",

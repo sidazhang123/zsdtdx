@@ -72,7 +72,6 @@ def _prepare_runtime_config(run: Dict[str, Any], art_dir: Path) -> Path:
     defaults = dict(stock_scope.get("defaults_when_codes_none") or {})
     defaults["get_stock_code_name"] = scopes
     defaults["get_stock_kline"] = scopes
-    defaults["get_stock_latest_price"] = scopes
     stock_scope["defaults_when_codes_none"] = defaults
     cfg["stock_scope"] = stock_scope
 
