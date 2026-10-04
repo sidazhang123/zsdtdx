@@ -5260,17 +5260,17 @@ class UnifiedTdxClient:
         输入无，输出全市场股票统计宽表 DataFrame。
 
         输入：无。范围与分页由 `config.yaml` 的 `stock_stat` 控制。
-        输出：一行一只股票的宽表；金额统一为万元；无 codes 过滤。
-        用途：一次聚合 054B 实时行 + 0010 财务 + zhb/tdxstat 多日统计。
+        输出：一行一只股票的宽表；中文表头（含单位）；金额统一为万元；无 codes 过滤。
+        用途：一次聚合 054B 实时行情 + 0010 财务 + zhb/tdxstat 统计快照。
         边界条件：
         1. 不先查码表；054B 回包自带代码。
         2. zhb.zip / tdxhy.cfg 复用板块命名文件 6 小时缓存，不强制刷新。
         3. 不含港股扩展行情。
+        4. 市值/pb/ps/pcf 按现价计算，现价非正则回退昨收；tdxstat 价敏字段仅在 `stat_asof` 非当日时按现价折算。
         """
         from zsdtdx.biz.stock_stat import (
-            assemble_stock_stat_rows,
+            build_stock_stat_df,
             is_stock_stat_row,
-            rows_to_stock_stat_df,
         )
         from zsdtdx.parser.get_board_quote_page import MAX_BOARD_QUOTE_PAGE
         from zsdtdx.parser.get_finance_info_batch import MAX_FINANCE_INFO_BATCH
@@ -5391,7 +5391,7 @@ class UnifiedTdxClient:
         except Exception as exc:
             self._record_failure("stock_stat", "block_files", "exception", str(exc))
 
-        rows = assemble_stock_stat_rows(
+        return build_stock_stat_df(
             ab_rows,
             fin_map,
             stat_map,
@@ -5399,7 +5399,6 @@ class UnifiedTdxClient:
             industry_name_map,
             code_hy_map,
         )
-        return rows_to_stock_stat_df(rows)
 
     def get_future_latest_price(
         self, codes: Optional[Any] = None

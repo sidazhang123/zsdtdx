@@ -2,7 +2,7 @@
 模块：`parser/tdxstat.py`。
 
 职责：
-1. 解析 `zhb.zip` 内 `tdxstat.cfg` / `tdxstat2.cfg` 多日涨幅与扩展统计。
+1. 解析 `zhb.zip` 内 `tdxstat.cfg` / `tdxstat2.cfg` 多日涨幅、估值快照与扩展统计。
 2. 从 `tdxzs.cfg` 解析地区码→中文名；从 `incon.dat` 解析通达信行业码→中文名。
 3. 从 `tdxhy.cfg` 解析股票代码→通达信行业码。
 
@@ -10,6 +10,7 @@
 1. 纯解析，不发起网络、不写缓存。
 2. tdxstat 文件无表头；列义按日线反算与截图金额标定；金额为文件原生万元。
 3. 地区仅收分类字段=3 的行；行业名仅收 `#TDXNHY` 段。
+4. 文件内无当日股价；`pe_*` / 涨幅 / 股息率为昨收时点快照，由业务层按现价折算。
 """
 
 from __future__ import annotations
@@ -20,7 +21,8 @@ import zipfile
 from collections import OrderedDict
 from typing import Any, Dict, Optional, Sequence
 
-STAT_MERGE_KEYS = (
+# 挂到 get_stock_stat 宽表的 tdxstat/tdxstat2 字段（原样合并，不按现价重算）。
+TDXSTAT_FIELD_KEYS = (
     "stat_asof",
     "beta",
     "consec_up_days",
@@ -43,7 +45,6 @@ STAT_MERGE_KEYS = (
     "rd_expense",
     "cash_funds",
     "contract_liab",
-    "limit_up_days_1y",
 )
 
 
@@ -69,7 +70,7 @@ def _tdxstat_cell_int(parts: Sequence[str], i: int) -> Optional[int]:
     """
     输入：管道分割字段、下标。
     输出：整数或 None。
-    用途：连涨天/员工/年涨停等整型列。
+    用途：连涨天数/员工数等整型列。
     边界：先按浮点解析再转 int；空→None。
     """
     v = _tdxstat_cell_float(parts, i)
@@ -79,9 +80,9 @@ def _tdxstat_cell_int(parts: Sequence[str], i: int) -> Optional[int]:
 def parse_tdxstat_cfg(raw: bytes) -> Dict[str, Dict[str, Any]]:
     """
     输入：`tdxstat.cfg` 原文。
-    输出：code → 多日涨幅 + 估值 + 扩展财务 D 类字段。
+    输出：code → 多日涨幅 + 估值快照 + 扩展财务字段。
     用途：解析 zhb.zip 内统计主表。
-    边界：无表头；空单元格→None；金额为文件原生万元。
+    边界：无表头；空单元格→None；金额为文件原生万元；不含当日股价。
     """
     text = raw.decode("gbk", errors="replace")
     out: Dict[str, Dict[str, Any]] = {}
@@ -112,7 +113,6 @@ def parse_tdxstat_cfg(raw: bytes) -> Dict[str, Dict[str, Any]]:
                 ("chg_pct_ytd", _tdxstat_cell_float(parts, 21)),
                 ("cash_funds", _tdxstat_cell_float(parts, 24)),
                 ("contract_liab", _tdxstat_cell_float(parts, 25)),
-                ("limit_up_days_1y", _tdxstat_cell_int(parts, 26)),
                 ("chg_pct_5d", _tdxstat_cell_float(parts, 28)),
                 ("chg_pct_10d", _tdxstat_cell_float(parts, 30)),
             ]
@@ -123,8 +123,8 @@ def parse_tdxstat_cfg(raw: bytes) -> Dict[str, Dict[str, Any]]:
 def parse_tdxstat2_cfg(raw: bytes) -> Dict[str, Dict[str, Any]]:
     """
     输入：`tdxstat2.cfg` 原文。
-    输出：code → 一年/30 日等补充 D 类字段。
-    用途：与 tdxstat 合并。
+    输出：code → 一年/30 日等补充涨幅字段。
+    用途：与 tdxstat 主表按代码合并。
     边界：无表头；[12]=一年涨幅%、[20]=30日涨幅%。
     """
     text = raw.decode("gbk", errors="replace")
@@ -151,8 +151,8 @@ def merge_tdxstat_maps(
 ) -> Dict[str, Dict[str, Any]]:
     """
     输入：tdxstat 主表、tdxstat2 补表。
-    输出：按代码合并后的 D 类字典（stat2 键覆盖同名键）。
-    用途：一次给出完整多日涨幅字段。
+    输出：按代码合并后的统计字典（stat2 同名键覆盖主表）。
+    用途：一次给出完整多日涨幅与估值快照字段。
     边界：只出现在一侧的代码也会保留。
     """
     out: Dict[str, Dict[str, Any]] = {}

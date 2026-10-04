@@ -391,12 +391,18 @@ def get_stock_stat() -> pd.DataFrame:
     输入:
     - 无。分页与过滤由 `config.yaml` 的 `stock_stat` 控制
       （`page_size`/`finance_batch_size`/`include_indices`/`max_pages`）。
-      A/B 来自 0x054B 分页；C 来自批量 0x0010；D 来自板块命名文件缓存中的
-      `zhb.zip`（tdxstat/tdxstat2）与 `tdxhy.cfg`（行业），不强制刷新缓存。
+      行情 0x054B；财务/股本 0x0010；多日涨幅与估值等来自 zhb/tdxstat + tdxhy。
+      市值/市净/市销/市现用现价（现价非正则回退昨收）。
+      市盈率(TTM|静)/股息率(%)/多日涨幅：统计基准日非当日才按现价折算。
 
     输出:
-    - 一行一只股票的宽表 DataFrame；金额统一为万元；总量/现量为手。
-      不含港股扩展行情；无 codes 入参。
+    - 一行一只股票；中文表头。金额万元、量手、股本万股；不含港股；无 codes。
+    - 返回列说明见 `STOCK_STAT_COLUMN_LABELS` 及 README「字段说明」。
+      涨跌额=现价-昨收；涨幅(%)=(现价-昨收)/昨收*100；
+      振幅(%)=(最高-最低)/昨收*100；总量(手)=当日成交量；现量(手)=最近分笔量；
+      内盘(手)/外盘(手)=主动卖/买；内外比=内盘/外盘；换手(%)=总量/流通股本；
+      流通市值/总市值=对应股本×现价；市净率/市销率/市现率=现价÷每股净资、总市值÷营业收入、现价÷每股现金流；
+      财报更新日期=财务数据更新日期；净利润=归母；税后利润含少数股东损益。
 
     调用示例:
     ```python
@@ -406,8 +412,8 @@ def get_stock_stat() -> pd.DataFrame:
 
     返回示例（列节选）:
     ```text
-    market code   price  last_close  ...  pe_ttm  chg_pct_5d  industry
-    1      600000  9.98   9.90        ...  5.2     1.23        银行
+    代码    现价  昨收  ...  市盈率(TTM)  5日涨幅(%)  行业
+    600000  9.98  9.90  ...  5.2         1.23        银行
     ```
     """
     return fetch_stock_stat()

@@ -6,12 +6,11 @@ import struct
 from collections import OrderedDict
 
 from zsdtdx.biz.stock_stat import (
-    STOCK_STAT_COLUMNS,
-    assemble_stock_stat_rows,
+    STOCK_STAT_COLUMN_LABELS,
+    STOCK_STAT_DISPLAY_COLUMNS,
+    _today_stat_asof,
+    build_stock_stat_df,
     is_stock_stat_row,
-    project_stock_stat_row,
-    rows_to_stock_stat_df,
-    scale_row_units_to_wan,
 )
 from zsdtdx.parser.get_board_quote_page import (
     GetBoardQuotePageCmd,
@@ -53,7 +52,7 @@ def test_board_quote_enrich_and_empty_body():
     """
     输入：空正文与手工价量行。
     输出：空列表；衍生涨跌幅算对。
-    用途：B 类衍生与空页。
+    用途：行情衍生字段。
     边界：不依赖网络。
     """
     assert parse_board_quote_body(b"") == []
@@ -118,7 +117,7 @@ def test_tdxstat_merge_and_maps():
     """
     输入：最小 tdxstat/tdxstat2/tdxzs/incon/tdxhy 文本。
     输出：合并涨幅、地区/行业映射正确。
-    用途：D 类解析离线契约。
+    用途：统计快照解析离线契约。
     边界：空单元格为 None。
     """
     # 至少 31 列以满足 [30]=10日
@@ -168,14 +167,14 @@ def test_is_stock_stat_row_filters_index():
     assert not is_stock_stat_row(0, "399001", include_indices=True)
 
 
-def test_wan_scale_and_assemble_dataframe():
+def test_build_stock_stat_df_units_and_columns():
     """
-    输入：协议原单位聚合行。
-    输出：万元折算；宽表列齐全。
-    用途：对外量纲与列契约。
-    边界：缺财务仍保留列。
+    输入：协议原单位行情 + 财务 + tdxstat。
+    输出：万元折算；宽表列齐全；地区行业挂上。
+    用途：向量化聚合契约。
+    边界：空行情返回空表（含全部列）。
     """
-    ab = OrderedDict(
+    quote = OrderedDict(
         [
             ("market", 1),
             ("code", "600000"),
@@ -233,7 +232,7 @@ def test_wan_scale_and_assemble_dataframe():
         "eps": 0.1,
         "capital_reserve_ps": None,
         "undistributed_ps": None,
-        "ocf_ps": None,
+        "ocf_ps": 1.0,
         "roe_pct": 10.0,
         "gross_margin_pct": None,
         "op_margin_pct": None,
@@ -241,31 +240,169 @@ def test_wan_scale_and_assemble_dataframe():
         "_region_code": 18,
         "_industry_code": 1,
     }
-    rows = assemble_stock_stat_rows(
-        [ab],
+    df = build_stock_stat_df(
+        [quote],
         {"600000": fin},
-        {"600000": {"chg_pct_5d": 2.2, "stat_asof": "20260929"}},
+        {
+            "600000": {
+                "chg_pct_5d": 2.2,
+                "pe_ttm": 9.0,
+                "pe_static": 8.1,
+                "dividend_yield_pct": 4.5,
+                "stat_asof": "20260929",
+            }
+        },
         {18: "深圳板块"},
         {"T020603": "银行"},
         {"600000": "T020603"},
     )
-    assert len(rows) == 1
-    assert rows[0]["amount"] == 10.0  # 元→万元
-    assert rows[0]["total_assets"] == 100.0  # 千元→万元
-    assert rows[0]["region"] == "深圳板块"
-    assert rows[0]["industry"] == "银行"
-    assert rows[0]["chg_pct_5d"] == 2.2
-    df = rows_to_stock_stat_df(rows)
-    assert list(df.columns) == STOCK_STAT_COLUMNS
+    assert list(df.columns) == STOCK_STAT_DISPLAY_COLUMNS
     assert len(df) == 1
+    row = df.iloc[0]
+    L = STOCK_STAT_COLUMN_LABELS
+    assert row[L["amount"]] == 10.0  # 元→万元
+    assert row[L["total_assets"]] == 100.0  # 千元→万元
+    assert row[L["region"]] == "深圳板块"
+    assert row[L["industry"]] == "银行"
+    # 现价/昨收=10/9 且 asof 非今日：涨幅、PE、股息率按昨收快照折算
+    factor = 10.0 / 9.0
+    assert row[L["stat_asof"]] == "20260929"
+    assert row[L["stat_asof"]] != _today_stat_asof()
+    assert row[L["chg_pct_5d"]] == round(((1.0 + 2.2 / 100.0) * factor - 1.0) * 100.0, 4)
+    assert row[L["pe_ttm"]] == round(9.0 * factor, 4)
+    assert row[L["pe_static"]] == round(8.1 * factor, 4)
+    assert row[L["dividend_yield_pct"]] == round(4.5 / factor, 4)
+    # 现价 10、流通股本 100 万股：市值=1000 万元；pb=10/2.5=4
+    assert row[L["float_mkt_cap"]] == 1000.0
+    assert row[L["total_mkt_cap"]] == 2000.0
+    assert row[L["pb"]] == 4.0
+    assert row[L["pcf"]] == 10.0
 
-    scaled = scale_row_units_to_wan({"amount": 20000.0, "price": 1.0})
-    assert scaled["amount"] == 2.0
-    assert scaled["price"] == 1.0
-
-    empty = rows_to_stock_stat_df([])
-    assert list(empty.columns) == STOCK_STAT_COLUMNS
+    empty = build_stock_stat_df([], {}, {}, {}, {}, {})
+    assert list(empty.columns) == STOCK_STAT_DISPLAY_COLUMNS
     assert len(empty) == 0
+
+
+def test_build_stock_stat_df_price_zero_falls_back_to_last_close():
+    """
+    输入：现价为 0、昨收有值的停牌形态行。
+    输出：市值/pb/ps/pcf 均按昨收回退计算。
+    用途：与 `_quote_last_price` 同语义。
+    边界：现价与昨收双非正则估值为空。
+    """
+    quote = {
+        "market": 0,
+        "code": "002667",
+        "price": 0.0,
+        "last_close": 22.19,
+        "vol": 0.0,
+        "amount": 0.0,
+    }
+    fin = {
+        "float_shares": 100.0,
+        "total_shares": 200.0,
+        "bvps": 2.219,
+        "operating_revenue": 1000.0,  # 千元 → 元分母=1_000_000
+        "ocf_ps": 2.219,
+        "_region_code": 18,
+    }
+    df = build_stock_stat_df(
+        [quote],
+        {"002667": fin},
+        {
+            "002667": {
+                "chg_pct_5d": 1.7,
+                "pe_ttm": -13.29,
+                "dividend_yield_pct": 0.54,
+            }
+        },
+        {18: "深圳板块"},
+        {},
+        {},
+    )
+    row = df.iloc[0]
+    L = STOCK_STAT_COLUMN_LABELS
+    assert row[L["float_mkt_cap"]] == round(22.19 * 100.0, 4)
+    assert row[L["total_mkt_cap"]] == round(22.19 * 200.0, 4)
+    assert row[L["pb"]] == 10.0
+    assert row[L["pcf"]] == 10.0
+    # 市销用元口径：总市值元 / 营收元
+    assert row[L["ps"]] == round((22.19 * 200 * 10000) / (1000.0 * 1000.0), 2)
+    # 现价回退昨收 → 因子=1，tdxstat 价敏字段保持快照
+    assert row[L["chg_pct_5d"]] == 1.7
+    assert row[L["pe_ttm"]] == -13.29
+    assert row[L["dividend_yield_pct"]] == 0.54
+
+    both_zero = build_stock_stat_df(
+        [{"market": 0, "code": "301569", "price": 0.0, "last_close": 0.0, "vol": 0}],
+        {
+            "301569": {
+                "float_shares": 10.0,
+                "total_shares": 10.0,
+                "bvps": 1.0,
+                "ocf_ps": 1.0,
+                "operating_revenue": 100.0,
+            }
+        },
+        {},
+        {},
+        {},
+        {},
+    ).iloc[0]
+    assert both_zero[L["float_mkt_cap"]] is None
+    assert both_zero[L["total_mkt_cap"]] is None
+    assert both_zero[L["pb"]] is None
+    assert both_zero[L["ps"]] is None
+    assert both_zero[L["pcf"]] is None
+
+
+def test_build_stock_stat_df_skips_rebase_when_asof_is_today():
+    """
+    输入：`stat_asof` 为当日、现价≠昨收。
+    输出：tdxstat 价敏字段保持文件原值不折算。
+    用途：当日快照已含最新价语义时直接送出。
+    边界：市值等仍按现价计算。
+    """
+    today = _today_stat_asof()
+    quote = {
+        "market": 1,
+        "code": "600000",
+        "price": 10.0,
+        "last_close": 9.0,
+        "vol": 100.0,
+        "amount": 100000.0,
+    }
+    fin = {
+        "float_shares": 100.0,
+        "total_shares": 200.0,
+        "bvps": 2.5,
+        "ocf_ps": 1.0,
+        "operating_revenue": 800.0,
+    }
+    df = build_stock_stat_df(
+        [quote],
+        {"600000": fin},
+        {
+            "600000": {
+                "stat_asof": today,
+                "chg_pct_5d": 2.2,
+                "pe_ttm": 9.0,
+                "pe_static": 8.1,
+                "dividend_yield_pct": 4.5,
+            }
+        },
+        {},
+        {},
+        {},
+    )
+    row = df.iloc[0]
+    L = STOCK_STAT_COLUMN_LABELS
+    assert row[L["stat_asof"]] == today
+    assert row[L["chg_pct_5d"]] == 2.2
+    assert row[L["pe_ttm"]] == 9.0
+    assert row[L["pe_static"]] == 8.1
+    assert row[L["dividend_yield_pct"]] == 4.5
+    assert row[L["float_mkt_cap"]] == 1000.0
 
 
 def test_quote_last_price_fallback_still_works():
@@ -281,21 +418,6 @@ def test_quote_last_price_fallback_still_works():
     assert client._quote_last_price({"price": 0.0, "last_close": 0.0}) is None
 
 
-def test_project_keeps_column_order():
-    """
-    输入：多余字段行。
-    输出：仅 STOCK_STAT_COLUMNS 且顺序固定。
-    用途：投影契约。
-    边界：缺键填 None。
-    """
-    out = project_stock_stat_row({"code": "600000", "noise": 1, "amount": 10000.0})
-    assert list(out.keys()) == STOCK_STAT_COLUMNS
-    assert out["code"] == "600000"
-    assert out["amount"] == 1.0
-    assert out["price"] is None
-
-
-# 保留原五档解析用例所需最小导入（同文件历史 fixture 已迁走时仍可独立跑）
 def test_security_quotes_unlisted_still_isolated():
     """
     输入：未上市占位回包（历史 fixture）。

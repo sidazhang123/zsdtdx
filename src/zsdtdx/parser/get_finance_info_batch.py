@@ -131,7 +131,7 @@ def parse_finance_info_batch_body(body: bytes) -> List[Dict[str, Any]]:
         except (TypeError, ValueError, ZeroDivisionError):
             pass
 
-        # 净益率=净利润/净资；毛利率=(营收-成本)/营收；营业利润率=营业利润/营收；
+        # 净资产收益率=净利润/净资；毛利率=(营收-成本)/营收；营业利润率=营业利润/营收；
         # 净利润率=税后利润/营收
         roe_pct = gross_margin_pct = op_margin_pct = net_margin_pct = None
         try:
