@@ -240,6 +240,14 @@ class GetFinanceInfoBatchCmd(BaseParser):
         输入：解压后的批量 0x0010 正文。
         输出：C 类字段行列表。
         用途：财务批解码。
-        边界：空正文返回 []。
+        边界：空正文返回 []；任一记录解析失败抛 ValueError，交由连接池重试。
         """
-        return parse_finance_info_batch_body(body_buf or b"")
+        rows = parse_finance_info_batch_body(body_buf or b"")
+        errors = [row for row in rows if row.get("parse_error")]
+        if errors:
+            detail = "; ".join(
+                f"{row.get('code', '')}: {row.get('parse_error', '')}"
+                for row in errors[:3]
+            )
+            raise ValueError(f"0010 记录解析失败 {len(errors)} 条: {detail}")
+        return rows

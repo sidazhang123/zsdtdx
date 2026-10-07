@@ -12,7 +12,7 @@
 
 # coding=utf-8
 
-from zsdtdx.parser.base import BaseParser
+from zsdtdx.parser.setup_base import SetupResponsePassthroughParser
 
 # 扩展行情握手：92 字节，cmd=0x6548，inner=0x2454（银河海王星 7720 首连）。
 _EX_SETUP1 = bytes.fromhex(
@@ -22,7 +22,7 @@ _EX_SETUP1 = bytes.fromhex(
 )
 
 
-class ExSetupCmd1(BaseParser):
+class ExSetupCmd1(SetupResponsePassthroughParser):
     def setup(self):
         """
         输入：无。
@@ -31,12 +31,3 @@ class ExSetupCmd1(BaseParser):
         边界：正文为固定 92 字节身份块；回包无业务字段。
         """
         self.send_pkg = bytearray(_EX_SETUP1)
-
-    def parseResponse(self, body_buf):
-        """
-        输入：握手回包体。
-        输出：原样 body_buf。
-        用途：握手回包无业务字段，仅确认收包。
-        边界：不解析、不校验内容。
-        """
-        return body_buf

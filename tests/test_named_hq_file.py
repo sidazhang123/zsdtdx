@@ -147,7 +147,7 @@ def test_parse_infoharbor_lines():
 def test_get_etf_code_name_map_uses_full_remote_names():
     """输入：mock 完整名。输出：保留 ETF/LOF、剔除 drop、前缀正确。用途：主路径。边界：离线。"""
     client = _etf_client()
-    result = client.get_etf_code_name_map(use_cache=True)
+    result = client.get_etf_code_name_map()
     assert result["sz.159915"] == "创业板ETF易方达"
     assert result["sh.510300"] == "沪深300ETF华泰柏瑞"
     assert result["sz.159105"] == "恒生生物科技ETF易方达"
@@ -259,7 +259,7 @@ def test_ensure_etf_name_catalog_merges_ilong_from_zhb_zip():
     assert by_code["158011"] == "创业板软件ETF国泰改"
     assert by_code["158053"] == "创业板算力ETF大成"
     assert by_code["158061"] == "创业板算力ETF天弘"
-    result = client.get_etf_code_name_map(use_cache=True)
+    result = client.get_etf_code_name_map()
     assert result["sz.158053"] == "创业板算力ETF大成"
     assert result["sz.158011"] == "创业板软件ETF国泰改"
 
@@ -276,7 +276,7 @@ def test_get_etf_code_name_map_falls_back_to_std_short_name():
         {"market": 0, "code": "159915", "name": "创业板ETF易方达"},
         {"market": 1, "code": "501046", "name": "财通福鑫定开混合"},
     ]
-    result = client.get_etf_code_name_map(use_cache=True)
+    result = client.get_etf_code_name_map()
     assert result["sz.159915"] == "创业板ETF易方达"
     assert result["sh.501046"] == "财通福鑫定开混合"
 
@@ -359,7 +359,7 @@ def test_ensure_etf_name_catalog_disk_hit_skips_download(tmp_path):
 
 
 def test_ensure_etf_refresh_ignores_disk_and_redownloads(tmp_path):
-    """输入：磁盘已有当日缓存但 refresh=True。输出：仍下载并覆盖。用途：use_cache=False。边界：离线。"""
+    """输入磁盘已有当日缓存但内部 refresh=True。输出仍下载并覆盖。"""
     from zsdtdx.cache.catalog_disk_cache import (
         KIND_ETF,
         catalog_cache_file_path,
@@ -487,3 +487,17 @@ def test_get_report_file_by_size_pages_and_slices():
     assert bytes(raw) == b"abcde"
     assert meta_calls == ["infoharbor_ex.name"]
     assert offsets == [0, 3]
+
+
+def test_get_report_file_by_size_rejects_truncated_middle_page():
+    """输入元数据声明 5 字节但第二页只有 1 字节。输出失败，不把半截文件交给缓存层。"""
+    from zsdtdx.net.hq import TdxHq_API
+
+    api = TdxHq_API.__new__(TdxHq_API)
+    api.get_report_file_meta = lambda filename: {"filesize": 5, "checksum": "x"}
+    api.get_report_file = lambda filename, offset, chunk_size=None: (
+        {"chunksize": 3, "chunkdata": b"abc"}
+        if offset == 0
+        else {"chunksize": 2, "chunkdata": b"d"}
+    )
+    assert api.get_report_file_by_size("infoharbor_ex.name") is None

@@ -24,6 +24,7 @@ import threading
 import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple
 
@@ -31,13 +32,17 @@ import pandas as pd
 import yaml
 
 import zsdtdx.net.base_socket_client as _base_socket_client
-from zsdtdx.net.exhq import TdxExHq_API
-from zsdtdx.net.hq import TdxHq_API
-from zsdtdx.params import TDXParams
+from zsdtdx.cache.block_file_cache import (
+    BLOCK_FILE_TTL_SECONDS,
+    invalidate_block_files,
+    load_fresh_block_files,
+    save_block_files,
+)
 from zsdtdx.cache.catalog_disk_cache import (
     KIND_ETF,
     KIND_EX,
     KIND_STD,
+    cache_refresh_lock,
     catalog_cache_file_path,
     load_catalog_cache,
     load_etf_catalog_cache,
@@ -45,8 +50,9 @@ from zsdtdx.cache.catalog_disk_cache import (
     save_catalog_cache,
     save_etf_catalog_cache,
 )
-from zsdtdx.util.helper import parse_future_symbol
-from zsdtdx.cache.block_file_cache import load_fresh_block_files, save_block_files
+from zsdtdx.net.exhq import TdxExHq_API
+from zsdtdx.net.hq import TdxHq_API
+from zsdtdx.params import TDXParams
 from zsdtdx.parser.block_index_catalog import (
     REQUIRED_BLOCK_FILES,
     BlockIndexCatalog,
@@ -58,6 +64,7 @@ from zsdtdx.parser.infoharbor_block import (
     parse_tdx_industry_blocks,
     read_zip_entry,
 )
+from zsdtdx.util.helper import parse_future_symbol
 from zsdtdx.util.log import log
 
 _PACKAGE_DIR = Path(__file__).resolve().parent.parent
@@ -190,12 +197,20 @@ def _load_merged_zsdtdx_config(config_path: Optional[str] = None) -> Dict[str, A
     builtin = _load_builtin_zsdtdx_config()
     resolved = _resolve_zsdtdx_config_path(config_path)
     if resolved.resolve() == _DEFAULT_CONFIG_PATH.resolve():
-        return copy.deepcopy(builtin)
+        merged = copy.deepcopy(builtin)
+        from zsdtdx.util.log import configure_logging
+
+        configure_logging(merged)
+        return merged
     with open(resolved, "r", encoding="utf-8") as fp:
         user_cfg = yaml.safe_load(fp) or {}
     if not isinstance(user_cfg, dict):
         raise ValueError(f"配置无效（非字典）: {resolved}")
-    return _deep_merge_config_overlay(builtin, user_cfg)
+    merged = _deep_merge_config_overlay(builtin, user_cfg)
+    from zsdtdx.util.log import configure_logging
+
+    configure_logging(merged)
+    return merged
 
 
 def normalize_hosts_entries(hosts: List[Any]) -> List[Tuple[str, int]]:
@@ -269,6 +284,8 @@ def _tcp_probe_and_trim_available_hosts(
     timeout: float,
     fallback_hosts: List[Tuple[str, int]],
     pool_label: str = "",
+    *,
+    parallel: bool = True,
 ) -> List[Tuple[str, int]]:
     """
     对地址池做 TCP 探测后裁剪：剔除不可达；可达按延迟升序；
@@ -280,6 +297,7 @@ def _tcp_probe_and_trim_available_hosts(
     2. timeout: 单地址探测超时（秒）。
     3. fallback_hosts: 裁剪为空时的回退列表（通常为配置原始顺序）。
     4. pool_label: 日志用池名前缀。
+    5. parallel: 是否用临时线程池并发探测；后台预热使用串行模式，避免解释器退出时再创建 executor。
     输出：
     1. 裁剪后的可用地址列表。
     用途：
@@ -297,21 +315,24 @@ def _tcp_probe_and_trim_available_hosts(
         _ht, lat = _tcp_probe_one(h, p, timeout)
         if lat is not None:
             return [hosts[0]]
-        log.warning(f"{prefix}[TCP Probe] 单节点不可达，回退配置顺序")
+        log.error(f"{prefix}[TCP Probe] 单节点不可达，回退配置顺序")
         return list(fallback_hosts)
 
-    workers = min(len(hosts), 32)
     results: List[Tuple[Tuple[str, int], Optional[float]]] = []
-    with _ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(_tcp_probe_one, h, p, timeout): (h, p) for h, p in hosts
-        }
-        for future in futures:
-            try:
-                results.append(future.result(timeout=timeout + 1.0))
-            except Exception:
-                host_tuple = futures[future]
-                results.append((host_tuple, None))
+    if parallel:
+        workers = min(len(hosts), 32)
+        with _ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(_tcp_probe_one, h, p, timeout): (h, p) for h, p in hosts
+            }
+            for future in futures:
+                try:
+                    results.append(future.result(timeout=timeout + 1.0))
+                except Exception:
+                    host_tuple = futures[future]
+                    results.append((host_tuple, None))
+    else:
+        results = [_tcp_probe_one(h, p, timeout) for h, p in hosts]
 
     reachable = [(ht, lat) for ht, lat in results if lat is not None]
     unreachable = [(ht, lat) for ht, lat in results if lat is None]
@@ -324,7 +345,7 @@ def _tcp_probe_and_trim_available_hosts(
         top3_str = ", ".join(f"{h}:{p} ({lat:.1f}ms)" for (h, p), lat in top3)
         log.info(f"{prefix}[TCP Probe] {ok_count}/{total} 可达, 最快: {top3_str}")
     else:
-        log.warning(f"{prefix}[TCP Probe] 0/{total} 可达, 全部超时")
+        log.error(f"{prefix}[TCP Probe] 0/{total} 可达, 全部超时")
     if unreachable:
         fail_str = ", ".join(f"{h}:{p}" for (h, p), _ in unreachable)
         log.info(f"{prefix}[TCP Probe] 不可达已剔除: {fail_str}")
@@ -341,7 +362,7 @@ def _tcp_probe_and_trim_available_hosts(
             f"{_SHORT_HOST_POOL_NO_DROP_SLOWEST_MAX})，保留全部 {len(trimmed)} 个可达节点"
         )
     if not trimmed:
-        log.warning(
+        log.error(
             f"{prefix}[TCP Probe] 裁剪后为空，回退配置原始顺序 ({len(fallback_hosts)} 项)"
         )
         return list(fallback_hosts)
@@ -458,6 +479,8 @@ def _probe_trim_and_write_availability_cache(
     ex_hosts: List[Tuple[str, int]],
     probe_timeout: float,
     required_sources: Optional[set[str]] = None,
+    *,
+    parallel_probe: bool = True,
 ) -> Dict[str, List[Tuple[str, int]]]:
     """
     对 std/ex 执行 TCP 探测裁剪并写入 `_probe_result_cache`。
@@ -476,13 +499,31 @@ def _probe_trim_and_write_availability_cache(
     std_trimmed: List[Tuple[str, int]] = []
     ex_trimmed: List[Tuple[str, int]] = []
     if std_hosts and "standard" in sources:
-        std_trimmed = _tcp_probe_and_trim_available_hosts(
-            std_hosts, probe_timeout, std_hosts, "standard"
-        )
+        if parallel_probe:
+            std_trimmed = _tcp_probe_and_trim_available_hosts(
+                std_hosts, probe_timeout, std_hosts, "standard"
+            )
+        else:
+            std_trimmed = _tcp_probe_and_trim_available_hosts(
+                std_hosts,
+                probe_timeout,
+                std_hosts,
+                "standard",
+                parallel=False,
+            )
     if ex_hosts and "extended" in sources:
-        ex_trimmed = _tcp_probe_and_trim_available_hosts(
-            ex_hosts, probe_timeout, ex_hosts, "extended"
-        )
+        if parallel_probe:
+            ex_trimmed = _tcp_probe_and_trim_available_hosts(
+                ex_hosts, probe_timeout, ex_hosts, "extended"
+            )
+        else:
+            ex_trimmed = _tcp_probe_and_trim_available_hosts(
+                ex_hosts,
+                probe_timeout,
+                ex_hosts,
+                "extended",
+                parallel=False,
+            )
     fp_new = compute_hosts_fingerprint(std_hosts, ex_hosts)
     with _probe_result_cache_lock:
         if std_trimmed and "standard" in sources:
@@ -534,6 +575,7 @@ def _ensure_availability_hosts_cache(
     force: bool = False,
     wait_timeout: float = 120.0,
     required_sources: Optional[set[str]] = None,
+    parallel_probe: bool = True,
 ) -> Dict[str, Any]:
     """
     检查可用地址缓存；不可用时从配置读取 hosts 并探测写入缓存。
@@ -543,6 +585,7 @@ def _ensure_availability_hosts_cache(
     2. cfg: 已加载 YAML；优先使用以避免重复读盘。
     3. force: True 时强制重新探测。
     4. wait_timeout: single-flight 等待进行中的探测完成的超时（秒）。
+    5. parallel_probe: 是否创建临时线程池并发探测；后台线程应传 False。
     输出：
     1. 摘要字典（skipped、config_path、各级数量等）。
     用途：
@@ -596,7 +639,11 @@ def _ensure_availability_hosts_cache(
         probe_timeout = float(pool_cfg.get("probe_timeout", 0.8))
         std_hosts, ex_hosts = _normalize_hosts_from_cfg(loaded_cfg)
         trimmed = _probe_trim_and_write_availability_cache(
-            std_hosts, ex_hosts, probe_timeout, required_sources=sources
+            std_hosts,
+            ex_hosts,
+            probe_timeout,
+            required_sources=sources,
+            parallel_probe=parallel_probe,
         )
         return {
             "skipped": False,
@@ -1470,8 +1517,8 @@ class ChunkLocalRowCache:
        下每个 chunk 在 `asyncio.to_thread` worker 内独立运行；sync 路径单线程顺序执行）。
     2. **无 free 池**：移除分区软复用，避免跨 chunk 复用 list 槽位的复杂性；分区由 Python GC 在 chunk 结束后回收。
     3. **API 兼容**：保留 `acquire_partition` / `soft_delete` / `get_partition` 调用契约，外部调用零改动。
-    4. **命中率统计**：保留 partition 的 `_partition_key/_n/oldest_dt/newest_dt/page_start/fetched_pages`
-       字段集与 SharedChunkCache 完全一致，外层调用方逻辑透明迁移。
+    4. **命中率统计**：partition 保留 `_partition_key/_n/oldest_dt/newest_dt/page_start/fetched_pages`，
+       并用 `history_exhausted` 记录空页或末短页，避免同 chunk 后续任务重复拉末页。
 
     - cache_rows：有序 list[(dt_key, row)]，按时间升序追加；_n 为有效下标（chunk 内单调递增）。
     - acquire_partition：返回该 chunk 的私有分区；同一 chunk 内重复 acquire 等价（返回同一对象）。
@@ -1495,6 +1542,7 @@ class ChunkLocalRowCache:
             "newest_dt": None,
             "page_start": 0,
             "fetched_pages": 0,
+            "history_exhausted": False,
         }
 
     def acquire_partition(self, code: str, freq: str) -> Dict[str, Any]:
@@ -1503,7 +1551,7 @@ class ChunkLocalRowCache:
         输入：
         1. code/freq: 分区 key 维度。
         输出：
-        1. 全新或已有的分区 dict（_n 归零、oldest/newest/page_start/fetched_pages 归零）。
+        1. 全新或已有的分区 dict（行数、时间边界、分页游标与历史终止状态归零）。
         用途：
         1. chunk 入口处调用一次；chunk 内只读/写该对象。
         边界条件：
@@ -1519,6 +1567,7 @@ class ChunkLocalRowCache:
             existing["newest_dt"] = None
             existing["page_start"] = 0
             existing["fetched_pages"] = 0
+            existing["history_exhausted"] = False
             return existing
         partition = self._new_partition(partition_key)
         self._partitions[partition_key] = partition
@@ -1549,6 +1598,12 @@ class UnifiedTdxClient:
 
     # 板块三文件缓存的进程内互斥，避免名称与 K 线同时触发下载。
     _block_catalog_lock = threading.Lock()
+    # std/ex/ETF 冷启动的进程内 single-flight；跨进程由同目录 lockfile 兜底。
+    _catalog_refresh_locks = {
+        KIND_STD: threading.Lock(),
+        KIND_EX: threading.Lock(),
+        KIND_ETF: threading.Lock(),
+    }
 
     PERIOD_MAP = {
         "5min": 0,
@@ -1601,7 +1656,6 @@ class UnifiedTdxClient:
         )
         self.index_kline_cfg = self.config.get("index_kline", {}) or {}
         self.index_kline_aliases_cfg = self.index_kline_cfg.get("aliases", {}) or {}
-        self.stock_stat_cfg = self.config.get("stock_stat", {}) or {}
         # 指数目录由码表聚合层在使用时过滤得到，仅保留进程内快照。
         self._index_catalog_records: List[Dict[str, Any]] = []
         self._index_name_route_map: Dict[str, Dict[str, Any]] = {}
@@ -1623,7 +1677,7 @@ class UnifiedTdxClient:
                 self._catalog_cache_enabled = False
         self.client_cfg = self.config.get("client", {})
         self.preconnect_on_enter = bool(
-            self.client_cfg.get("preconnect_on_enter", True)
+            self.client_cfg.get("preconnect_on_enter", False)
         )
 
         pool_cfg = self.config.get("pool", {})
@@ -1785,8 +1839,7 @@ class UnifiedTdxClient:
         start_ts = self._to_datetime(start_time)
         end_ts = self._to_datetime(end_time)
         start_h, start_m, start_s = (
-            int(part)
-            for part in str(TDXParams.FUTURE_DATE_ONLY_START_TIME).split(":")
+            int(part) for part in str(TDXParams.FUTURE_DATE_ONLY_START_TIME).split(":")
         )
         end_h, end_m, end_s = (
             int(part) for part in str(TDXParams.FUTURE_DATE_ONLY_END_TIME).split(":")
@@ -2092,7 +2145,11 @@ class UnifiedTdxClient:
         source = str(route_source or "").strip().lower()
         if source not in {"std", "ex"}:
             source = ""
-        if self._stock_route and not refresh:
+        if (
+            self._stock_route
+            and not refresh
+            and self._stock_route_cache_fresh(source or None)
+        ):
             if source == "" or any(
                 str(item.get("source", "")).strip().lower() == source
                 for item in self._stock_route.values()
@@ -2118,6 +2175,10 @@ class UnifiedTdxClient:
             source = ""
         normalized_code = self._normalize_stock_query_code(code)
         route = self._lookup_stock_route(normalized_code)
+        if route is not None and not self._stock_route_cache_fresh(
+            str(route.get("source", ""))
+        ):
+            route = None
         if (
             route is not None
             and source
@@ -2238,7 +2299,8 @@ class UnifiedTdxClient:
         输出：
         1. 追加后的原始 K 线 dict 列表（未做 normalize/DataFrame）。
         边界条件：
-        1. 空页、达左边界、末页不足 `page_size` 时结束；`fetch_page` 差异由调用方保证。
+        1. 空页、达左边界、末页不足 `page_size` 或达到最大页数时结束。
+        2. `page_size` 必须是对应协议真实生效的请求页长；服务端忽略页长的接口不得复用本循环。
         """
         effective_max_pages = int(
             max_pages if max_pages is not None else _DEFAULT_MAX_KLINE_PAGES
@@ -2415,6 +2477,7 @@ class UnifiedTdxClient:
         partition["newest_dt"] = None
         partition["page_start"] = 0
         partition["fetched_pages"] = 0
+        partition["history_exhausted"] = False
         partition["_route_fp"] = ""
 
     def _ensure_index_chunk_route_valid(
@@ -2565,6 +2628,46 @@ class UnifiedTdxClient:
             out.append(item)
         return out
 
+    def _fetch_raw_kline_rows(
+        self,
+        *,
+        source: str,
+        market: int,
+        code: str,
+        category: int,
+        start_boundary: Any,
+        boundary_mode: Literal["no_df", "pandas"],
+        qfq: Optional[bool] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        输入标准/扩展行情路由与左时间边界，输出未经业务字段归一化的 K 线行。
+
+        用途：统一 task 列表路径与 DataFrame 批处理路径的分页请求，避免两套网络循环漂移。
+        边界：source 仅支持 std/ex；空页、短页、时间边界或最大页数结束。
+        """
+        source_key = str(source).strip().lower()
+        if source_key == "std":
+            page_size = self._standard_kline_page_size()
+        elif source_key == "ex":
+            page_size = int(TDXParams.MAX_EXTENDED_KLINE_COUNT)
+        else:
+            raise ValueError(f"未知 K 线数据源: {source}")
+
+        return self._paginate_kline_pages(
+            page_size=page_size,
+            start_boundary=start_boundary,
+            boundary_mode=boundary_mode,
+            fetch_page=lambda start: self._fetch_kline_page_rows_no_df(
+                source=source_key,
+                market=int(market),
+                code=str(code),
+                category=int(category),
+                start=int(start),
+                page_size=int(page_size),
+                qfq=qfq,
+            ),
+        )
+
     def _fetch_std_kline_rows(
         self,
         market: int,
@@ -2575,26 +2678,15 @@ class UnifiedTdxClient:
         end_dt: dt.datetime,
         qfq: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
-        """输入标准行情参数，输出标准化K线列表；用于无 DataFrame 路径；空页即结束。"""
-        page_size = self._standard_kline_page_size()
-
-        def _fetch_page(start: int) -> Any:
-            return self._pool_call_allow_none(
-                self.std_pool,
-                "get_security_bars",
-                category,
-                int(market),
-                str(code),
-                int(start),
-                int(page_size),
-                qfq=self._standard_kline_qfq(qfq),
-            )
-
-        rows = self._paginate_kline_pages(
-            page_size=page_size,
+        """输入标准行情参数，输出标准化K线列表；空页、短页或时间边界结束。"""
+        rows = self._fetch_raw_kline_rows(
+            source="std",
+            market=market,
+            code=code,
+            category=category,
             start_boundary=start_dt,
             boundary_mode="no_df",
-            fetch_page=_fetch_page,
+            qfq=self._standard_kline_qfq(qfq),
         )
         return self._normalize_stock_kline_rows(
             rows=rows,
@@ -2616,27 +2708,15 @@ class UnifiedTdxClient:
         end_dt: dt.datetime,
         qfq: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
-        """输入扩展行情参数，输出标准化K线列表；用于无 DataFrame 路径；空页即结束。"""
-        page_size = int(TDXParams.MAX_EXTENDED_KLINE_COUNT)
-        qfq_flag = self._standard_kline_qfq(qfq)
-
-        def _fetch_page(start: int) -> Any:
-            return self._pool_call_allow_none(
-                self.ex_pool,
-                "get_instrument_bars",
-                category,
-                int(market),
-                str(code),
-                int(start),
-                int(page_size),
-                qfq=qfq_flag,
-            )
-
-        rows = self._paginate_kline_pages(
-            page_size=page_size,
+        """输入扩展行情参数，输出标准化K线列表；空页、短页或时间边界结束。"""
+        rows = self._fetch_raw_kline_rows(
+            source="ex",
+            market=market,
+            code=code,
+            category=category,
             start_boundary=start_dt,
             boundary_mode="no_df",
-            fetch_page=_fetch_page,
+            qfq=self._standard_kline_qfq(qfq),
         )
         return self._normalize_stock_kline_rows(
             rows=rows,
@@ -2944,6 +3024,7 @@ class UnifiedTdxClient:
             newest_cached_dt = partition["newest_dt"]
             page_start = partition["page_start"]
             fetched_pages = partition["fetched_pages"]
+            history_exhausted = bool(partition.get("history_exhausted", False))
 
             for task in task_items:
                 try:
@@ -2974,6 +3055,8 @@ class UnifiedTdxClient:
                     )
                     if covered and not stale:
                         break
+                    if history_exhausted:
+                        break
                     if fetched_pages >= max_pages:
                         break
                     page_rows = self._fetch_kline_page_rows_no_df(
@@ -2988,6 +3071,7 @@ class UnifiedTdxClient:
                     fetched_pages += 1
                     chunk_network_page_calls += 1
                     if not page_rows:
+                        history_exhausted = True
                         break
                     page_oldest, page_newest = self._merge_chunk_cache_page_rows(
                         page_rows=page_rows, cache_rows=cache_rows, _n_ref=_n_ref
@@ -3000,6 +3084,9 @@ class UnifiedTdxClient:
                         newest_cached_dt is None or page_newest > newest_cached_dt
                     ):
                         newest_cached_dt = page_newest
+                    page_start += len(page_rows)
+                    if len(page_rows) < page_size:
+                        history_exhausted = True
                     if (
                         oldest_cached_dt is not None
                         and oldest_cached_dt <= start_dt
@@ -3008,9 +3095,8 @@ class UnifiedTdxClient:
                         )
                     ):
                         break
-                    if len(page_rows) < page_size:
+                    if history_exhausted:
                         break
-                    page_start += len(page_rows)
 
                 # 读分区：仅扫描 [0,_n) 有效槽位，按任务时间窗过滤（不触碰 _n 之后残留槽位）
                 filtered_raw: List[Dict[str, Any]] = []
@@ -3072,6 +3158,7 @@ class UnifiedTdxClient:
             partition["newest_dt"] = newest_cached_dt
             partition["page_start"] = page_start
             partition["fetched_pages"] = fetched_pages
+            partition["history_exhausted"] = history_exhausted
         finally:
             self._shared_chunk_cache.soft_delete(base_code, base_freq)
 
@@ -3228,6 +3315,7 @@ class UnifiedTdxClient:
             newest_cached_dt = partition["newest_dt"]
             page_start = partition["page_start"]
             fetched_pages = partition["fetched_pages"]
+            history_exhausted = bool(partition.get("history_exhausted", False))
             route_refreshed = False
 
             for task in task_items:
@@ -3257,6 +3345,8 @@ class UnifiedTdxClient:
                         newest_cached_dt, end_dt, base_freq
                     )
                     if covered and not stale:
+                        break
+                    if history_exhausted:
                         break
                     if fetched_pages >= max_pages:
                         break
@@ -3288,6 +3378,7 @@ class UnifiedTdxClient:
                     fetched_pages += 1
                     chunk_network_page_calls += 1
                     if not page_rows:
+                        history_exhausted = True
                         break
                     page_oldest, page_newest = self._merge_chunk_cache_page_rows(
                         page_rows=page_rows,
@@ -3302,6 +3393,9 @@ class UnifiedTdxClient:
                         newest_cached_dt is None or page_newest > newest_cached_dt
                     ):
                         newest_cached_dt = page_newest
+                    page_start += len(page_rows)
+                    if len(page_rows) < page_size:
+                        history_exhausted = True
                     if (
                         oldest_cached_dt is not None
                         and oldest_cached_dt <= start_dt
@@ -3318,9 +3412,8 @@ class UnifiedTdxClient:
                         )
                     ):
                         break
-                    if len(page_rows) < page_size:
+                    if history_exhausted:
                         break
-                    page_start += len(page_rows)
 
                 # 读分区：仅扫描 [0,_n) 有效槽位，按任务时间窗过滤
                 filtered_raw: List[Dict[str, Any]] = []
@@ -3383,6 +3476,7 @@ class UnifiedTdxClient:
             partition["newest_dt"] = newest_cached_dt
             partition["page_start"] = page_start
             partition["fetched_pages"] = fetched_pages
+            partition["history_exhausted"] = history_exhausted
         finally:
             self._shared_chunk_cache.soft_delete(base_symbol, base_freq)
 
@@ -3410,6 +3504,17 @@ class UnifiedTdxClient:
             return
         with lock:
             self._runtime_failures.append(entry)
+
+    def record_runtime_failure(
+        self, task: str, code: str, reason: str, detail: str, freq: str = ""
+    ) -> None:
+        """
+        输入业务失败信息，输出无。
+
+        用途：为上层业务门面提供统一运行态失败记录能力。
+        边界：只记录不吞异常；线程安全性与客户端内部记录一致。
+        """
+        self._record_failure(task, code, reason, detail, freq)
 
     def _refresh_markets(self):
         """输入无，输出无；用于刷新市场缓存；网络波动时连接池自动兜底。"""
@@ -3835,7 +3940,12 @@ class UnifiedTdxClient:
 
     def _ensure_index_catalog_ready(self) -> List[Dict[str, Any]]:
         """确保指数目录已从码表两侧过滤出来并返回快照。"""
-        if self._index_catalog_records and self._index_name_route_map:
+        if (
+            self._index_catalog_records
+            and self._index_name_route_map
+            and self._catalog_memory_fresh(KIND_STD)
+            and self._catalog_memory_fresh(KIND_EX)
+        ):
             return list(self._index_catalog_records)
         return self._discover_index_route_records(refresh=False)
 
@@ -3854,7 +3964,12 @@ class UnifiedTdxClient:
         边界条件：
         1. 码表缺失时返回当前已缓存结果（可能为空）。
         """
-        if (not bool(refresh)) and self._index_catalog_records:
+        if (
+            (not bool(refresh))
+            and self._index_catalog_records
+            and self._catalog_memory_fresh(KIND_STD)
+            and self._catalog_memory_fresh(KIND_EX)
+        ):
             return list(self._index_catalog_records)
 
         self.ensure_code_catalog(need_std=True, need_ex=True, refresh=bool(refresh))
@@ -4168,14 +4283,29 @@ class UnifiedTdxClient:
         price = self._safe_float(row.get("price"))
         if price is not None and price > 0:
             return price
-        last_close = self._safe_float(row.get("last_close"))
-        if last_close is not None and last_close > 0:
-            return last_close
+        for close_field in ("last_close", "pre_close"):
+            last_close = self._safe_float(row.get(close_field))
+            if last_close is not None and last_close > 0:
+                return last_close
         return None
 
     def _today_catalog_cache_date(self) -> str:
         """输出当天自然日 YYYY-MM-DD，供码表日级缓存判定。"""
         return dt.datetime.now().date().isoformat()
+
+    @contextmanager
+    def _catalog_refresh_guard(self, kind: str) -> Iterator[None]:
+        """为单侧码表冷启动提供进程内与跨进程 single-flight。"""
+        kind_key = str(kind or "").strip().lower()
+        process_lock = self._catalog_refresh_locks.get(kind_key)
+        if process_lock is None:
+            raise ValueError(f"未知码表缓存 kind: {kind}")
+        disk_guard = nullcontext()
+        if self._catalog_cache_enabled and self._catalog_cache_dir is not None:
+            disk_guard = cache_refresh_lock(self._catalog_cache_dir, kind_key)
+        with process_lock:
+            with disk_guard:
+                yield
 
     def _catalog_memory_fresh(self, kind: str) -> bool:
         """输入 std/ex，输出该侧内存码表是否已是当日快照。"""
@@ -4191,6 +4321,42 @@ class UnifiedTdxClient:
                 and self._ex_catalog_date == self._today_catalog_cache_date()
             )
         return False
+
+    def _stock_route_cache_fresh(self, route_source: Optional[str] = None) -> bool:
+        """输入可选 std/ex，输出对应股票路由所依赖的码表是否为当天。"""
+        source = str(route_source or "").strip().lower()
+        if source == "std":
+            return self._catalog_memory_fresh(KIND_STD)
+        if source == "ex":
+            return self._catalog_memory_fresh(KIND_EX)
+        return self._catalog_memory_fresh(KIND_STD) and self._catalog_memory_fresh(
+            KIND_EX
+        )
+
+    def _clear_one_catalog(self, kind: str) -> None:
+        """清空一侧原始码表与全部派生视图，禁止刷新失败后复用旧数据。"""
+        kind_key = str(kind or "").strip().lower()
+        if kind_key == KIND_STD:
+            self._std_catalog_records = None
+            self._std_catalog_date = ""
+        elif kind_key == KIND_EX:
+            self._ex_catalog_records = None
+            self._ex_catalog_date = ""
+        else:
+            raise ValueError(f"未知码表缓存 kind: {kind}")
+        self._invalidate_derived_catalog_views()
+
+    def _record_cache_write_failure(self, kind: str, exc: Exception) -> None:
+        """记录缓存写失败但保持其它 kind 的读写能力。"""
+        try:
+            self._record_failure(
+                "catalog_cache",
+                str(kind),
+                "write_failed",
+                str(exc),
+            )
+        except Exception:
+            log.error("[%s] 缓存写入失败: %s", kind, exc)
 
     def _invalidate_derived_catalog_views(self) -> None:
         """码表原文更新后清空股票/期货/指数等使用时过滤产物。"""
@@ -4208,7 +4374,7 @@ class UnifiedTdxClient:
         records: List[Dict[str, Any]],
         market_names: Optional[Dict[int, str]] = None,
     ) -> None:
-        """将一侧未过滤码表写入当日磁盘缓存；写失败时禁用磁盘缓存。"""
+        """将一侧未过滤码表写入当日磁盘缓存；写失败只记录该次故障。"""
         if (
             not self._catalog_cache_enabled
             or self._catalog_cache_dir is None
@@ -4223,8 +4389,8 @@ class UnifiedTdxClient:
                 records=records,
                 market_names=market_names,
             )
-        except Exception:
-            self._catalog_cache_enabled = False
+        except Exception as exc:
+            self._record_cache_write_failure(kind, exc)
 
     def _try_load_one_catalog_from_disk(self, kind: str) -> bool:
         """尝试加载一侧当日磁盘码表；命中返回 True 并回填内存。"""
@@ -4270,7 +4436,7 @@ class UnifiedTdxClient:
         return markets or [0, 1, 2]
 
     def _download_std_security_catalog(self) -> List[Dict[str, Any]]:
-        """分页下载标准行情未过滤码表；空页视为该市场结束。"""
+        """分页下载标准行情未过滤码表；空页或不足请求页长时结束。"""
         security_page = int(TDXParams.MAX_SECURITY_LIST_COUNT)
         records: List[Dict[str, Any]] = []
         for market in self._std_catalog_markets():
@@ -4283,7 +4449,15 @@ class UnifiedTdxClient:
                     security_page,
                     allow_none=True,
                 )
-                if not page:
+                if page is None:
+                    raise RuntimeError(
+                        f"标准行情码表分页失败: market={market}, start={start}"
+                    )
+                if not isinstance(page, (list, tuple)):
+                    raise RuntimeError(
+                        f"标准行情码表分页类型非法: market={market}, start={start}"
+                    )
+                if len(page) == 0:
                     break
                 for item in page:
                     row = dict(item)
@@ -4294,13 +4468,13 @@ class UnifiedTdxClient:
                     row["name"] = str(row.get("name", "")).strip()
                     row["market"] = int(market)
                     records.append(row)
-                start += len(page)
                 if len(page) < security_page:
                     break
+                start += len(page)
         return records
 
     def _download_ex_instrument_catalog(self) -> List[Dict[str, Any]]:
-        """分页下载扩展行情未过滤码表；空页或短页视为结束。"""
+        """分页下载扩展行情未过滤码表；仅空页视为该侧结束。"""
         if not self._ex_market_name_map:
             try:
                 self.get_supported_markets(return_df=True)
@@ -4313,7 +4487,11 @@ class UnifiedTdxClient:
             page = self.ex_pool.call(
                 "get_instrument_info", start, page_size, allow_none=True
             )
-            if not page:
+            if page is None:
+                raise RuntimeError(f"扩展行情码表分页失败: start={start}")
+            if not isinstance(page, (list, tuple)):
+                raise RuntimeError(f"扩展行情码表分页类型非法: start={start}")
+            if len(page) == 0:
                 break
             for item in page:
                 row = dict(item)
@@ -4331,52 +4509,44 @@ class UnifiedTdxClient:
                 row["market"] = market
                 rows.append(row)
             start += len(page)
-            if len(page) < page_size:
-                break
         return rows
 
     def _ensure_std_catalog(self, refresh: bool = False) -> None:
         """确保标准行情码表为当日内存快照；缺失则读盘或下载。"""
         if not refresh and self._catalog_memory_fresh(KIND_STD):
             return
-        replaced = False
-        if not refresh and self._try_load_one_catalog_from_disk(KIND_STD):
-            replaced = True
-        else:
+        with self._catalog_refresh_guard(KIND_STD):
+            if not refresh and self._catalog_memory_fresh(KIND_STD):
+                return
+            if not refresh and self._try_load_one_catalog_from_disk(KIND_STD):
+                self._invalidate_derived_catalog_views()
+                return
+            self._clear_one_catalog(KIND_STD)
             rows = self._download_std_security_catalog()
-            if rows:
-                self._std_catalog_records = rows
-                self._std_catalog_date = self._today_catalog_cache_date()
-                self._persist_one_catalog(KIND_STD, rows)
-                replaced = True
-            elif self._std_catalog_records is None:
-                self._std_catalog_records = []
-                self._std_catalog_date = ""
-        if replaced:
+            self._std_catalog_records = rows
+            self._std_catalog_date = self._today_catalog_cache_date()
+            self._persist_one_catalog(KIND_STD, rows)
             self._invalidate_derived_catalog_views()
 
     def _ensure_ex_catalog(self, refresh: bool = False) -> None:
         """确保扩展行情码表为当日内存快照；缺失则读盘或下载。"""
         if not refresh and self._catalog_memory_fresh(KIND_EX):
             return
-        replaced = False
-        if not refresh and self._try_load_one_catalog_from_disk(KIND_EX):
-            replaced = True
-        else:
+        with self._catalog_refresh_guard(KIND_EX):
+            if not refresh and self._catalog_memory_fresh(KIND_EX):
+                return
+            if not refresh and self._try_load_one_catalog_from_disk(KIND_EX):
+                self._invalidate_derived_catalog_views()
+                return
+            self._clear_one_catalog(KIND_EX)
             rows = self._download_ex_instrument_catalog()
-            if rows:
-                self._ex_catalog_records = rows
-                self._ex_catalog_date = self._today_catalog_cache_date()
-                self._persist_one_catalog(
-                    KIND_EX,
-                    rows,
-                    market_names=dict(getattr(self, "_ex_market_name_map", {}) or {}),
-                )
-                replaced = True
-            elif self._ex_catalog_records is None:
-                self._ex_catalog_records = []
-                self._ex_catalog_date = ""
-        if replaced:
+            self._ex_catalog_records = rows
+            self._ex_catalog_date = self._today_catalog_cache_date()
+            self._persist_one_catalog(
+                KIND_EX,
+                rows,
+                market_names=dict(getattr(self, "_ex_market_name_map", {}) or {}),
+            )
             self._invalidate_derived_catalog_views()
 
     def ensure_code_catalog(
@@ -4476,7 +4646,12 @@ class UnifiedTdxClient:
         self, return_df: Optional[bool] = None, refresh: bool = False
     ):
         """输入返回与刷新开关，输出股票清单；码表过滤在使用时完成。"""
-        if self._stock_df is not None and not refresh:
+        if (
+            self._stock_df is not None
+            and not refresh
+            and self._catalog_memory_fresh(KIND_STD)
+            and self._catalog_memory_fresh(KIND_EX)
+        ):
             if self._default_return_df(return_df):
                 return self._stock_df.copy()
             return self._stock_df.to_dict(orient="records")
@@ -4488,9 +4663,9 @@ class UnifiedTdxClient:
             return df.copy()
         return df.to_dict(orient="records")
 
-    def get_stock_code_name_map(self, use_cache: bool = True) -> Dict[str, str]:
-        """输入缓存开关，输出带市场前缀的股票代码名称字典；用于全量代码接口；按配置范围过滤。"""
-        stock_df = self.get_all_stock_list(return_df=True, refresh=not bool(use_cache))
+    def get_stock_code_name_map(self) -> Dict[str, str]:
+        """输出带市场前缀的股票代码名称字典；有效缓存自动复用。"""
+        stock_df = self.get_all_stock_list(return_df=True, refresh=False)
         scopes = self._get_default_stock_scopes("get_stock_code_name")
         scoped_df = self._filter_stock_df_by_scopes(stock_df, scopes)
         if scoped_df.empty:
@@ -4565,19 +4740,115 @@ class UnifiedTdxClient:
             files[name] = bytes(raw)
         return files
 
-    def _ensure_block_named_files(self) -> Dict[str, bytes]:
+    def _block_file_cache_dir(self) -> Optional[Path]:
+        """输出当前客户端板块缓存目录；与 catalog_cache 开关和路径完全一致。"""
+        if not bool(getattr(self, "_catalog_cache_enabled", False)):
+            return None
+        configured = getattr(self, "_catalog_cache_dir", None)
+        return None if configured is None else Path(configured)
+
+    def _validate_block_named_files(self, files: Dict[str, bytes]) -> None:
+        """校验三份命名文件可形成非空板块目录，失败时抛 ValueError。"""
+        catalog = parse_block_index_catalog(files)
+        if not catalog.names:
+            raise ValueError("板块命名文件无法解析出非空目录")
+
+    def _record_block_cache_failure(self, reason: str, exc: Exception) -> None:
+        """记录板块缓存失败；缓存持久化问题不得覆盖业务数据。"""
+        try:
+            self._record_failure(
+                "block_cache",
+                "block_named_files",
+                reason,
+                str(exc),
+            )
+        except Exception:
+            log.error("[block_cache] %s: %s", reason, exc)
+
+    def _try_load_valid_block_files(
+        self, cache_dir: Optional[Path]
+    ) -> Optional[Dict[str, object]]:
+        """读取并语义校验板块快照；畸形快照会失效删除。"""
+        if cache_dir is None:
+            return None
+        fresh = load_fresh_block_files(cache_dir=cache_dir)
+        if fresh is None:
+            return None
+        try:
+            self._validate_block_named_files(dict(fresh["files"]))
+        except Exception as exc:
+            try:
+                invalidate_block_files(cache_dir=cache_dir)
+            except OSError as unlink_exc:
+                self._record_block_cache_failure("invalidate_failed", unlink_exc)
+            self._record_block_cache_failure("semantic_invalid", exc)
+            return None
+        return fresh
+
+    def _fresh_memory_block_files_snapshot(self) -> Optional[Dict[str, object]]:
+        """输出进程内未过期板块快照；时间异常或内容损坏时主动丢弃。"""
+        snapshot = getattr(self, "_block_named_files_snapshot", None)
+        if not isinstance(snapshot, dict):
+            return None
+        try:
+            fetched_at = float(snapshot.get("fetched_at"))
+            age = time.time() - fetched_at
+            files = dict(snapshot.get("files") or {})
+            if (
+                not math.isfinite(fetched_at)
+                or not math.isfinite(age)
+                or age < 0
+                or age >= BLOCK_FILE_TTL_SECONDS
+            ):
+                raise ValueError("板块内存快照已过期或时间戳非法")
+            self._validate_block_named_files(files)
+        except Exception:
+            self._block_named_files_snapshot = None
+            return None
+        return {"fetched_at": fetched_at, "files": files}
+
+    def _ensure_block_named_files_snapshot(self) -> Dict[str, object]:
+        """命中有效板块快照；缺失时 single-flight 下载、校验并尽力写盘。"""
+        cache_dir = self._block_file_cache_dir()
+        with self._block_catalog_lock:
+            memory = self._fresh_memory_block_files_snapshot()
+            if memory is not None:
+                return memory
+            fresh = self._try_load_valid_block_files(cache_dir)
+            if fresh is not None:
+                self._block_named_files_snapshot = fresh
+                return fresh
+            disk_guard = (
+                cache_refresh_lock(cache_dir, "block")
+                if cache_dir is not None
+                else nullcontext()
+            )
+            with disk_guard:
+                fresh = self._try_load_valid_block_files(cache_dir)
+                if fresh is not None:
+                    self._block_named_files_snapshot = fresh
+                    return fresh
+                files = self._download_block_named_files()
+                self._validate_block_named_files(files)
+                stamp = time.time()
+                if cache_dir is not None:
+                    try:
+                        stamp = save_block_files(files, cache_dir=cache_dir)
+                    except Exception as exc:
+                        self._record_block_cache_failure("write_failed", exc)
+                snapshot = {"fetched_at": stamp, "files": files}
+                self._block_named_files_snapshot = snapshot
+                return snapshot
+
+    def get_block_named_files(self) -> Dict[str, bytes]:
         """
         输入：无。
         输出：文件名到 bytes 的字典（infoharbor_block.dat / tdxhy.cfg / zhb.zip）。
-        用途：`get_stock_stat` 与板块目录共用 6 小时缓存，命中则不下载。
+        用途：为板块目录与上层业务提供 6 小时原始文件快照。
         边界条件：缓存未过期直接返回；过期或损坏时下载三件套并写回缓存。
         """
-        fresh = load_fresh_block_files()
-        if fresh is not None:
-            return dict(fresh["files"])
-        files = self._download_block_named_files()
-        save_block_files(files)
-        return files
+        snapshot = self._ensure_block_named_files_snapshot()
+        return dict(snapshot["files"])
 
     def _load_block_index_catalog(self) -> BlockIndexCatalog:
         """
@@ -4591,31 +4862,20 @@ class UnifiedTdxClient:
         2. 过期或损坏时重新下载三份文件并覆盖缓存。
         3. 下载或解析失败时抛 ValueError，不使用过期缓存。
         """
-        with self._block_catalog_lock:
-            fresh = load_fresh_block_files()
-            cached = getattr(self, "_block_index_catalog", None)
-            cached_at = getattr(self, "_block_index_catalog_at", None)
-            if (
-                fresh is not None
-                and isinstance(cached, BlockIndexCatalog)
-                and cached_at == fresh["fetched_at"]
-            ):
-                return cached
-            if fresh is not None:
-                catalog = parse_block_index_catalog(fresh["files"])
-                if not catalog.names:
-                    raise ValueError("板块目录为空")
-                self._block_index_catalog = catalog
-                self._block_index_catalog_at = fresh["fetched_at"]
-                return catalog
-            files = self._download_block_named_files()
-            catalog = parse_block_index_catalog(files)
-            if not catalog.names:
-                raise ValueError("板块目录为空")
-            stamp = save_block_files(files)
-            self._block_index_catalog = catalog
-            self._block_index_catalog_at = stamp
-            return catalog
+        snapshot = self._ensure_block_named_files_snapshot()
+        cached = getattr(self, "_block_index_catalog", None)
+        cached_at = getattr(self, "_block_index_catalog_at", None)
+        if (
+            isinstance(cached, BlockIndexCatalog)
+            and cached_at == snapshot["fetched_at"]
+        ):
+            return cached
+        catalog = parse_block_index_catalog(snapshot["files"])
+        if not catalog.names:
+            raise ValueError("板块目录为空")
+        self._block_index_catalog = catalog
+        self._block_index_catalog_at = snapshot["fetched_at"]
+        return catalog
 
     def get_block_names(self) -> List[str]:
         """
@@ -4753,14 +5013,24 @@ class UnifiedTdxClient:
         用途：
         1. 下载概念板块、行业归属和行业名称表，再用当日码表把代码换成名称。
         边界条件：
-        1. 码表内存或磁盘不是当日、或不存在时，走 `get_stock_code_name_map(use_cache=True)` 的下载更新。
+        1. 码表内存或磁盘不是当日、或不存在时，走自动缓存流程下载更新。
         2. 某一份远程文件失败时，其余成功的部分仍然返回。
         3. 全部失败时返回空 names 与空 map。不落盘 pkl。
         """
-        code_name = self.get_stock_code_name_map(use_cache=True)
-        block_raw = self._download_named_hq_file(TDXParams.INFOHARBOR_BLOCK_REMOTE_FILE)
-        hy_raw = self._download_named_hq_file(TDXParams.TDXHY_REMOTE_FILE)
-        zip_raw = self._download_named_hq_file(TDXParams.ZHB_ZIP_REMOTE_FILE)
+        code_name = self.get_stock_code_name_map()
+        cache_dir = self._block_file_cache_dir()
+        with self._block_catalog_lock:
+            fresh = self._try_load_valid_block_files(cache_dir)
+        files = dict(fresh["files"]) if fresh is not None else {}
+        block_raw = files.get(TDXParams.INFOHARBOR_BLOCK_REMOTE_FILE) or (
+            self._download_named_hq_file(TDXParams.INFOHARBOR_BLOCK_REMOTE_FILE)
+        )
+        hy_raw = files.get(TDXParams.TDXHY_REMOTE_FILE) or (
+            self._download_named_hq_file(TDXParams.TDXHY_REMOTE_FILE)
+        )
+        zip_raw = files.get(TDXParams.ZHB_ZIP_REMOTE_FILE) or (
+            self._download_named_hq_file(TDXParams.ZHB_ZIP_REMOTE_FILE)
+        )
         zs_raw = read_zip_entry(zip_raw, TDXParams.TDXZS_ZIP_MEMBER)
         blocks = parse_infoharbor_block(block_raw)
         blocks.extend(parse_tdx_industry_blocks(hy_raw, zs_raw))
@@ -4878,8 +5148,8 @@ class UnifiedTdxClient:
                 name_records=list(self._etf_name_records or []),
                 board_records=list(self._etf_board_records or []),
             )
-        except Exception:
-            self._catalog_cache_enabled = False
+        except Exception as exc:
+            self._record_cache_write_failure(KIND_ETF, exc)
 
     def _try_load_etf_catalog_from_disk(self) -> bool:
         """输入：无。输出：是否命中当日磁盘 ETF 缓存并回填内存。"""
@@ -5089,48 +5359,51 @@ class UnifiedTdxClient:
         """
         if (not bool(refresh)) and self._etf_memory_fresh():
             return
-        if (not bool(refresh)) and self._try_load_etf_catalog_from_disk():
-            return
-        filename = TDXParams.ETF_NAME_REMOTE_FILE
-        board_files = self._etf_board_remote_files()
-        if not board_files:
+        with self._catalog_refresh_guard(KIND_ETF):
+            if (not bool(refresh)) and self._etf_memory_fresh():
+                return
+            if (not bool(refresh)) and self._try_load_etf_catalog_from_disk():
+                return
             self._clear_etf_name_catalog()
-            return
-        raw_names = self._download_named_hq_file(filename)
-        harbor_names = self._parse_infoharbor_name_file(raw_names)
-        zip_raw = self._download_named_hq_file(TDXParams.ZHB_ZIP_REMOTE_FILE)
-        ilong_raw = read_zip_entry(zip_raw, TDXParams.ILONG_ZIP_MEMBER)
-        ilong_names = self._parse_ilong_name_file(ilong_raw)
-        names = self._merge_etf_name_records_prefer_ilong(harbor_names, ilong_names)
-        boards: List[Dict[str, Any]] = []
-        seen: set[Tuple[int, str]] = set()
-        boards_ok = True
-        for board_name in board_files:
-            raw_board = self._download_named_hq_file(board_name)
-            parsed = self._parse_etf_board_file(raw_board)
-            if not parsed:
-                boards_ok = False
-                break
-            for rec in parsed:
-                key = (int(rec["market"]), str(rec["code"]))
-                if key in seen:
-                    continue
-                seen.add(key)
-                boards.append(rec)
-        if (not boards_ok) or (not self._etf_catalog_records_ok(names, boards)):
-            self._clear_etf_name_catalog()
-            return
-        self._etf_name_records = names
-        self._etf_board_records = boards
-        self._etf_name_date = self._today_catalog_cache_date()
-        self._persist_etf_catalog()
+            filename = TDXParams.ETF_NAME_REMOTE_FILE
+            board_files = self._etf_board_remote_files()
+            if not board_files:
+                self._clear_etf_name_catalog()
+                return
+            raw_names = self._download_named_hq_file(filename)
+            harbor_names = self._parse_infoharbor_name_file(raw_names)
+            zip_raw = self._download_named_hq_file(TDXParams.ZHB_ZIP_REMOTE_FILE)
+            ilong_raw = read_zip_entry(zip_raw, TDXParams.ILONG_ZIP_MEMBER)
+            ilong_names = self._parse_ilong_name_file(ilong_raw)
+            names = self._merge_etf_name_records_prefer_ilong(harbor_names, ilong_names)
+            boards: List[Dict[str, Any]] = []
+            seen: set[Tuple[int, str]] = set()
+            boards_ok = True
+            for board_name in board_files:
+                raw_board = self._download_named_hq_file(board_name)
+                parsed = self._parse_etf_board_file(raw_board)
+                if not parsed:
+                    boards_ok = False
+                    break
+                for rec in parsed:
+                    key = (int(rec["market"]), str(rec["code"]))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    boards.append(rec)
+            if (not boards_ok) or (not self._etf_catalog_records_ok(names, boards)):
+                self._clear_etf_name_catalog()
+                return
+            self._etf_name_records = names
+            self._etf_board_records = boards
+            self._etf_name_date = self._today_catalog_cache_date()
+            self._persist_etf_catalog()
 
-    def get_etf_code_name_map(self, use_cache: bool = True) -> Dict[str, str]:
+    def get_etf_code_name_map(self) -> Dict[str, str]:
         """
-        输入缓存开关，输出场内 ETF/LOF（语境含两者）带前缀代码名称字典。
+        输出场内 ETF/LOF（语境含两者）带前缀代码名称字典。
 
-        输入：
-        1. use_cache: True 时复用当日磁盘/内存快照；False 强制重新下载命名文件。
+        输入：无。有效快照自动复用，缺失、损坏或过期时重建。
         输出：
         1. `Dict[str, str]`，键为 `sz.`/`sh.` 前缀代码。
         用途：
@@ -5142,7 +5415,7 @@ class UnifiedTdxClient:
            名称文件中额外命中 etf/lof 的代码一并纳入；
            排除 399*；drop 见 market_rules；按 `catalog_cache` 自然日落盘。
         """
-        self._ensure_etf_name_catalog(refresh=not bool(use_cache))
+        self._ensure_etf_name_catalog(refresh=False)
         name_by_key: Dict[Tuple[int, str], str] = {}
         for item in self._etf_name_records or []:
             code = str(item.get("code", "")).strip()
@@ -5206,16 +5479,14 @@ class UnifiedTdxClient:
             result[prefixed] = name
         return result
 
-    def get_all_future_list(
-        self, return_df: Optional[bool] = None, use_cache: bool = True
-    ):
-        """输入返回与缓存开关，输出全商品期货；用于统一四大商品所；默认不含中金所。"""
-        if self._future_df is not None and use_cache:
+    def get_all_future_list(self, return_df: Optional[bool] = None):
+        """输出全商品期货；有效缓存自动复用；默认不含中金所。"""
+        if self._future_df is not None and self._catalog_memory_fresh(KIND_EX):
             if self._default_return_df(return_df):
                 return self._future_df.copy()
             return self._future_df.to_dict(orient="records")
 
-        self.ensure_code_catalog(need_ex=True, refresh=not bool(use_cache))
+        self.ensure_code_catalog(need_ex=True, refresh=False)
         target_market_names = set(TDXParams.FUTURE_MARKET_NAMES)
         records = []
         for item in self._ex_catalog_records or []:
@@ -5255,54 +5526,26 @@ class UnifiedTdxClient:
             return df.copy()
         return df.to_dict(orient="records")
 
-    def get_stock_stat(self) -> pd.DataFrame:
+    def _refresh_future_catalog_view(self) -> None:
+        """仅供代码未命中的恢复路径强制刷新扩展码表并重建期货派生视图。"""
+        self.ensure_code_catalog(need_ex=True, refresh=True)
+        self.get_all_future_list(return_df=True)
+
+    def get_board_quote_rows(
+        self,
+        page_size: int,
+        row_filter: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    ) -> List[Dict[str, Any]]:
         """
-        输入无，输出全市场股票统计宽表 DataFrame。
+        输入 054B 每页条数与可选行过滤器，输出符合条件的原始行情行。
 
-        输入：无。范围与分页由 `config.yaml` 的 `stock_stat` 控制。
-        输出：一行一只股票的宽表；中文表头（含单位）；金额统一为万元；无 codes 过滤。
-        用途：一次聚合 054B 实时行情 + 0010 财务 + zhb/tdxstat 统计快照。
-        边界条件：
-        1. 不先查码表；054B 回包自带代码。
-        2. zhb.zip / tdxhy.cfg 复用板块命名文件 6 小时缓存，不强制刷新。
-        3. 不含港股扩展行情。
-        4. 市值/pb/ps/pcf 按现价计算，现价非正则回退昨收；tdxstat 价敏字段仅在 `stat_asof` 非当日时按现价折算。
+        用途：提供通用完整版面分页能力，过滤器可避免上层再扫描一遍结果。
+        边界：未传过滤器时保留全部行；空页或短页正常结束；None、重复页、非法行或偏移溢出抛错。
         """
-        from zsdtdx.biz.stock_stat import (
-            build_stock_stat_df,
-            is_stock_stat_row,
-        )
-        from zsdtdx.parser.get_board_quote_page import MAX_BOARD_QUOTE_PAGE
-        from zsdtdx.parser.get_finance_info_batch import MAX_FINANCE_INFO_BATCH
-        from zsdtdx.parser.tdxstat import (
-            merge_tdxstat_maps,
-            parse_industry_name_map_from_incon,
-            parse_region_map_from_tdxzs,
-            parse_tdxhy_code_map,
-            parse_tdxstat2_cfg,
-            parse_tdxstat_cfg,
-            read_zhb_stat_payload,
-        )
-
-        cfg = self.stock_stat_cfg or {}
-        page_size = min(
-            max(1, int(cfg.get("page_size", MAX_BOARD_QUOTE_PAGE))),
-            MAX_BOARD_QUOTE_PAGE,
-        )
-        batch_n = min(
-            max(1, int(cfg.get("finance_batch_size", MAX_FINANCE_INFO_BATCH))),
-            MAX_FINANCE_INFO_BATCH,
-        )
-        max_pages = int(cfg.get("max_pages", 0) or 0)
-        include_indices = bool(cfg.get("include_indices", False))
-
-        ab_rows: List[Dict[str, Any]] = []
-        seen: set = set()
+        rows: List[Dict[str, Any]] = []
+        seen: set[Tuple[int, str]] = set()
         start = 0
-        page_i = 0
-        while True:
-            if max_pages > 0 and page_i >= max_pages:
-                break
+        while start <= 0xFFFF:
             try:
                 page = self._pool_call_allow_none(
                     self.std_pool,
@@ -5312,93 +5555,154 @@ class UnifiedTdxClient:
                 )
             except Exception as exc:
                 self._record_failure(
-                    "stock_stat", f"page@{start}", "exception", str(exc)
+                    "board_quote", f"page@{start}", "exception", str(exc)
                 )
-                break
-            page = list(page or [])
-            if not page:
-                break
-            for r in page:
-                if r.get("parse_error"):
-                    continue
+                raise RuntimeError(f"054B 分页拉取失败: start={start}") from exc
+
+            if page is None:
+                detail = "054B 连接池重试耗尽后返回 None"
+                self._record_failure("board_quote", f"page@{start}", "none", detail)
+                raise RuntimeError(detail)
+            if not isinstance(page, (list, tuple)):
+                detail = f"054B 分页返回类型非法: {type(page).__name__}"
+                self._record_failure("board_quote", f"page@{start}", "invalid", detail)
+                raise RuntimeError(detail)
+
+            page_rows = list(page)
+            if not page_rows:
+                return rows
+
+            page_seen: set[Tuple[int, str]] = set()
+            for row in page_rows:
+                if not isinstance(row, dict) or row.get("parse_error"):
+                    detail = f"054B 分页含解析失败行: start={start}"
+                    self._record_failure(
+                        "board_quote", f"page@{start}", "invalid", detail
+                    )
+                    raise RuntimeError(detail)
                 try:
-                    m = int(r.get("market", -1))
-                except (TypeError, ValueError):
-                    continue
-                c = str(r.get("code", "")).strip()
-                key = (m, c)
-                if key in seen:
-                    continue
-                if is_stock_stat_row(m, c, include_indices=include_indices):
-                    seen.add(key)
-                    ab_rows.append(r)
-            page_i += 1
-            if len(page) < page_size:
-                break
-            start += page_size
+                    market = int(row.get("market", -1))
+                except (TypeError, ValueError) as exc:
+                    detail = f"054B 市场号非法: start={start}"
+                    self._record_failure(
+                        "board_quote", f"page@{start}", "invalid", detail
+                    )
+                    raise RuntimeError(detail) from exc
+                code = str(row.get("code", "")).strip()
+                if market not in (0, 1, 2) or len(code) != 6 or not code.isdigit():
+                    detail = (
+                        f"054B 代码行非法: start={start}, "
+                        f"market={market}, code={code!r}"
+                    )
+                    self._record_failure(
+                        "board_quote", f"page@{start}", "invalid", detail
+                    )
+                    raise RuntimeError(detail)
+                key = (market, code)
+                if key in page_seen or key in seen:
+                    detail = f"054B 分页重复代码: start={start}, key={key!r}"
+                    self._record_failure(
+                        "board_quote", f"page@{start}", "repeated", detail
+                    )
+                    raise RuntimeError(detail)
+                page_seen.add(key)
+                seen.add(key)
+                if row_filter is None or row_filter(row):
+                    rows.append(row)
 
-        codes = [(int(r["market"]), str(r["code"])) for r in ab_rows]
-        fin_map: Dict[str, Dict[str, Any]] = {}
-        for i in range(0, len(codes), batch_n):
-            chunk = codes[i : i + batch_n]
-            try:
-                fin_rows = self._pool_call_allow_none(
-                    self.std_pool,
-                    "get_finance_info_batch",
-                    chunk,
-                )
-            except Exception as exc:
-                self._record_failure(
-                    "stock_stat",
-                    f"finance@{i}",
-                    "exception",
-                    str(exc),
-                )
-                continue
-            for fr in fin_rows or []:
-                if fr.get("parse_error"):
-                    continue
-                fin_map[str(fr["code"])] = fr
+            if len(page_rows) < page_size:
+                return rows
+            next_start = start + len(page_rows)
+            if next_start <= start or next_start > 0xFFFF:
+                detail = f"054B 分页偏移越界: {start} -> {next_start}"
+                self._record_failure("board_quote", f"page@{start}", "overflow", detail)
+                raise RuntimeError(detail)
+            start = next_start
 
-        stat_map: Dict[str, Dict[str, Any]] = {}
-        region_map: Dict[int, str] = {}
-        industry_name_map: Dict[str, str] = {}
-        code_hy_map: Dict[str, str] = {}
+        detail = "054B 分页未在 16 位偏移范围内结束"
+        self._record_failure("board_quote", "page", "overflow", detail)
+        raise RuntimeError(detail)
+
+    def get_finance_info_batch_map(
+        self,
+        codes: List[Tuple[int, str]],
+        batch_size: int,
+        workers: int,
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        输入股票列表、批量与线程数，输出 code 到 0010 财务行的映射。
+
+        用途：以有上限的线程并发拉取财务批次，不使用多进程。
+        边界：线程数限制为 1..8；None、解析失败或代码集不完整均抛错。
+        """
+        if not codes:
+            return {}
+        batches = [
+            (offset, codes[offset : offset + batch_size])
+            for offset in range(0, len(codes), batch_size)
+        ]
+
+        def _fetch_one(
+            item: Tuple[int, List[Tuple[int, str]]],
+        ) -> Tuple[int, List[Dict[str, Any]]]:
+            offset, chunk = item
+            result = self._pool_call_allow_none(
+                self.std_pool,
+                "get_finance_info_batch",
+                chunk,
+            )
+            if result is None:
+                raise RuntimeError(f"0010 批次返回 None: offset={offset}")
+            if not isinstance(result, (list, tuple)):
+                raise RuntimeError(
+                    f"0010 批次返回类型非法: offset={offset}, "
+                    f"type={type(result).__name__}"
+                )
+            finance_rows = list(result)
+            if any(
+                not isinstance(row, dict) or row.get("parse_error")
+                for row in finance_rows
+            ):
+                raise RuntimeError(f"0010 批次含解析失败行: offset={offset}")
+
+            expected = {str(code) for _, code in chunk}
+            actual_codes = [str(row.get("code", "")).strip() for row in finance_rows]
+            actual = set(actual_codes)
+            if (
+                len(actual_codes) != len(actual)
+                or actual != expected
+                or any(len(code) != 6 or not code.isdigit() for code in actual_codes)
+            ):
+                missing = sorted(expected - actual)
+                unexpected = sorted(actual - expected)
+                raise RuntimeError(
+                    f"0010 批次代码集不完整: offset={offset}, "
+                    f"missing={missing[:5]}, unexpected={unexpected[:5]}"
+                )
+            return offset, finance_rows
+
+        effective_workers = min(max(1, int(workers)), 8, len(batches))
         try:
-            files = self._ensure_block_named_files()
-            zhb = files.get(TDXParams.ZHB_ZIP_REMOTE_FILE) or b""
-            payload = read_zhb_stat_payload(zhb)
-            st1 = (
-                parse_tdxstat_cfg(payload["tdxstat.cfg"])
-                if "tdxstat.cfg" in payload
-                else {}
-            )
-            st2 = (
-                parse_tdxstat2_cfg(payload["tdxstat2.cfg"])
-                if "tdxstat2.cfg" in payload
-                else {}
-            )
-            stat_map = merge_tdxstat_maps(st1, st2)
-            if "tdxzs.cfg" in payload:
-                region_map = parse_region_map_from_tdxzs(payload["tdxzs.cfg"])
-            if "incon.dat" in payload:
-                industry_name_map = parse_industry_name_map_from_incon(
-                    payload["incon.dat"]
-                )
-            hy_raw = files.get(TDXParams.TDXHY_REMOTE_FILE) or b""
-            if hy_raw:
-                code_hy_map = parse_tdxhy_code_map(hy_raw)
+            if effective_workers == 1:
+                fetched = [_fetch_one(item) for item in batches]
+            else:
+                try:
+                    with _ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                        futures = [
+                            executor.submit(_fetch_one, item) for item in batches
+                        ]
+                        fetched = [future.result() for future in futures]
+                finally:
+                    self.std_pool.cleanup_dead_thread_connections()
         except Exception as exc:
-            self._record_failure("stock_stat", "block_files", "exception", str(exc))
+            self._record_failure("finance_info_batch", "finance", "exception", str(exc))
+            raise RuntimeError("0010 财务批次拉取不完整") from exc
 
-        return build_stock_stat_df(
-            ab_rows,
-            fin_map,
-            stat_map,
-            region_map,
-            industry_name_map,
-            code_hy_map,
-        )
+        finance_map: Dict[str, Dict[str, Any]] = {}
+        for _offset, finance_rows in sorted(fetched, key=lambda item: item[0]):
+            for row in finance_rows:
+                finance_map[str(row["code"])] = row
+        return finance_map
 
     def get_future_latest_price(
         self, codes: Optional[Any] = None
@@ -5428,7 +5732,7 @@ class UnifiedTdxClient:
                 else:
                     missing.append(code)
             if missing:
-                self.get_all_future_list(return_df=True, use_cache=False)
+                self._refresh_future_catalog_view()
                 for code in missing:
                     if code in self._future_route:
                         targets.append(code)
@@ -5467,7 +5771,14 @@ class UnifiedTdxClient:
                 continue
 
             one = (rows or [None])[0]
-            price = None if one is None else self._safe_float(one.get("price"))
+            price = self._quote_last_price(one)
+            if price is None:
+                self._record_failure(
+                    "future_latest_price",
+                    canonical_code,
+                    "no_valid_quote",
+                    "price/pre_close 均为空或非正",
+                )
             result[canonical_code] = price
             if canonical_code != code:
                 result.pop(code, None)
@@ -5523,26 +5834,15 @@ class UnifiedTdxClient:
         end_ts: pd.Timestamp,
         qfq: Optional[bool] = None,
     ) -> pd.DataFrame:
-        """输入标准股票参数，输出区间 K 线；用于自动分页；None/空页即结束。"""
-        page_size = self._standard_kline_page_size()
-
-        def _fetch_page(start: int) -> Any:
-            return self._pool_call_allow_none(
-                self.std_pool,
-                "get_security_bars",
-                category,
-                int(market),
-                str(code),
-                int(start),
-                int(page_size),
-                qfq=self._standard_kline_qfq(qfq),
-            )
-
-        rows = self._paginate_kline_pages(
-            page_size=page_size,
+        """输入标准股票参数，输出区间 K 线；None、空页、短页或时间边界结束。"""
+        rows = self._fetch_raw_kline_rows(
+            source="std",
+            market=market,
+            code=code,
+            category=category,
             start_boundary=start_ts,
             boundary_mode="pandas",
-            fetch_page=_fetch_page,
+            qfq=self._standard_kline_qfq(qfq),
         )
         market_name = self._std_stock_market_name(int(market))
         return self._kline_dataframe(
@@ -5559,26 +5859,15 @@ class UnifiedTdxClient:
         end_ts: pd.Timestamp,
         qfq: bool = False,
     ) -> pd.DataFrame:
-        """输入扩展参数，输出区间 K 线；用于自动分页；None/空页即结束。"""
-        page_size = int(TDXParams.MAX_EXTENDED_KLINE_COUNT)
-
-        def _fetch_page(start: int) -> Any:
-            return self._pool_call_allow_none(
-                self.ex_pool,
-                "get_instrument_bars",
-                category,
-                int(market),
-                str(code),
-                int(start),
-                int(page_size),
-                qfq=bool(qfq),
-            )
-
-        rows = self._paginate_kline_pages(
-            page_size=page_size,
+        """输入扩展参数，输出区间 K 线；None、空页、短页或时间边界结束。"""
+        rows = self._fetch_raw_kline_rows(
+            source="ex",
+            market=market,
+            code=code,
+            category=category,
             start_boundary=start_ts,
             boundary_mode="pandas",
-            fetch_page=_fetch_page,
+            qfq=bool(qfq),
         )
         market_name = self._get_ex_market_name(int(market))
         return self._kline_dataframe(
@@ -5797,7 +6086,7 @@ class UnifiedTdxClient:
                 unresolved.append(code)
 
         if unresolved:
-            self.get_all_future_list(return_df=True, use_cache=False)
+            self._refresh_future_catalog_view()
             for code in unresolved:
                 if code in self._future_route:
                     targets.append(code)
@@ -5865,7 +6154,7 @@ class UnifiedTdxClient:
         self.get_all_future_list(return_df=True)
         route = self._future_route.get(normalized_code)
         if route is None:
-            self.get_all_future_list(return_df=True, use_cache=False)
+            self._refresh_future_catalog_view()
             route = self._future_route.get(normalized_code)
         if route is None:
             raise ValueError(f"期货代码未找到: {code}（标准化后: {normalized_code}）")
@@ -6053,13 +6342,13 @@ class UnifiedTdxClient:
         3. bind_host: 目录所在站；给出时每一轮读取前都把当前线程连到该站。
         输出：
         1. (正文, status)。status 为 success / none_terminated / empty_terminated /
-           gbk_ignore_fallback / host_bind_failed / host_call_failed。
+           short_page_terminated / gbk_ignore_fallback / host_bind_failed / host_call_failed。
         用途：
         1. 按官方客户端分页拉取各页原始字节，拼完整包后再做 GBK 解码。
         边界条件：
         1. 单页上限为 `TDXParams.COMPANY_INFO_CHUNK_SIZE`（30720）。
         2. 请求走 `call_current_host`，页与页之间不换站。
-        3. 某一页返回 None 或空 bytes 时停止后续页。
+        3. 某一页返回 None、空 bytes 或不足预期字节时停止后续页。
         4. 严格 GBK 失败时 ignore 兜底，并由调用方记入运行态失败。
         """
         if bind_host is not None:
@@ -6076,6 +6365,7 @@ class UnifiedTdxClient:
 
         while offset < int(length):
             remaining = int(length) - offset
+            expected_page_size = min(chunk_size, remaining)
             try:
                 part = self.std_pool.call_current_host(
                     "get_company_info_content",
@@ -6098,7 +6388,10 @@ class UnifiedTdxClient:
                 status = "empty_terminated"
                 break
             chunks.append(part)
-            offset += min(chunk_size, remaining)
+            if len(part) != expected_page_size:
+                status = "short_page_terminated"
+                break
+            offset += expected_page_size
 
         text, decode_status = self._decode_company_info_bytes(b"".join(chunks))
         if status == "success" and decode_status != "success":
@@ -6200,6 +6493,7 @@ class UnifiedTdxClient:
         retry_status = {
             "none_terminated",
             "empty_terminated",
+            "short_page_terminated",
             "host_bind_failed",
             "host_call_failed",
         }

@@ -93,13 +93,17 @@ python -m build
 
 ## 4. 测试命令
 
-### 4.1 pytest（自动收集，离线）
+### 4.1 pytest（自动收集）
 
 ```bash
+# 纯离线回归
+py -m pytest tests/ -q --ignore=tests/test_simple_api_retry_e2e.py --ignore=tests/test_user_acceptance_tcp_config.py
+
+# 完整回归（其中 26 例会执行真实 TCP 探测）
 py -m pytest tests/ -q
 ```
 
-- 当前共有 273 个用例，全部离线可跑。
+- 当前共有 314 个用例；其中 288 个为纯离线测试，26 个配置/重试验收用例需要真实 TCP 可达。
 - `pyproject.toml` 已配置 `pythonpath = ["src"]`、`testpaths = ["tests"]`、`norecursedirs = ["manual", ...]`。
 - 不要修改 `tests/` 下现有用例的语义，除非修复接口变更导致的编译/调用错误。
 

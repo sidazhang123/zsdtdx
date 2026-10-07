@@ -4,28 +4,41 @@
 职责：
 1. 定义全市场股票统计宽表对外列（内部英文键 + 中文表头映射）。
 2. 将行情行、财务行、tdxstat 快照按代码左连接，向量化计算市值/换手/估值后输出 DataFrame。
-3. 假定 tdxstat 为昨收时点快照，按现价/昨收把 PE、股息率、n 日涨幅折算到当前价。
-4. 提供 `fetch_stock_stat` 门面，委托统一客户端拉数。
+3. 将 zhb/tdxstat 字段按文件原值返回，不推断其与实时行情的交易日关系。
+4. 编排 054B 实时行情、0010 财务批次与 zhb/tdxstat 静态统计数据。
 
 边界：
-1. 不组协议包、不管理连接池。
+1. 不组协议包、不管理连接池；通过统一客户端的通用数据能力拉取原始数据。
 2. 不强制刷新板块命名文件缓存；由客户端复用 `block_file_cache`。
-3. 无 codes 入参；范围由前缀过滤与配置 `include_indices` 决定。
-4. 现价非正则估值价回退昨收；仅当行内统计基准日不是当日时才按现价折算价敏字段。
+3. 无 codes 入参；范围固定为 A 股股票，按市场号与代码前缀排除指数/板块。
+4. 现价非正则时，仅实时行情与财务派生的估值指标回退昨收；不改写 tdxstat 字段。
 5. 不接码表；返回列为中文表头，见 `STOCK_STAT_COLUMN_LABELS`。
 """
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-from zsdtdx.parser.tdxstat import TDXSTAT_FIELD_KEYS
-from zsdtdx.util.helper import call_with_client
-from zsdtdx.engine.unified_client import UnifiedTdxClient
+from zsdtdx.biz._client_context import call_with_main_client
+from zsdtdx.params import TDXParams
+from zsdtdx.parser.get_board_quote_page import MAX_BOARD_QUOTE_PAGE
+from zsdtdx.parser.get_finance_info_batch import MAX_FINANCE_INFO_BATCH
+from zsdtdx.parser.tdxstat import (
+    TDXSTAT_FIELD_KEYS,
+    merge_tdxstat_maps,
+    parse_industry_name_map_from_incon,
+    parse_region_map_from_tdxzs,
+    parse_tdxhy_code_map,
+    parse_tdxstat2_cfg,
+    parse_tdxstat_cfg,
+    read_zhb_stat_payload,
+)
+
+if TYPE_CHECKING:
+    from zsdtdx.engine.unified_client import UnifiedTdxClient
 
 # 对外宽表列顺序（内部英文键；返回前映射为中文表头）。
 STOCK_STAT_COLUMNS: List[str] = [
@@ -193,7 +206,7 @@ STOCK_STAT_COLUMN_LABELS: Dict[str, str] = {
     "pb": "市净率",
     "ps": "市销率",
     "pcf": "市现率",
-    "stat_asof": "统计基准日",  # 快照基准日；价敏列折算后仍保留
+    "stat_asof": "统计基准日",  # zhb/tdxstat 文件原值
     "beta": "贝塔系数",  # 近60日相对大盘（沪→上证、深→深成指）
     "consec_up_days": "连涨天数",
     "chg_pct_prev": "统计日涨幅(%)",
@@ -266,22 +279,6 @@ FINANCE_FIELD_KEYS = (
     "_region_code",
 )
 
-# tdxstat 假定挂在昨收：随现价/昨收因子重算的字段。
-_TDXSTAT_PE_KEYS = ("pe_ttm", "pe_static")
-_TDXSTAT_YIELD_KEYS = ("dividend_yield_pct",)
-_TDXSTAT_CHG_PCT_KEYS = (
-    "chg_pct_prev",
-    "chg_pct_3d",
-    "chg_pct_5d",
-    "chg_pct_10d",
-    "chg_pct_20d",
-    "chg_pct_30d",
-    "chg_pct_60d",
-    "chg_pct_1y",
-    "chg_pct_mtd",
-    "chg_pct_ytd",
-)
-
 _YUAN_TO_WAN_KEYS = ("amount", "float_mkt_cap", "total_mkt_cap")
 _QIAN_TO_WAN_KEYS = (
     "total_assets",
@@ -307,9 +304,9 @@ _QIAN_TO_WAN_KEYS = (
 )
 
 
-def is_stock_stat_row(market: int, code: str, *, include_indices: bool) -> bool:
+def is_stock_stat_row(market: int, code: str) -> bool:
     """
-    输入：市场号、代码、是否保留指数。
+    输入：市场号、代码。
     输出：是否纳入全市场股票集合。
     用途：过滤板块/指数占位。
     边界：粗分代码形态，不读码表。
@@ -317,13 +314,12 @@ def is_stock_stat_row(market: int, code: str, *, include_indices: bool) -> bool:
     c = str(code).strip()
     if len(c) != 6 or not c.isdigit():
         return False
-    if not include_indices:
-        if c.startswith(("399", "880")) or c in {"999999", "999998", "999997"}:
-            return False
+    if c.startswith(("399", "880")) or c in {"999999", "999998", "999997"}:
+        return False
     if market == 0:
         return c.startswith(("000", "001", "002", "003", "300", "301"))
     if market == 1:
-        return c.startswith(("60", "68")) or include_indices
+        return c.startswith(("60", "68"))
     if market == 2:
         return c.startswith(("43", "83", "87", "88", "92"))
     return False
@@ -360,16 +356,6 @@ def _map_to_frame(
     return pd.DataFrame(cols)
 
 
-def _today_stat_asof() -> str:
-    """
-    输入：无。
-    输出：当日自然日 `YYYYMMDD`。
-    用途：判断 tdxstat 行是否已是当日快照。
-    边界：按本机日历日，不区分交易日。
-    """
-    return datetime.now().strftime("%Y%m%d")
-
-
 def _valuation_price(price: pd.Series, last_close: pd.Series) -> pd.Series:
     """
     输入：现价列、昨收列。
@@ -381,18 +367,6 @@ def _valuation_price(price: pd.Series, last_close: pd.Series) -> pd.Series:
     last = pd.to_numeric(last_close, errors="coerce")
     chosen = px.where(px > 0, last)
     return chosen.where(chosen > 0)
-
-
-def _price_to_last_factor(price: pd.Series, last_close: pd.Series) -> pd.Series:
-    """
-    输入：现价列、昨收列。
-    输出：估值价/昨收；无法计算时为 NA。
-    用途：把昨收时点的 tdxstat 比率折到当前价。
-    边界：估值价回退昨收时因子为 1；昨收非正则 NA。
-    """
-    px = _valuation_price(price, last_close)
-    last = pd.to_numeric(last_close, errors="coerce")
-    return (px / last).where((px > 0) & (last > 0))
 
 
 def _derive_quote_metrics(df: pd.DataFrame) -> pd.DataFrame:
@@ -429,47 +403,6 @@ def _derive_quote_metrics(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _rebase_tdxstat_to_live_price(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    输入：已合并 tdxstat 列的宽表。
-    输出：按需折算 PE、股息率、n 日涨幅后的同一 DataFrame。
-    用途：`stat_asof` 不是当日时，假定快照挂在昨收并折到现价；已是当日则原样送出。
-    边界：
-    1. 仅 `stat_asof != 今日` 的行参与折算；等于今日或无法比价时保持文件原值。
-    2. PE_live = PE_asof × (估值价/昨收)。
-    3. 股息率_live = 股息率_asof × (昨收/估值价)。
-    4. 涨幅_live% = ((1 + 涨幅_asof/100) × 因子 − 1) × 100。
-    5. `stat_asof`/`beta` 等非价敏字段不改。
-    """
-    out = df
-    if "stat_asof" not in out.columns:
-        return out
-    today = _today_stat_asof()
-    asof = out["stat_asof"].fillna("").astype(str).str.strip()
-    need_rebase = asof != today
-    factor = _price_to_last_factor(out.get("price"), out.get("last_close"))
-    factor = factor.where(need_rebase)
-    for key in _TDXSTAT_PE_KEYS:
-        if key not in out.columns:
-            continue
-        base = pd.to_numeric(out[key], errors="coerce")
-        adjusted = (base * factor).round(4)
-        out[key] = base.where(factor.isna() | base.isna(), adjusted)
-    for key in _TDXSTAT_YIELD_KEYS:
-        if key not in out.columns:
-            continue
-        base = pd.to_numeric(out[key], errors="coerce")
-        adjusted = (base / factor).round(4)
-        out[key] = base.where(factor.isna() | base.isna(), adjusted)
-    for key in _TDXSTAT_CHG_PCT_KEYS:
-        if key not in out.columns:
-            continue
-        base = pd.to_numeric(out[key], errors="coerce")
-        adjusted = ((1.0 + base / 100.0) * factor - 1.0) * 100.0
-        out[key] = base.where(factor.isna() | base.isna(), adjusted.round(4))
-    return out
-
-
 def _scale_amount_columns_to_wan(df: pd.DataFrame) -> pd.DataFrame:
     """
     输入：协议原单位聚合宽表（市值/成交额为元，财务金额为千元）。
@@ -500,7 +433,7 @@ def build_stock_stat_df(
     输出：已投影、单位折算、中文表头后的宽表 DataFrame。
     用途：离线/在线共用的聚合核心（向量化，不逐票 Python 循环算估值）。
     边界：财务或统计缺失时对应列为 NA/None；空行情返回空表（含全部列）；
-         仅统计基准日非当日的行才按现价/昨收折算价敏字段；
+         zhb/tdxstat 字段按文件原值合并，不按本机日期或实时价格改写；
          表头为 `STOCK_STAT_COLUMN_LABELS` 中文（含单位）。
     """
     if not quote_rows:
@@ -553,7 +486,6 @@ def build_stock_stat_df(
             if key not in merged.columns:
                 merged[key] = np.nan
 
-    merged = _rebase_tdxstat_to_live_price(merged)
     merged = _scale_amount_columns_to_wan(merged)
 
     for key in STOCK_STAT_COLUMNS:
@@ -564,17 +496,98 @@ def build_stock_stat_df(
     return out.replace({np.nan: None})
 
 
+def _load_stock_stat_static_maps(
+    client: UnifiedTdxClient,
+) -> Tuple[
+    Dict[str, Dict[str, Any]],
+    Dict[int, str],
+    Dict[str, str],
+    Dict[str, str],
+]:
+    """
+    输入统一客户端，输出 tdxstat、地区、行业名与股票行业映射。
+
+    用途：从共享缓存的 zhb.zip / tdxhy.cfg 构建宽表静态字段。
+    边界：任一必需文件或解析结果缺失时记录失败并抛错，不降级返回残缺宽表。
+    """
+    try:
+        files = client.get_block_named_files()
+        zhb = files.get(TDXParams.ZHB_ZIP_REMOTE_FILE) or b""
+        hy_raw = files.get(TDXParams.TDXHY_REMOTE_FILE) or b""
+        if not zhb or not hy_raw:
+            raise ValueError("zhb.zip 或 tdxhy.cfg 为空")
+        payload = read_zhb_stat_payload(zhb)
+        required = {"tdxstat.cfg", "tdxstat2.cfg", "tdxzs.cfg", "incon.dat"}
+        missing = sorted(name for name in required if not payload.get(name))
+        if missing:
+            raise ValueError(f"zhb.zip 缺少必需成员: {missing}")
+
+        stat_map = merge_tdxstat_maps(
+            parse_tdxstat_cfg(payload["tdxstat.cfg"]),
+            parse_tdxstat2_cfg(payload["tdxstat2.cfg"]),
+        )
+        region_map = parse_region_map_from_tdxzs(payload["tdxzs.cfg"])
+        industry_name_map = parse_industry_name_map_from_incon(payload["incon.dat"])
+        code_hy_map = parse_tdxhy_code_map(hy_raw)
+        if not all((stat_map, region_map, industry_name_map, code_hy_map)):
+            raise ValueError("stock_stat 静态映射解析结果为空")
+        return stat_map, region_map, industry_name_map, code_hy_map
+    except Exception as exc:
+        client.record_runtime_failure(
+            "stock_stat", "block_files", "exception", str(exc)
+        )
+        raise RuntimeError("stock_stat 静态统计数据不完整") from exc
+
+
+def _fetch_stock_stat_with_client(client: UnifiedTdxClient) -> pd.DataFrame:
+    """
+    输入统一客户端，输出全市场 A 股统计宽表。
+
+    用途：按固定顺序编排 054B、0010 与静态统计数据，并调用向量化聚合核心。
+    边界：无 codes 过滤；任一数据源不完整时抛错；不包含指数与港股。
+    """
+    cfg = client.config.get("stock_stat", {}) or {}
+    page_size = min(
+        max(1, int(cfg.get("page_size", MAX_BOARD_QUOTE_PAGE))),
+        MAX_BOARD_QUOTE_PAGE,
+    )
+    batch_size = min(
+        max(1, int(cfg.get("finance_batch_size", MAX_FINANCE_INFO_BATCH))),
+        MAX_FINANCE_INFO_BATCH,
+    )
+    finance_workers = min(max(1, int(cfg.get("finance_workers", 4))), 8)
+
+    quote_rows = client.get_board_quote_rows(
+        page_size,
+        lambda row: is_stock_stat_row(int(row["market"]), str(row["code"])),
+    )
+    codes = [(int(row["market"]), str(row["code"])) for row in quote_rows]
+    finance_map = client.get_finance_info_batch_map(
+        codes,
+        batch_size,
+        finance_workers,
+    )
+    stat_map, region_map, industry_name_map, code_hy_map = _load_stock_stat_static_maps(
+        client
+    )
+    return build_stock_stat_df(
+        quote_rows,
+        finance_map,
+        stat_map,
+        region_map,
+        industry_name_map,
+        code_hy_map,
+    )
+
+
 def fetch_stock_stat() -> pd.DataFrame:
     """
     输入：无。
     输出：全市场股票统计宽表 DataFrame。
-    用途：simple_api 门面；需处于 `with get_client()`。
-    边界：无 codes；配置见 `config.yaml` 的 `stock_stat`。
+    用途：simple_api 业务门面；复用活跃主进程客户端完成跨源聚合。
+    边界：无 codes；配置见 `config.yaml` 的 `stock_stat`；无活跃上下文时临时客户端会自动关闭。
     """
-    from zsdtdx.simple_api import get_client
-
-    return call_with_client(
-        lambda client: client.get_stock_stat(),
-        get_active_context_client=UnifiedTdxClient.get_active_context_client,
-        build_client=lambda: get_client(),
+    return call_with_main_client(
+        _fetch_stock_stat_with_client,
+        caller_name="get_stock_stat",
     )

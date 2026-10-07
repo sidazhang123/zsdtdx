@@ -9,11 +9,12 @@
 边界：
 1. 不发起网络请求，不解析板块目录或统计表。
 2. 三份文件必须同时存在且非空，否则视为无效缓存。
-3. 多进程并发写以最后一次为准。
+3. 多进程刷新由调用方的同目录文件锁串行化，写入本身使用原子替换。
 """
 
 from __future__ import annotations
 
+import math
 import os
 import pickle
 import tempfile
@@ -101,7 +102,7 @@ def _snapshot_ok(snapshot: object) -> bool:
         fetched_at = float(snapshot.get("fetched_at"))
     except (TypeError, ValueError):
         return False
-    if fetched_at <= 0:
+    if not math.isfinite(fetched_at) or fetched_at <= 0:
         return False
     files = snapshot.get("files")
     if not isinstance(files, dict):
@@ -135,6 +136,22 @@ def load_fresh_block_files(
     path = block_file_cache_path(cache_dir)
     if path is None or not path.is_file():
         return None
+    current = time.time() if now is None else float(now)
+    if now is None:
+        try:
+            mtime_age = current - path.stat().st_mtime
+        except OSError:
+            return None
+        if not math.isfinite(current) or not math.isfinite(mtime_age) or mtime_age < 0:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
+        # 文件修改时间不会早于原子写入完成时间。先挡住显然过期的旧文件，
+        # 避免为已过期的大型 pickle 支付反序列化成本；最终仍以下方 fetched_at 为准。
+        if mtime_age >= BLOCK_FILE_TTL_SECONDS:
+            return None
     try:
         with open(path, "rb") as handle:
             snapshot = pickle.loads(handle.read())
@@ -150,9 +167,15 @@ def load_fresh_block_files(
         except OSError:
             pass
         return None
-    current = time.time() if now is None else float(now)
     fetched_at = float(snapshot["fetched_at"])
-    if current - fetched_at >= BLOCK_FILE_TTL_SECONDS:
+    age = current - fetched_at
+    if not math.isfinite(current) or not math.isfinite(age) or age < 0:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    if age >= BLOCK_FILE_TTL_SECONDS:
         return None
     files = {name: bytes(snapshot["files"][name]) for name in REQUIRED_BLOCK_FILES}
     return {"fetched_at": fetched_at, "files": files}
@@ -188,6 +211,8 @@ def save_block_files(
     if path is None:
         raise ValueError("板块文件缓存目录不可写")
     stamp = time.time() if fetched_at is None else float(fetched_at)
+    if not math.isfinite(stamp) or stamp <= 0:
+        raise ValueError(f"板块文件缓存时间戳非法: {fetched_at}")
     blob = pickle.dumps(
         {"version": _CACHE_FORMAT_VERSION, "fetched_at": stamp, "files": payload},
         protocol=pickle.HIGHEST_PROTOCOL,
@@ -195,3 +220,15 @@ def save_block_files(
     with _LOCK:
         _atomic_write_bytes(path, blob)
     return stamp
+
+
+def invalidate_block_files(cache_dir: Optional[Path] = None) -> None:
+    """删除板块文件快照；用于语义解析失败后强制下次重新下载。
+
+    输入：cache_dir 为空时使用默认缓存目录。
+    输出：无；文件不存在时安全返回。
+    边界：删除失败原样抛出 OSError，由调用方记录但不复用该内存快照。
+    """
+    path = block_file_cache_path(cache_dir)
+    if path is not None:
+        path.unlink(missing_ok=True)

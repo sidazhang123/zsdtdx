@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Summary
+1. 日志输出统一由 `config.yaml.logging.level` 控制，仅支持 DEBUG/INFO/ERROR/OFF；单条日志的级别在代码中固定，逐 chunk 与重试细节为 DEBUG。
+2. 后台 TCP 探测改为不创建嵌套线程池，避免短生命周期进程退出时出现 executor shutdown 竞态。
+3. 股票、指数、板块 K 线业务门面共用校验与 sync/async 分发器；标准/扩展 K 线共用底层分页请求。
+4. 主进程 API 统一经业务层客户端借用入口；默认连接改为按实际使用侧懒建。
+5. 期货最新价现价非正时回退昨收，两者均非正时返回 `None` 并记录 `no_valid_quote`。
+6. `get_stock_stat` 不再按自然日推断交易日并折算 tdxstat；统计基准日、涨幅、PE 与股息率均按 zhb 文件原值返回。
+7. 删除依赖旧版股票统计英文列名的三份手工验收脚本，并收敛 API、配置与 parser 注释。
+
 ## v2.3.1 - 2026-09-30
 
 ### Summary

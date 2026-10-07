@@ -18,7 +18,7 @@ import re
 import sys
 import time
 import traceback
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -74,7 +74,16 @@ def _ok(round_id: str, elapsed: float, **extra: Any) -> int:
         **extra,
     }
     _write_report(round_id, payload)
-    print(json.dumps({k: payload[k] for k in ("round_id", "ok", "elapsed_seconds") if k in payload}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                k: payload[k]
+                for k in ("round_id", "ok", "elapsed_seconds")
+                if k in payload
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 
@@ -96,7 +105,7 @@ def _check_kline_row(row: Dict[str, Any], freq: str) -> Optional[str]:
     if not _DT_RE.match(dt_text):
         return f"datetime格式非法:{dt_text}"
     try:
-        o, h, l, c = (
+        o, h, low, c = (
             float(row.get("open")),
             float(row.get("high")),
             float(row.get("low")),
@@ -104,9 +113,9 @@ def _check_kline_row(row: Dict[str, Any], freq: str) -> Optional[str]:
         )
     except Exception:
         return "OHLC无法转float"
-    if h < l:
+    if h < low:
         return "high<low"
-    if h + 1e-9 < max(o, c) or l - 1e-9 > min(o, c):
+    if h + 1e-9 < max(o, c) or low - 1e-9 > min(o, c):
         return "OHLC不自洽"
     vol = row.get("volume")
     if vol is not None:
@@ -163,9 +172,7 @@ def _consume_async(job: Any, *, expected_tasks: int) -> Dict[str, Any]:
         if err:
             stats["error_tasks"] += 1
             if len(stats["error_samples"]) < 8:
-                stats["error_samples"].append(
-                    {"task": task, "error": str(err)[:240]}
-                )
+                stats["error_samples"].append({"task": task, "error": str(err)[:240]})
         elif not rows:
             stats["empty_rows"] += 1
         else:
@@ -187,7 +194,7 @@ def _consume_async(job: Any, *, expected_tasks: int) -> Dict[str, Any]:
             print(
                 f"progress events={stats['data_events']}/{expected_tasks} "
                 f"ok={stats['ok_tasks']} empty={stats['empty_rows']} "
-                f"err={stats['error_tasks']} elapsed={time.time()-t0:.1f}s",
+                f"err={stats['error_tasks']} elapsed={time.time() - t0:.1f}s",
                 flush=True,
             )
     stats["destroy"] = dict(destroy_parallel_fetcher())
@@ -197,9 +204,7 @@ def _consume_async(job: Any, *, expected_tasks: int) -> Dict[str, Any]:
         stats["job_result_error"] = str(exc)
     stats["expected_tasks"] = expected_tasks
     stats["coverage"] = (
-        None
-        if expected_tasks <= 0
-        else round(stats["data_events"] / expected_tasks, 4)
+        None if expected_tasks <= 0 else round(stats["data_events"] / expected_tasks, 4)
     )
     return stats
 
@@ -231,7 +236,12 @@ def round_get_supported_markets() -> Dict[str, Any]:
     missing = sorted(need - set(names))
     if missing:
         raise RuntimeError(f"市场名缺失: {missing}")
-    return {"n": len(rows), "sources": sources, "sample_names": names[:12], "has_required": True}
+    return {
+        "n": len(rows),
+        "sources": sources,
+        "sample_names": names[:12],
+        "has_required": True,
+    }
 
 
 def round_get_stock_code_name() -> Dict[str, Any]:
@@ -239,15 +249,20 @@ def round_get_stock_code_name() -> Dict[str, Any]:
     from zsdtdx import get_client, get_stock_code_name
 
     with get_client():
-        mp = get_stock_code_name(use_cache=True)
+        mp = get_stock_code_name()
     prefixes = {}
     for k in mp:
         prefixes[k.split(".", 1)[0]] = prefixes.get(k.split(".", 1)[0], 0) + 1
     if "sh.600000" not in mp or "sz.000001" not in mp:
         raise RuntimeError("缺少浦发银行或平安银行")
-    if any("退" in str(v) for v in mp.values()):
-        raise RuntimeError("码表名称含退")
-    return {"n": len(mp), "prefixes": prefixes, "yaml_scope": "szsh"}
+    retired_names = sorted({str(v) for v in mp.values() if "退" in str(v)})
+    return {
+        "n": len(mp),
+        "prefixes": prefixes,
+        "yaml_scope": "szsh",
+        "retired_name_count": len(retired_names),
+        "retired_name_samples": retired_names[:8],
+    }
 
 
 def round_get_all_future_list() -> Dict[str, Any]:
@@ -255,7 +270,7 @@ def round_get_all_future_list() -> Dict[str, Any]:
     from zsdtdx import get_all_future_list, get_client
 
     with get_client():
-        rows = get_all_future_list(return_df=False, use_cache=False)
+        rows = get_all_future_list(return_df=False)
     markets = sorted({str(r.get("market_name", "")) for r in rows})
     expect = {"郑州商品", "大连商品", "上海期货", "广州期货"}
     if set(markets) != expect:
@@ -270,37 +285,53 @@ def round_get_all_future_list() -> Dict[str, Any]:
 def round_get_stock_stat() -> Dict[str, Any]:
     _boot()
     from zsdtdx import get_client, get_stock_stat
+    from zsdtdx.biz.stock_stat import STOCK_STAT_COLUMN_LABELS
 
     with get_client():
         df = get_stock_stat()
     n = int(len(df))
     if n < 1000:
         raise RuntimeError(f"全市场宽表行数过低: {n}")
-    by_code = {str(r["code"]): r for _, r in df.iterrows()}
+    code_col = STOCK_STAT_COLUMN_LABELS["code"]
+    price_col = STOCK_STAT_COLUMN_LABELS["price"]
+    by_code = {str(r[code_col]): r for _, r in df.iterrows()}
     sample = {}
     for code in ("600000", "000001"):
         row = by_code.get(code)
         if row is None:
             raise RuntimeError(f"缺少 {code}")
-        px = row.get("price")
+        px = row.get(price_col)
         if px is None or float(px) <= 0:
             raise RuntimeError(f"{code} 价异常: {px}")
         sample[code] = float(px)
-    pos = int((df["price"].fillna(0).astype(float) > 0).sum())
+    pos = int((df[price_col].fillna(0).astype(float) > 0).sum())
     return {"n": n, "positive_price": pos, "sample": sample}
 
 
 def round_get_future_latest_price() -> Dict[str, Any]:
     _boot()
-    from zsdtdx import get_client, get_future_latest_price
+    from zsdtdx import get_client, get_future_latest_price, get_runtime_failures
 
     with get_client():
         mp = get_future_latest_price()
         cu = get_future_latest_price("CU")
+        failures = get_runtime_failures()
     pos = sum(1 for v in mp.values() if v is not None and float(v) > 0)
-    if "CUL8" not in cu or cu.get("CUL8") in (None, 0):
-        raise RuntimeError(f"CU主连最新价异常: {cu}")
-    return {"n": len(mp), "positive": pos, "CUL8": cu.get("CUL8")}
+    if "CUL8" not in cu:
+        raise RuntimeError(f"CU 主连路由缺失: {cu}")
+    cu_failure = failures[
+        (failures["code"] == "CUL8")
+        & (failures["reason"] == "no_valid_quote")
+    ]
+    if cu.get("CUL8") is None and cu_failure.empty:
+        raise RuntimeError(f"CU 主连无报价但缺少失败明细: {cu}")
+    return {
+        "n": len(mp),
+        "positive": pos,
+        "unavailable": len(mp) - pos,
+        "CUL8": cu.get("CUL8"),
+        "CUL8_no_valid_quote": not cu_failure.empty,
+    }
 
 
 def round_get_company_info() -> Dict[str, Any]:
@@ -343,7 +374,11 @@ def round_get_runtime_metadata() -> Dict[str, Any]:
         meta = get_runtime_metadata()
     if not isinstance(meta, dict) or not meta:
         raise RuntimeError("runtime metadata 为空")
-    return {"keys": sorted(meta.keys()), "std_active_host": meta.get("std_active_host"), "config_path": meta.get("config_path")}
+    return {
+        "keys": sorted(meta.keys()),
+        "std_active_host": meta.get("std_active_host"),
+        "config_path": meta.get("config_path"),
+    }
 
 
 def round_prewarm() -> Dict[str, Any]:
@@ -362,7 +397,9 @@ def round_restart() -> Dict[str, Any]:
     from zsdtdx import destroy_parallel_fetcher, restart_parallel_fetcher
 
     try:
-        info = restart_parallel_fetcher(prewarm=True, prewarm_timeout_seconds=180, max_rounds=3)
+        info = restart_parallel_fetcher(
+            prewarm=True, prewarm_timeout_seconds=180, max_rounds=3
+        )
         return {"restart": info}
     finally:
         destroy_parallel_fetcher()
@@ -450,7 +487,13 @@ def round_kline_future() -> Dict[str, Any]:
             if reason:
                 bad += 1
                 if len(samples) < 8:
-                    samples.append({"code": rec.get("code"), "freq": rec.get("freq"), "reason": reason})
+                    samples.append(
+                        {
+                            "code": rec.get("code"),
+                            "freq": rec.get("freq"),
+                            "reason": reason,
+                        }
+                    )
     codes = [] if df is None or df.empty else sorted(set(df["code"].astype(str)))
     freqs = [] if df is None or df.empty else sorted(set(df["freq"].astype(str)))
     if n < 100:
@@ -480,7 +523,9 @@ def round_kline_index() -> Dict[str, Any]:
             seen.add(name)
             names.append(name)
     tasks = [
-        IndexKlineTask(index_name=name, freq=freq, start_time=TODAY, end_time=TODAY).to_dict()
+        IndexKlineTask(
+            index_name=name, freq=freq, start_time=TODAY, end_time=TODAY
+        ).to_dict()
         for name in names
         for freq in FREQS
     ]

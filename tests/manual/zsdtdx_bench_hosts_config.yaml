@@ -42,8 +42,7 @@ stock_scope:
 stock_stat:
   page_size: 80
   finance_batch_size: 100
-  include_indices: false
-  max_pages: 0
+  finance_workers: 4
 
 output:
   return_df_default: true

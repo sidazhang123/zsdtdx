@@ -56,7 +56,7 @@ class TDXParams:
     MAX_EXTENDED_KLINE_COUNT = 700
     # 标准行情码表 0x044D 单页条数
     MAX_SECURITY_LIST_COUNT = 1600
-    # 扩展行情码表短页结束阈值
+    # 扩展行情码表兼容请求参数；实盘服务端按自身可变页长返回，不能用于短页终止
     EXTENDED_INSTRUMENT_INFO_PAGE_SIZE = 800
     # K 线向更早历史翻页的次数上限
     MAX_KLINE_PAGES = 400

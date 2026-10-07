@@ -7,7 +7,7 @@
 边界：
 1. 不负责网络下载与业务过滤，仅做序列化/反序列化与路径解析。
 2. std、ex、etf 分文件存储，可独立命中或过期。
-3. 多进程并发写可能产生竞态；当前以最后一次写入为准，不引入额外依赖锁。
+3. 冷启动刷新使用同目录文件锁做跨进程 single-flight；最终文件仍以原子替换写入。
 """
 
 from __future__ import annotations
@@ -16,8 +16,11 @@ import os
 import pickle
 import re
 import tempfile
+import time
+from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 # 与 0x044D 16 字节 GBK 名称记录对应；版本不符的磁盘缓存直接丢弃。
 # v3：ETF 名称合并 zhb.zip/ilong.dat（同码覆盖 infoharbor）。
@@ -55,9 +58,82 @@ def default_zsdtdx_user_cache_dir() -> Path:
 
 def _is_valid_cache_date(cache_date: Any) -> bool:
     """校验缓存日期戳格式是否为 YYYY-MM-DD。"""
-    return isinstance(cache_date, str) and bool(
-        re.match(r"^\d{4}-\d{2}-\d{2}$", cache_date)
-    )
+    if (
+        not isinstance(cache_date, str)
+        or re.fullmatch(r"\d{4}-\d{2}-\d{2}", cache_date) is None
+    ):
+        return False
+    try:
+        date.fromisoformat(cache_date)
+    except ValueError:
+        return False
+    return True
+
+
+@contextmanager
+def cache_refresh_lock(
+    cache_dir: Path,
+    key: str,
+    *,
+    timeout_seconds: float = 120.0,
+    stale_seconds: float = 300.0,
+) -> Iterator[None]:
+    """为缓存冷启动提供跨线程、跨进程 single-flight 文件锁。
+
+    输入：
+    1. cache_dir: 锁文件所在缓存目录。
+    2. key: std/ex/etf/block 等缓存键。
+    3. timeout_seconds: 最长等待时间。
+    4. stale_seconds: 崩溃遗留锁的回收阈值。
+    输出：无；作为上下文管理器使用。
+    用途：命中失败后只允许一个执行流下载，其他执行流获得锁后再次检查缓存。
+    边界：超时抛 TimeoutError；只删除超过 stale_seconds 的同目录锁文件。
+    """
+    directory = Path(cache_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    safe_key = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(key or "cache"))
+    lock_path = directory / f".zsdtdx_{safe_key}.lock"
+    deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+    stale_after = max(1.0, float(stale_seconds))
+    fd: Optional[int] = None
+    while fd is None:
+        try:
+            candidate_fd = os.open(
+                str(lock_path),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            )
+            try:
+                os.write(
+                    candidate_fd,
+                    f"pid={os.getpid()} time={time.time()}\n".encode("ascii"),
+                )
+            except Exception:
+                os.close(candidate_fd)
+                lock_path.unlink(missing_ok=True)
+                raise
+            fd = candidate_fd
+        except FileExistsError:
+            try:
+                age = time.time() - lock_path.stat().st_mtime
+                if age >= stale_after:
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"等待缓存刷新锁超时: {lock_path}")
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        try:
+            if fd is not None:
+                os.close(fd)
+        finally:
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _ensure_directory_writable(target_dir: Path) -> bool:
@@ -348,6 +424,8 @@ def save_catalog_cache(
             for k, v in dict(market_names or {}).items()
         },
     }
+    if validate_catalog_payload(payload, expected_kind=kind_key) is None:
+        raise ValueError("码表缓存记录非法")
     data = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
     _atomic_write_bytes(path, data, tmp_prefix=f".zsdtdx_catalog_{kind_key}_")
 

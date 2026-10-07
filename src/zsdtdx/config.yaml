@@ -14,8 +14,15 @@
 client:
   # with get_client(...) 进入时是否预连接标准/扩展连接池。
   # 取值: true/false
-  # 影响: true 启动更快暴露连接问题；false 首次调用接口时再连接。
-  preconnect_on_enter: true
+  # 影响: true 启动即连接两侧；false 按实际 API 所需侧懒连接，减少冷启动时间与空闲 socket。
+  preconnect_on_enter: false
+
+logging:
+  # 包级唯一日志阈值；仅支持 DEBUG/INFO/ERROR/OFF。
+  # 每条日志的实际级别由代码固定：过程为 INFO、异常为 ERROR、高频诊断为 DEBUG。
+  level: "INFO"
+  # Python logging formatter 格式。
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 hosts:
   # 标准行情 IP 池（A股主站）。
@@ -96,7 +103,8 @@ pagination:
   standard_kline_qfq: true
 
 catalog_cache:
-  # 标准/扩展码表与 ETF/LOF 名称板块的磁盘缓存：按自然日分文件保存，使用时再过滤。
+  # 标准/扩展码表、ETF/LOF 名称板块按自然日缓存；板块三文件按 6 小时缓存。
+  # 调用方无需控制缓存开关：有效即复用，缺失、损坏或过期即自动重建。
   # ETF 文件为 etf_code_name.pkl；当日已有则 get_etf_code_name 不再下载 0x02C5/0x06B9
   #（含 infoharbor_ex.name、zhb.zip/ilong.dat 与板块文件）。
   enabled: true
@@ -148,10 +156,8 @@ stock_stat:
   page_size: 80
   # 0010 每批代码数；服务端硬顶 100。
   finance_batch_size: 100
-  # 是否保留指数/板块占位（399/880 等）。
-  include_indices: false
-  # 054B 最大翻页数；0=翻到空页为止。
-  max_pages: 0
+  # 0010 财务批次并发线程数；1=串行，内部限制为 1..8。
+  finance_workers: 4
 
 output:
   # 默认返回 DataFrame 还是 list[dict]。

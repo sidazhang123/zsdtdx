@@ -17,10 +17,28 @@ def test_init_module_no_import_time_tcp_refresh():
     assert "refresh_tcp_probe_cache_from_config_path" not in text
 
 
+def test_business_and_engine_dependency_direction():
+    """
+    输入业务层与引擎层源码。
+    输出业务层不反向导入 simple_api，引擎层不反向导入 biz。
+    用途：固化 API→biz→engine 的单向依赖。
+    边界：仅检查 Python 源文件，不包含文档与字符串示例。
+    """
+    package_root = Path(__file__).resolve().parents[1] / "src" / "zsdtdx"
+    for path in (package_root / "biz").glob("*.py"):
+        assert "zsdtdx.simple_api" not in path.read_text(encoding="utf-8"), path
+    for path in (package_root / "engine").glob("*.py"):
+        assert "zsdtdx.biz" not in path.read_text(encoding="utf-8"), path
+
+
 def test_default_max_kline_pages_constant():
     assert _DEFAULT_MAX_KLINE_PAGES == 400
     uc_path = (
-        Path(__file__).resolve().parents[1] / "src" / "zsdtdx" / "engine" / "unified_client.py"
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "zsdtdx"
+        / "engine"
+        / "unified_client.py"
     )
     text = uc_path.read_text(encoding="utf-8")
     assert 'max_kline_pages", 200)' not in text
@@ -283,7 +301,10 @@ def test_parallel_fetcher_load_config_uses_resolve_and_active_path(tmp_path):
         "parallel:\n  auto_prewarm_timeout_seconds: 42.5\n  auto_prewarm_max_rounds: 7\n",
         encoding="utf-8",
     )
-    from zsdtdx.engine.parallel_fetcher import ParallelKlineFetcher, set_active_config_path
+    from zsdtdx.engine.parallel_fetcher import (
+        ParallelKlineFetcher,
+        set_active_config_path,
+    )
 
     set_active_config_path(str(custom_cfg.resolve()))
     fetcher = ParallelKlineFetcher(config_path=None)
@@ -374,9 +395,45 @@ def test_paginate_kline_pages_no_df_and_pandas_boundaries():
     assert calls == [0, 2]
 
 
+def test_paginate_kline_short_page_is_terminal():
+    """输入非空短页。输出按协议末页语义停止，不再发起多余的后继请求。"""
+    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+    client.pagination = {"max_kline_pages": 10}
+    client._append_raw_kline_page_rows = (
+        UnifiedTdxClient._append_raw_kline_page_rows.__get__(client, UnifiedTdxClient)
+    )
+    client._to_datetime_no_df = UnifiedTdxClient._to_datetime_no_df.__get__(
+        client, UnifiedTdxClient
+    )
+    client._is_placeholder_raw_kline_row = lambda row: False
+    pages = {
+        0: [{"datetime": "2020-06-02 15:00:00"}],
+        1: [{"datetime": "2020-06-01 15:00:00"}],
+        2: [],
+    }
+    calls: list[int] = []
+
+    def fetch_page(start: int):
+        calls.append(start)
+        return pages[start]
+
+    rows = client._paginate_kline_pages(
+        page_size=2,
+        start_boundary=client._to_datetime_no_df("2019-01-01"),
+        boundary_mode="no_df",
+        fetch_page=fetch_page,
+    )
+    assert len(rows) == 1
+    assert calls == [0]
+
+
 def test_parallel_fetcher_no_chunk_timeout_executor_shutdown():
     pf_path = (
-        Path(__file__).resolve().parents[1] / "src" / "zsdtdx" / "engine" / "parallel_fetcher.py"
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "zsdtdx"
+        / "engine"
+        / "parallel_fetcher.py"
     )
     text = pf_path.read_text(encoding="utf-8")
     assert "_shutdown_chunk_timeout_executor" not in text
@@ -390,7 +447,10 @@ def test_parallel_fetcher_loads_coroutine_workers_from_config(tmp_path):
         "parallel:\n  task_chunk_inproc_coroutine_workers: 9\n",
         encoding="utf-8",
     )
-    from zsdtdx.engine.parallel_fetcher import ParallelKlineFetcher, set_active_config_path
+    from zsdtdx.engine.parallel_fetcher import (
+        ParallelKlineFetcher,
+        set_active_config_path,
+    )
 
     set_active_config_path(str(custom_cfg.resolve()))
     fetcher = ParallelKlineFetcher(config_path=None)

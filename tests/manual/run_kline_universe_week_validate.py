@@ -139,7 +139,9 @@ def _is_bad_number(v: float) -> bool:
     return math.isnan(v) or math.isinf(v)
 
 
-def _check_bar(row: Dict[str, Any], freq: str, start_day: date, end_day: date) -> Optional[str]:
+def _check_bar(
+    row: Dict[str, Any], freq: str, start_day: date, end_day: date
+) -> Optional[str]:
     """
     输入：单根 K 线、周期、窗口日期。
     输出：通过返回 None，否则原因字符串。
@@ -204,7 +206,9 @@ def _check_bar(row: Dict[str, Any], freq: str, start_day: date, end_day: date) -
     return None
 
 
-def _push_sample(bucket: List[Dict[str, Any]], item: Dict[str, Any], limit: int = 30) -> None:
+def _push_sample(
+    bucket: List[Dict[str, Any]], item: Dict[str, Any], limit: int = 30
+) -> None:
     """
     输入：样本桶、条目、上限。
     输出：无。
@@ -496,6 +500,7 @@ def _start_async_with_retry(start_fn: Callable[[], Any], label: str) -> Any:
             print(f"{label} restart_warn: {restart_exc}", flush=True)
         return start_fn()
 
+
 def _validate_future_df(
     df: Any,
     freqs: List[str],
@@ -662,8 +667,8 @@ def main() -> int:
     try:
         _write_json(progress_path, {"phase": "catalog", "status": "loading"})
         with get_client():
-            stock_map = get_stock_code_name(use_cache=True)
-            future_list = get_all_future_list(return_df=False, use_cache=True)
+            stock_map = get_stock_code_name()
+            future_list = get_all_future_list(return_df=False)
         stock_codes = sorted(stock_map.keys())
         future_codes_all = sorted(
             {
@@ -684,7 +689,9 @@ def main() -> int:
             f"indices={len(indices)} prefixes={dict(prefix_counts)}",
             flush=True,
         )
-        _write_json(progress_path, {"phase": "catalog", "universe": summary["universe"]})
+        _write_json(
+            progress_path, {"phase": "catalog", "universe": summary["universe"]}
+        )
 
         measure_per_freq = bool(run.get("measure_elapsed_per_freq", True))
         freq_batches: List[List[str]] = (
@@ -851,9 +858,7 @@ def main() -> int:
                 destroy_info = destroy_parallel_fetcher()
             except Exception as exc:
                 destroy_info = {"error": str(exc)}
-            future_batch = _validate_future_df(
-                fut_df, batch_freqs, start_day, end_day
-            )
+            future_batch = _validate_future_df(fut_df, batch_freqs, start_day, end_day)
             future_batch["elapsed_seconds"] = fut_elapsed
             future_batch["destroy"] = (
                 dict(destroy_info)
@@ -872,9 +877,9 @@ def main() -> int:
                 for freq in batch_freqs:
                     if (code, freq) not in got:
                         missing += 1
-            future_batch["missing_code_freq_pairs"] = int(
-                future_batch.get("missing_code_freq_pairs", 0)
-            ) + missing
+            future_batch["missing_code_freq_pairs"] = (
+                int(future_batch.get("missing_code_freq_pairs", 0)) + missing
+            )
             future_batch["expected_code_freq_pairs"] = len(expect_codes) * len(
                 batch_freqs
             )

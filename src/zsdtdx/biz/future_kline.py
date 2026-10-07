@@ -7,7 +7,7 @@
 边界：
 1. 无独立 FutureKlineTask；入参仍为 codes/freq/start_time/end_time。
 2. 不解析扩展行情包，不管理连接池。
-3. 不从 `simple_api` 做模块级导入。
+3. 不依赖 `simple_api`。
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from typing import Any, List, Optional, Union
 
 import pandas as pd
 
+from zsdtdx.biz._client_context import call_with_main_client
 from zsdtdx.util.helper import normalize_future_time_window
 
 
@@ -48,10 +49,12 @@ def fetch_future_kline(
         freq_list = list(freq)
 
     if codes is None:
-        from zsdtdx.simple_api import get_client
-
-        with get_client() as client:
-            codes = list(client.get_all_future_list(return_df=True)["code"].tolist())
+        codes = call_with_main_client(
+            lambda client: list(
+                client.get_all_future_list(return_df=True)["code"].tolist()
+            ),
+            caller_name="get_future_kline",
+        )
     elif isinstance(codes, str):
         codes = [codes]
     else:

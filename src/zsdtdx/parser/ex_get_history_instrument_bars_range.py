@@ -2,13 +2,12 @@
 模块：`parser/ex_get_history_instrument_bars_range.py`。
 
 职责：
-1. 提供 zsdtdx 体系中的协议封装、解析或对外接口能力。
-2. 对上层暴露稳定调用契约，屏蔽底层协议数据细节。
-3. 当前统计：类 1 个，函数 5 个。
+1. 构造并解析扩展行情指定日期范围 K 线请求。
+2. 将协议二进制字段转换为上层可消费的数据结构。
 
 边界：
-1. 本模块仅负责当前文件定义范围，不承担其它分层编排职责。
-2. 错误语义、重试策略与容错逻辑以实现与调用方约定为准。
+1. 只负责单次请求组包与回包解析，不管理连接池、重试或 host 切换。
+2. 网络错误由上层客户端处理；本模块只定义协议数据边界。
 3. 时间：socket 层解析 d1/d2 仅拼 datetime 字符串，不返回 year/month/day/hour/minute 分列字段。
 """
 
@@ -21,8 +20,8 @@ from typing import Any, Dict, List
 
 import numpy as np
 
-from zsdtdx.util.helper import format_socket_kline_page_inplace
 from zsdtdx.parser.base import BaseParser
+from zsdtdx.util.helper import format_socket_kline_page_inplace
 
 
 class GetHistoryInstrumentBarsRange(BaseParser):
@@ -36,7 +35,7 @@ class GetHistoryInstrumentBarsRange(BaseParser):
         用途：
         1. 执行 `__init__` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层客户端负责；本函数只处理当前协议数据。
         """
         self.seqid = 1
         BaseParser.__init__(self, *args, **kvargs)
@@ -53,31 +52,19 @@ class GetHistoryInstrumentBarsRange(BaseParser):
         用途：
         1. 执行 `setParams` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层客户端负责；本函数只处理当前协议数据。
         """
         pkg = bytearray.fromhex("01")
         pkg.extend(struct.pack("<B", self.seqid))
         self.seqid = self.seqid + 1
         pkg.extend(bytearray.fromhex("38 92 00 01 16 00 16 00 0D 24"))
         code = code.encode("utf-8")
-        # x =struct.pack("<B9s",  market, code)
         pkg.extend(struct.pack("<B9s", market, code))
         pkg.extend(bytearray.fromhex("07 00"))
         pkg.extend(struct.pack("<LL", date, date2))
-        # print(hexdump.hexdump(pkg))
         self.send_pkg = pkg
 
-    #
-
     def parseResponse(self, body_buf):
-        #        print('测试', body_buf)
-        #        fileobj = open("a.bin", 'wb')  # make partfile
-        #        fileobj.write(body_buf)  # write data into partfile
-        #        fileobj.close()
-        # print(hexdump.hexdump(body_buf[0:1024]))
-        #        import zlib
-        #        d=zlib.decompress(body_buf[16:])
-        #        print(hexdump.hexdump(d))
         """
         输入：
         1. body_buf: 输入参数，约束以协议定义与函数实现为准。
@@ -86,7 +73,7 @@ class GetHistoryInstrumentBarsRange(BaseParser):
         用途：
         1. 执行 `parseResponse` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层客户端负责；本函数只处理当前协议数据。
         """
         pos = 12
         (ret_count,) = struct.unpack("H", body_buf[pos : pos + 2])

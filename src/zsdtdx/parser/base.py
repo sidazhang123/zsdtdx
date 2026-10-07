@@ -2,23 +2,23 @@
 模块：`parser/base.py`。
 
 职责：
-1. 提供 zsdtdx 体系中的协议封装、解析或对外接口能力。
-2. 对上层暴露稳定调用契约，屏蔽底层协议数据细节。
-3. 当前统计：类 6 个，函数 7 个。
+1. 提供协议 parser 的请求发送、定长接收、解压与解析基类。
+2. 维护每次请求的收发字节统计，并定义底层协议异常类型。
 
 边界：
-1. 本模块仅负责当前文件定义范围，不承担其它分层编排职责。
-2. 错误语义、重试策略与容错逻辑以实现与调用方约定为准。
+1. 只处理单次协议调用，不负责连接重试与 host 切换。
+2. 业务字段由各具体 parser 的 `parseResponse` 实现。
 """
 
 # coding=utf-8
 
 import datetime
+import logging
 import struct
 import sys
 import zlib
 
-from zsdtdx.util.log import DEBUG, log
+from zsdtdx.util.log import log
 
 try:
     import cython
@@ -34,7 +34,7 @@ try:
             用途：
             1. 执行 `buffer` 对应的协议处理、数据解析或调用适配逻辑。
             边界条件：
-            1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+            1. 连接与重试由上层客户端负责；本函数只处理当前协议数据。
             """
             return x
 except ImportError:
@@ -111,7 +111,7 @@ class BaseParser(object):
         用途：
         1. 执行 `__init__` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层客户端负责；本函数只处理当前协议数据。
         """
         self.client = client
         self.data = None
@@ -142,7 +142,7 @@ class BaseParser(object):
         用途：
         1. 执行 `parseResponse` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层客户端负责；本函数只处理当前协议数据。
         """
         pass
 
@@ -155,7 +155,7 @@ class BaseParser(object):
         用途：
         1. 执行 `setup` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层客户端负责；本函数只处理当前协议数据。
         """
         pass
 
@@ -168,7 +168,7 @@ class BaseParser(object):
         用途：
         1. 执行 `call_api` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层客户端负责；本函数只处理当前协议数据。
         """
         if self.lock:
             with self.lock:
@@ -187,7 +187,7 @@ class BaseParser(object):
         用途：
         1. 执行 `_call_api` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层客户端负责；本函数只处理当前协议数据。
         """
         self.setup()
 
@@ -206,16 +206,16 @@ class BaseParser(object):
         if self.client.first_pkg_send_time is None:
             self.client.first_pkg_send_time = datetime.datetime.now()
 
-        if DEBUG:
+        if log.isEnabledFor(logging.DEBUG):
             log.debug("send package:" + str(self.send_pkg))
 
         head_buf = _recv_exact(self.client, self.rsp_header_len, header=True)
-        if DEBUG:
+        if log.isEnabledFor(logging.DEBUG):
             log.debug(
                 "recv head_buf:" + str(head_buf) + " |len is :" + str(len(head_buf))
             )
         _, _, _, zipsize, unzipsize = struct.unpack("<IIIHH", head_buf)
-        if DEBUG:
+        if log.isEnabledFor(logging.DEBUG):
             log.debug("zip size is: " + str(zipsize))
         if zipsize <= 0:
             log.debug("接收数据体失败服务器断开连接")
@@ -230,7 +230,7 @@ class BaseParser(object):
                 body_buf = zlib.decompress(buffer(body_buf))
             else:
                 body_buf = zlib.decompress(body_buf)
-        if DEBUG:
+        if log.isEnabledFor(logging.DEBUG):
             log.debug("recv body: ")
             log.debug(body_buf)
         return self.parseResponse(body_buf)

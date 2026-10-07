@@ -31,7 +31,7 @@ class GetCompanyInfoCategory(BaseParser):
         用途：
         1. 执行 `setParams` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层客户端负责；本函数只处理当前协议数据。
         """
         if type(code) is six.text_type:
             code = code.encode("utf-8")
@@ -61,7 +61,7 @@ class GetCompanyInfoCategory(BaseParser):
         用途：
         1. 执行 `parseResponse` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层客户端负责；本函数只处理当前协议数据。
         """
         pos = 0
         (num,) = struct.unpack("<H", body_buf[:2])
@@ -78,7 +78,7 @@ class GetCompanyInfoCategory(BaseParser):
             用途：
             1. 执行 `get_str` 对应的协议处理、数据解析或调用适配逻辑。
             边界条件：
-            1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+            1. 连接与重试由上层客户端负责；本函数只处理当前协议数据。
             """
             p = b.find(b"\x00")
             if p != -1:

@@ -7,19 +7,21 @@
 | `smoke_index_kline_sync_async_demo.py` | 指数 K 线 sync/async 小样本冒烟 | 是 |
 | `probe_pytdx_standard_hosts.py` | 标准行情 host 连通性探测 | 是 |
 | `probe_kline_pagination_direction.py` | K 线 `start` 分页方向实测 | 是 |
+| `probe_pagination_termination.py` | 各分页协议末短页及后继空页实测 | 是 |
+| `probe_ex_instrument_pagination.py` | 扩展码表可变页长与空页终止实测 | 是 |
 | `verify_zz2000_1315_bar.py` | 中证2000 单 bar（13:15）行为验证 | 是 |
 | `weaknet_inject_retry.py` | 弱网注入与 chunk 重试路径（离线） | 否 |
 | `run_stock_kline_async_full_compare.py` | 全量股票 async K 线单环境基准（workspace / site_packages） | 是 |
 | `run_stock_kline_async_week.py` | 默认股票清单指定日期区间 15/30/60/d/w async 抽样 | 是 |
 | `compare_std_host_bars.py` | 钉死 `hosts.standard` 对比同一已收盘 15 分钟 K 线跨站是否一致 | 是 |
 | `live_full_api/run_one.py` | 分轮现场验证对外 `get_*` API | 是 |
-| `run_simple_api_full_acceptance.py` | 对外 `get_*` 全量验收 | 是 |
 | `run_kline_universe_week_validate.py` | 全市场周区间多周期 K 线质量校验 | 是 |
 | `run_zsdtdx_weekly_daily_bench.py` | zsdtdx 周/日线基准 | 是 |
 | `run_tdxquant_weekly_daily_bench.py` | tdxquant 周/日线对照基准 | 是 |
 | `analyze_tdxquant_vs_zsdtdx_weekly.py` | tdxquant vs zsdtdx 周线差异分析 | 否 |
 | `check_boc_ohlcv_quality.py` | 单标的 OHLCV 质量抽检 | 是 |
 | `_analyze_kline_errors.py` | K 线错误日志辅助分析 | 否 |
+| `run_cache_lifecycle_acceptance.py` | 真实行情缓存冷建、命中、过期重建与跨接口共享验收 | 是 |
 
 全量基准需主 Agent 分两次单独运行。**不要用「主进程是否退出」判断完成**；async 进程池不会自动关闭，脚本在收到队列 `event=done` 后会立刻调用 `destroy_parallel_fetcher()`，并写入 lifecycle 状态。
 
@@ -43,8 +45,15 @@ py tests/manual/smoke_index_kline_sync_async_demo.py
 py tests/manual/probe_pytdx_standard_hosts.py
 py tests/manual/probe_kline_pagination_direction.py
 py tests/manual/verify_zz2000_1315_bar.py
+py tests/manual/run_cache_lifecycle_acceptance.py
 ```
 
 `probe_pytdx_standard_hosts.py` 结果默认写入同目录 `pytdx_standard_hosts_probe_result.json`。
 
 离线 pytest 用例见上级 `tests/test_*.py`：`py -m pytest tests/ -q`。
+
+说明：旧版 `run_simple_api_full_acceptance.py`、`run_simple_api_anomaly_acceptance.py`
+和 `smoke_yinhe_simple_api.py` 依赖已经废弃的英文股票统计列名，已移除。当前对外 API
+分轮实测使用 `live_full_api/run_one.py`，K 线组合覆盖使用
+`run_simple_api_market_freq_matrix.py`，缓存生命周期使用
+`run_cache_lifecycle_acceptance.py`。

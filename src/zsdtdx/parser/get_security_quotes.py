@@ -2,13 +2,12 @@
 模块：`parser/get_security_quotes.py`。
 
 职责：
-1. 提供 zsdtdx 体系中的协议封装、解析或对外接口能力。
-2. 对上层暴露稳定调用契约，屏蔽底层协议数据细节。
-3. 当前统计：类 1 个，函数 4 个。
+1. 构造并解析标准行情多证券实时五档报价请求。
+2. 将协议二进制字段转换为上层可消费的数据结构。
 
 边界：
-1. 本模块仅负责当前文件定义范围，不承担其它分层编排职责。
-2. 错误语义、重试策略与容错逻辑以实现与调用方约定为准。
+1. 只负责单次请求组包与回包解析，不管理连接池、重试或 host 切换。
+2. 网络错误由上层客户端处理；本模块只定义协议数据边界。
 """
 
 # coding=utf-8
@@ -18,8 +17,8 @@ from collections import OrderedDict
 
 import six
 
-from zsdtdx.util.helper import get_price, get_volume
 from zsdtdx.parser.base import BaseParser
+from zsdtdx.util.helper import get_price, get_volume
 
 
 class GetSecurityQuotesCmd(BaseParser):
@@ -76,7 +75,6 @@ class GetSecurityQuotesCmd(BaseParser):
         stocks = []
 
         for _ in range(num_stock):
-            # print(body_buf[pos:])
             # b'\x00000001\x95\n\x87\x0e\x01\x01\x05\x00\xb1\xb9\xd6\r\xc7\x0e\x8d\xd7\x1a\x84\x04S\x9c<M\xb6\xc8\x0e\x97\x8e\x0c\x00\xae\n\x00\x01\xa0\x1e\x9e\xb3\x03A\x02\x84\xf9\x01\xa8|B\x03\x8c\xd6\x01\xb0lC\x04\xb7\xdb\x02\xac\x7fD\x05\xbb\xb0\x01\xbe\xa0\x01y\x08\x01GC\x04\x00\x00\x95\n'
             (market, code, active1) = struct.unpack("<B6sH", body_buf[pos : pos + 9])
             pos += 9
@@ -100,7 +98,6 @@ class GetSecurityQuotesCmd(BaseParser):
             # reversed_bytes0, pos = get_price(body_buf, pos)
             # 应该是 -price
             reversed_bytes1, pos = get_price(body_buf, pos)
-            # print('reversed_bytes1:' + str(reversed_bytes1)  + ",price" + str(price))
             # assert (reversed_bytes1 == -price)
             vol, pos = get_price(body_buf, pos)
             cur_vol, pos = get_price(body_buf, pos)
@@ -217,7 +214,7 @@ class GetSecurityQuotesCmd(BaseParser):
         用途：
         1. 执行 `_cal_price` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层客户端负责；本函数只处理当前协议数据。
         """
         return float(base_p + diff) / 100
 

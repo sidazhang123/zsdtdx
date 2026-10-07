@@ -6,12 +6,15 @@ import struct
 import threading
 from unittest.mock import MagicMock
 
+import pytest
+
 from zsdtdx.parser.get_company_info_category import GetCompanyInfoCategory
 from zsdtdx.parser.get_company_info_content import (
     COMPANY_INFO_CONTENT_PAGE_SIZE,
     GetCompanyInfoContent,
 )
 from zsdtdx.engine.unified_client import UnifiedTdxClient
+from zsdtdx.params import TDXParams
 
 
 def _attach_pinned_pool(client, fake_call, hosts=None):
@@ -125,7 +128,8 @@ def test_fetch_company_content_pages_like_official_client():
         边界：不访问网络。
         """
         calls.append((method_name, args))
-        return b"x"
+        remaining = int(args[4])
+        return b"x" * min(TDXParams.COMPANY_INFO_CHUNK_SIZE, remaining)
 
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
     client.pagination = {"company_info_chunk_size": 30720}
@@ -141,7 +145,7 @@ def test_fetch_company_content_pages_like_official_client():
         category_index=8,
     )
     assert status == "success"
-    assert text == "x" * 12
+    assert len(text) == 361861
     assert len(calls) == 12
     starts = [item[1][3] for item in calls]
     lengths = [item[1][4] for item in calls]
@@ -153,6 +157,25 @@ def test_fetch_company_content_pages_like_official_client():
     assert indexes == [8] * 12
     assert all(item[0] == "get_company_info_content" for item in calls)
     assert all(item[1][2] == "300063.V14" for item in calls)
+
+
+def test_fetch_company_content_rejects_nonfinal_short_page():
+    """输入已知总长度下的非末尾短页。输出标记不完整，不能跳过缺口继续拼接。"""
+    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+    client.std_pool = MagicMock()
+    client.std_pool.call_current_host.return_value = b"x"
+    text, status = UnifiedTdxClient._fetch_company_content(
+        client,
+        market=0,
+        code="300063",
+        filename="300063.V14",
+        start=0,
+        length=TDXParams.COMPANY_INFO_CHUNK_SIZE + 10,
+        category_index=8,
+    )
+    assert text == "x"
+    assert status == "short_page_terminated"
+    assert client.std_pool.call_current_host.call_count == 1
 
 
 def test_fetch_company_content_joins_bytes_before_gbk_decode():
@@ -357,14 +380,14 @@ def test_get_company_info_content_category_workers_preserves_order():
                     "name": "最新提示",
                     "filename": "600000.V04",
                     "start": 0,
-                    "length": 2,
+                    "length": 1,
                 },
                 {
                     "index": 1,
                     "name": "公司概况",
                     "filename": "600000.V04",
                     "start": 2,
-                    "length": 2,
+                    "length": 1,
                 },
             ]
         # args: market, code, filename, start, length, category_index
@@ -486,8 +509,9 @@ def test_company_info_content_threads_bind_category_host():
     pool.call.assert_not_called()
 
 
-def test_company_info_retries_whole_stock_when_content_host_fails():
-    """输入：第一台站正文中断；输出：换站重拉目录，正文使用第二台站自己的 start。"""
+@pytest.mark.parametrize("first_response", [None, b"x"])
+def test_company_info_retries_whole_stock_when_content_host_fails(first_response):
+    """输入第一台站正文中断或短包；输出换站重拉目录并使用新站自己的 start。"""
     state = {"host": ("10.0.0.1", 7709)}
     content_starts: list[tuple[str, int]] = []
     payload = "正文".encode("gbk")
@@ -525,7 +549,7 @@ def test_company_info_retries_whole_stock_when_content_host_fails():
     def fake_call(method_name, *args, allow_none=False, **kwargs):
         """
         输入：方法名与协议参数。
-        输出：按当前站返回目录；第一台站正文为 None，第二台站返回正文。
+        输出：按当前站返回目录；第一台站正文不完整，第二台站返回完整正文。
         用途：模拟跨站偏移不能混用。
         边界：不访问网络。
         """
@@ -535,7 +559,7 @@ def test_company_info_retries_whole_stock_when_content_host_fails():
         start = int(args[3])
         content_starts.append((host, start))
         if host == "10.0.0.1":
-            return None
+            return first_response
         return payload
 
     client = _client_for_stock("000559", 0)

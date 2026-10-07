@@ -41,13 +41,15 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
+
 from zsdtdx.engine.adaptive_scheduler import (
     AdaptiveConcurrencyController,
     AdaptivePermit,
 )
-from zsdtdx.util.helper import parse_future_symbol
-from zsdtdx.params import TDXParams
 from zsdtdx.engine.unified_client import UnifiedTdxClient
+from zsdtdx.params import TDXParams
+from zsdtdx.util.helper import parse_future_symbol
+from zsdtdx.util.log import emit_log, event_level_name, is_event_enabled
 
 
 def _kline_symbol_field(kind: str) -> str:
@@ -344,15 +346,18 @@ def _emit_log(
     level: str, message: str, detail: Optional[Dict[str, Any]] = None
 ) -> None:
     """
-    统一输出并行获取日志：控制台 print + 可选回调。
+    统一输出并行获取日志：YAML 级别过滤后的包级 logger + 可选回调。
 
     输入：
-    1. level: 日志级别（info/warning/error）。
+    1. level: 代码中固定的日志级别（debug/info/error）。
     2. message: 日志消息。
     3. detail: 可选结构化明细。
     输出：
     1. 无返回值。
     """
+    if not is_event_enabled(level):
+        return
+
     text = str(message)
     if detail:
         try:
@@ -361,13 +366,13 @@ def _emit_log(
             text = f"{text} | {detail}"
     callback = _log_callback
     if callback is None:
-        print(text)
+        emit_log(level, text)
         return
     try:
-        callback(str(level or "info"), str(message), detail)
+        callback(event_level_name(level), str(message), detail)
     except Exception as exc:
-        print(f"[Parallel Logger Error] {exc}")
-        print(text)
+        emit_log("error", "[Parallel Logger Error] %s", exc)
+        emit_log(level, text)
 
 
 def _snapshot_pool_epoch() -> int:
@@ -412,7 +417,7 @@ def _get_global_process_pool(max_workers: int) -> ProcessPoolExecutor:
                 try:
                     _global_process_pool.shutdown(wait=False)
                 except Exception as exc:
-                    _emit_log("warning", f"[Parallel] 关闭旧进程池失败: {exc}")
+                    _emit_log("error", f"[Parallel] 关闭旧进程池失败: {exc}")
                 # C4: multiprocessing.Value 直接挂在共享内存上，无 Manager 子进程需要 shutdown。
                 _global_pool_slot_manager = None
                 _global_pool_slot_counter = None
@@ -449,7 +454,7 @@ def _get_global_process_pool(max_workers: int) -> ProcessPoolExecutor:
                 if not snapshot.get("extended"):
                     snapshot["extended"] = list(ex_hosts)
             except Exception as exc:
-                _emit_log("warning", f"[Parallel] 计算 hosts 指纹失败: {exc}")
+                _emit_log("error", f"[Parallel] 计算 hosts 指纹失败: {exc}")
 
             assignments = _build_worker_host_slot_assignments(
                 snapshot, max_workers, per_host_std, per_host_ex
@@ -894,7 +899,7 @@ def force_restart_parallel_fetcher(
         "failed_pids": [],
     }
     if pool is None:
-        _emit_log("warning", "[Parallel] 强制重启请求时未发现已创建进程池", detail)
+        _emit_log("info", "[Parallel] 强制重启请求时未发现已创建进程池", detail)
     else:
         processes = _snapshot_pool_processes(pool)
         old_pids = []
@@ -940,7 +945,7 @@ def force_restart_parallel_fetcher(
         except Exception as exc:
             detail["shutdown_error"] = str(exc)
 
-    _emit_log("warning", "[Parallel] 已强制终止旧并行进程池", detail)
+    _emit_log("info", "[Parallel] 已强制终止旧并行进程池", detail)
 
     prewarm_summary: Dict[str, Any] | None = None
     if prewarm:
@@ -1425,7 +1430,7 @@ def prewarm_parallel_fetcher(
     3. max_rounds: 预热轮次上限。
     4. target_workers: 可选目标进程数；不传时按当前 fetcher 的 num_processes。
     输出：
-    1. 预热统计摘要（目标进程数、已预热进程数、pid 列表、耗时等）。
+    1. 预热统计摘要（目标进程数、就绪进程数、连接就绪数、pid 列表、耗时等）。
     用途：
     1. 在服务启动阶段提前完成进程与模块初始化，缩短首批抓取冷启动。
     边界条件：
@@ -1522,8 +1527,16 @@ def prewarm_parallel_fetcher(
             break
 
     elapsed_total = round(time.monotonic() - started_at, 3)
+    connection_ready_workers = sum(
+        1
+        for state in worker_states.values()
+        if bool(state.get("std_ok")) or bool(state.get("ex_ok"))
+    )
     summary: Dict[str, Any] = {
         "target_workers": int(target_workers),
+        "ready_processes": int(len(warmed_pids)),
+        "connection_ready_workers": int(connection_ready_workers),
+        # 兼容旧调用方；其语义始终是进程已启动，不代表行情连接已建立。
         "warmed_workers": int(len(warmed_pids)),
         "warmed_pids": sorted(warmed_pids),
         "elapsed_seconds": float(elapsed_total),
@@ -1655,9 +1668,7 @@ def is_future_code(code: str) -> bool:
     if kind == "variety" and "-" in variety:
         return True
     compact = variety.replace("-", "")
-    return (
-        variety in TDXParams.FUTURE_PATTERNS or compact in TDXParams.FUTURE_PATTERNS
-    )
+    return variety in TDXParams.FUTURE_PATTERNS or compact in TDXParams.FUTURE_PATTERNS
 
 
 def get_optimal_process_count(core_multiplier: float = 1.5) -> int:
@@ -2399,7 +2410,7 @@ def _log_chunk_retry(
     if _is_connection_unavailable_error(error_text):
         # 仅记录日志（连接是否需要重建在调用方 timeout 分支已统一处理）。
         _emit_log(
-            "warning",
+            "debug",
             f"[Task Parallel] {log_tag} 检测到连接不可用，将进入重试",
             {
                 "stage": "chunk_retry_connection_unavailable",
@@ -2413,7 +2424,7 @@ def _log_chunk_retry(
         return
 
     _emit_log(
-        "warning",
+        "debug",
         f"[Task Parallel] {log_tag} 执行失败，开始重试",
         {
             "stage": "chunk_retry",
@@ -3398,9 +3409,7 @@ class ParallelKlineFetcher:
             self.config_path = str(resolved)
             return _load_merged_zsdtdx_config(str(resolved))
         except Exception as e:
-            _emit_log(
-                "warning", f"[ParallelKlineFetcher] 配置加载失败: {e}, 使用默认值"
-            )
+            _emit_log("error", f"[ParallelKlineFetcher] 配置加载失败: {e}, 使用默认值")
             return {}
 
     def _validate_queue(self, queue_obj: Optional[Any]) -> None:
@@ -3708,7 +3717,7 @@ class ParallelKlineFetcher:
             task_detail = [dict(item) for item in chunk.tasks]
             task_payload = self._build_chunk_task_detail(task_detail)
             _emit_log(
-                "info",
+                "debug",
                 "[Task Inproc] 分配 chunk 任务",
                 {
                     "stage": "chunk_dispatched",
@@ -3806,7 +3815,7 @@ class ParallelKlineFetcher:
                     report.get("chunk_network_page_calls", 0) or 0
                 )
                 _emit_log(
-                    "info",
+                    "debug",
                     "[Task Inproc] chunk 任务完成",
                     {
                         "stage": "chunk_completed",
@@ -4113,7 +4122,7 @@ class ParallelKlineFetcher:
                 task_detail = [dict(item) for item in chunk.tasks]
                 task_payload = self._build_chunk_task_detail(task_detail)
                 _emit_log(
-                    "info",
+                    "debug",
                     "[Task Parallel] 分配 chunk 任务",
                     {
                         "stage": "chunk_dispatched",
@@ -4307,7 +4316,7 @@ class ParallelKlineFetcher:
                     report.get("chunk_network_page_calls", 0) or 0
                 )
                 _emit_log(
-                    "info",
+                    "debug",
                     "[Task Parallel] chunk 任务完成",
                     {
                         "stage": "chunk_completed",
@@ -4746,7 +4755,7 @@ class ParallelKlineFetcher:
                 except Exception as e:
                     error_msg = str(e)[:100]
                     failures.append((code, freq, error_msg))
-                    _emit_log("warning", f"[Serial Fetch Error] {code}/{freq}: {e}")
+                    _emit_log("error", f"[Serial Fetch Error] {code}/{freq}: {e}")
                     continue
 
             # 记录失败信息到上下文客户端（如果存在）
@@ -4767,7 +4776,7 @@ class ParallelKlineFetcher:
                 try:
                     client.close()
                 except Exception as exc:
-                    _emit_log("warning", f"[Serial Fetch] 关闭客户端失败: {exc}")
+                    _emit_log("error", f"[Serial Fetch] 关闭客户端失败: {exc}")
 
         if all_data:
             return pd.concat(all_data, ignore_index=True)
@@ -4813,7 +4822,7 @@ class ParallelKlineFetcher:
                 task_detail = _serialize_task_list(chunk)
                 task_payload = self._build_chunk_task_detail(task_detail)
                 _emit_log(
-                    "info",
+                    "debug",
                     "[Parallel] 分配进程任务",
                     {
                         "stage": "chunk_dispatched",
@@ -4857,7 +4866,7 @@ class ParallelKlineFetcher:
                             all_failures.extend(chunk_failures)
                         done_tasks += chunk_task_count
                         _emit_log(
-                            "info",
+                            "debug",
                             "[Parallel] 进程任务完成",
                             {
                                 "stage": "chunk_completed",
@@ -4919,7 +4928,7 @@ class ParallelKlineFetcher:
                     try:
                         recycle_summary = force_restart_parallel_fetcher(prewarm=False)
                         _emit_log(
-                            "warning",
+                            "info",
                             "[Parallel Timeout] 已触发并行进程强制回收",
                             {
                                 "stage": "chunk_timeout_recycled",
@@ -4941,7 +4950,7 @@ class ParallelKlineFetcher:
 
                 if timeout_tasks and self.timeout_fallback_to_serial:
                     _emit_log(
-                        "warning",
+                        "info",
                         "[Parallel Timeout] 未完成任务回退串行补拉",
                         {
                             "stage": "chunk_timeout_fallback_serial",
@@ -4969,7 +4978,7 @@ class ParallelKlineFetcher:
                                 task_type, code, "fetch_error", error, freq
                             )
                 except Exception as e:
-                    _emit_log("warning", f"[Parallel] 记录失败信息时出错: {e}")
+                    _emit_log("error", f"[Parallel] 记录失败信息时出错: {e}")
 
         except Exception as e:
             _emit_log("error", f"[Parallel Error] 执行失败: {e}")
@@ -5125,7 +5134,7 @@ def _iter_company_info_chunk_results(
             )
         except Exception as exc:
             _emit_log(
-                "warning",
+                "error",
                 "[CompanyInfo Parallel] 预热失败，继续尝试抓取",
                 {"error": str(exc)},
             )
@@ -5249,7 +5258,7 @@ def fetch_company_info_parallel(
 
     if all_errors:
         _emit_log(
-            "warning",
+            "error",
             "[CompanyInfo Parallel] 部分股票失败",
             {"error_count": len(all_errors), "sample": all_errors[:5]},
         )

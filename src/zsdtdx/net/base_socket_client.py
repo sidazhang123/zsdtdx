@@ -15,18 +15,18 @@
 # coding=utf-8
 
 import atexit
-import socket
-import weakref
 import datetime
 import functools
+import socket
 import threading
 import time
+import weakref
 
 import pandas as pd
 
+from zsdtdx.parser.raw_parser import RawParser
 from zsdtdx.util.errors import TdxConnectionError, TdxFunctionCallError
 from zsdtdx.util.log import log
-from zsdtdx.parser.raw_parser import RawParser
 
 # 连接超时（秒）
 CONNECT_TIMEOUT = 5.0
@@ -231,7 +231,6 @@ class BaseSocketClient(object):
                 # TCP_NODELAY 在极少数嵌入式/精简 socket 模块上可能不可用，失败时静默降级。
                 pass
         except socket.timeout:
-            # print(str(e))
             log.debug("connection expired")
             self.client.close()
             self.client = None
@@ -354,7 +353,7 @@ class BaseSocketClient(object):
         用途：
         1. 执行 `send_raw_pkg` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层统一客户端负责；本函数只处理当前层数据。
         """
         cmd = RawParser(self.client, lock=self.lock)
         cmd.setParams(pkg)
@@ -369,7 +368,7 @@ class BaseSocketClient(object):
         用途：
         1. 执行 `__enter__` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层统一客户端负责；本函数只处理当前层数据。
         """
         return self
 
@@ -384,7 +383,7 @@ class BaseSocketClient(object):
         用途：
         1. 执行 `__exit__` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层统一客户端负责；本函数只处理当前层数据。
         """
         self.close()
 
@@ -397,7 +396,7 @@ class BaseSocketClient(object):
         用途：
         1. 执行 `to_df` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层统一客户端负责；本函数只处理当前层数据。
         """
         if isinstance(v, list):
             return pd.DataFrame(data=v)

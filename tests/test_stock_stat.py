@@ -5,13 +5,17 @@ from __future__ import annotations
 import struct
 from collections import OrderedDict
 
+import pytest
+
+import zsdtdx.biz.stock_stat as stock_stat_module
 from zsdtdx.biz.stock_stat import (
     STOCK_STAT_COLUMN_LABELS,
     STOCK_STAT_DISPLAY_COLUMNS,
-    _today_stat_asof,
+    _fetch_stock_stat_with_client,
     build_stock_stat_df,
     is_stock_stat_row,
 )
+from zsdtdx.engine.unified_client import UnifiedTdxClient
 from zsdtdx.parser.get_board_quote_page import (
     GetBoardQuotePageCmd,
     enrich_board_quote_row,
@@ -30,7 +34,6 @@ from zsdtdx.parser.tdxstat import (
     parse_tdxstat2_cfg,
     parse_tdxstat_cfg,
 )
-from zsdtdx.engine.unified_client import UnifiedTdxClient
 
 
 def test_board_quote_page_pack_clamps_to_80():
@@ -48,6 +51,157 @@ def test_board_quote_page_pack_clamps_to_80():
     assert count == 80
 
 
+def test_stock_stat_short_board_page_is_terminal():
+    """输入 054B 短页。输出不再请求后继空页，保留已拉取股票。"""
+    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+    board_starts: list[int] = []
+
+    def pool_call(_pool, method, *args):
+        if method == "get_board_quote_page":
+            start = int(args[0])
+            board_starts.append(start)
+            if start != 0:
+                raise AssertionError("054B 短页后不应再请求")
+            return [{"market": 1, "code": "600000", "price": 10.0}]
+        raise AssertionError(f"未预期的方法: {method}")
+
+    client.std_pool = object()
+    client._pool_call_allow_none = pool_call
+    client._record_failure = lambda *args: None
+    result = client.get_board_quote_rows(80)
+    assert board_starts == [0]
+    assert len(result) == 1
+
+
+def test_stock_stat_board_none_is_failure_but_empty_page_is_normal():
+    """输入 None 与空页。输出前者报错、后者正常结束，避免静默残缺。"""
+    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+    client.std_pool = object()
+    client._record_failure = lambda *args: None
+    client._pool_call_allow_none = lambda *_args: None
+    with pytest.raises(RuntimeError, match="None"):
+        client.get_board_quote_rows(80)
+
+    client._pool_call_allow_none = lambda *_args: []
+    assert client.get_board_quote_rows(80) == []
+
+
+def test_stock_stat_suspended_quote_is_normal_row():
+    """输入现价与成交量为 0 的停牌形态。输出仍纳入股票集。"""
+    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+    client.std_pool = object()
+    client._record_failure = lambda *args: None
+    client._pool_call_allow_none = lambda *_args: [
+        {
+            "market": 0,
+            "code": "002667",
+            "price": 0.0,
+            "last_close": 22.19,
+            "vol": 0,
+        }
+    ]
+    rows = client.get_board_quote_rows(80)
+    assert [row["code"] for row in rows] == ["002667"]
+
+
+def test_stock_stat_finance_map_requires_complete_code_set():
+    """输入完整与缺行的 0010 批次。输出完整映射或显式报错。"""
+
+    class DummyPool:
+        def __init__(self):
+            self.cleaned = 0
+
+        def cleanup_dead_thread_connections(self):
+            self.cleaned += 1
+
+    codes = [(1, f"60{i:04d}") for i in range(201)]
+    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+    client.std_pool = DummyPool()
+    client._record_failure = lambda *args: None
+
+    def complete_call(_pool, method, chunk):
+        assert method == "get_finance_info_batch"
+        return [{"code": code} for _, code in chunk]
+
+    client._pool_call_allow_none = complete_call
+    result = client.get_finance_info_batch_map(codes, 100, 4)
+    assert set(result) == {code for _, code in codes}
+    assert client.std_pool.cleaned == 1
+
+    client._pool_call_allow_none = lambda _pool, _method, chunk: [
+        {"code": code} for _, code in chunk[:-1]
+    ]
+    with pytest.raises(RuntimeError, match="不完整"):
+        client.get_finance_info_batch_map(codes[:2], 100, 1)
+
+
+def test_stock_stat_business_orchestration_uses_generic_client_capabilities(
+    monkeypatch,
+):
+    """
+    输入同时含股票与指数的版面数据。
+    输出业务层只向财务能力传入股票，并完成六源参数聚合。
+    用途：固化 simple_api→biz→engine 的目标分层。
+    边界：不发网络请求，不解析真实静态文件。
+    """
+
+    class FakeClient:
+        config = {
+            "stock_stat": {
+                "page_size": 80,
+                "finance_batch_size": 100,
+                "finance_workers": 4,
+            }
+        }
+
+        def __init__(self):
+            self.finance_args = None
+
+        def get_board_quote_rows(self, page_size, row_filter=None):
+            assert page_size == 80
+            rows = [
+                {"market": 1, "code": "600000", "price": 10.0},
+                {"market": 0, "code": "399001", "price": 20.0},
+            ]
+            return [row for row in rows if row_filter is None or row_filter(row)]
+
+        def get_finance_info_batch_map(self, codes, batch_size, workers):
+            self.finance_args = (codes, batch_size, workers)
+            return {"600000": {"code": "600000"}}
+
+    client = FakeClient()
+    static_maps = (
+        {"600000": {"stat_asof": "20260930"}},
+        {18: "深圳板块"},
+        {"T020603": "银行"},
+        {"600000": "T020603"},
+    )
+    captured = {}
+    monkeypatch.setattr(
+        stock_stat_module,
+        "_load_stock_stat_static_maps",
+        lambda _client: static_maps,
+    )
+
+    def fake_build(quote_rows, finance_map, stat_map, region_map, industry_map, hy_map):
+        captured["args"] = (
+            quote_rows,
+            finance_map,
+            stat_map,
+            region_map,
+            industry_map,
+            hy_map,
+        )
+        return "target-result"
+
+    monkeypatch.setattr(stock_stat_module, "build_stock_stat_df", fake_build)
+    result = _fetch_stock_stat_with_client(client)
+    assert result == "target-result"
+    assert client.finance_args == ([(1, "600000")], 100, 4)
+    assert [row["code"] for row in captured["args"][0]] == ["600000"]
+    assert captured["args"][1:] == ({"600000": {"code": "600000"}}, *static_maps)
+
+
 def test_board_quote_enrich_and_empty_body():
     """
     输入：空正文与手工价量行。
@@ -55,7 +209,9 @@ def test_board_quote_enrich_and_empty_body():
     用途：行情衍生字段。
     边界：不依赖网络。
     """
-    assert parse_board_quote_body(b"") == []
+    with pytest.raises(ValueError, match="正文过短"):
+        parse_board_quote_body(b"")
+    assert parse_board_quote_body(struct.pack("<HH", 0, 0)) == []
     row = enrich_board_quote_row(
         {
             "price": 11.0,
@@ -73,6 +229,12 @@ def test_board_quote_enrich_and_empty_body():
     assert row["amplitude_pct"] == 30.0
     assert row["avg_price"] == 11.0
     assert row["io_ratio"] == round(40.0 / 60.0, 4)
+
+
+def test_board_quote_parser_rejects_declared_count_mismatch():
+    """输入声明 1 条但无记录的 054B 正文。输出结构错误而非空页。"""
+    with pytest.raises(ValueError, match="记录数不匹配"):
+        parse_board_quote_body(struct.pack("<HH", 0, 1))
 
 
 def test_finance_batch_pack_and_parse_one_record():
@@ -157,14 +319,16 @@ def test_tdxstat_merge_and_maps():
 def test_is_stock_stat_row_filters_index():
     """
     输入：指数与股票代码。
-    输出：默认过滤指数；include_indices 时保留。
+    输出：始终过滤指数，仅保留股票代码前缀。
     用途：全市场范围过滤。
     边界：不读码表。
     """
-    assert is_stock_stat_row(1, "600000", include_indices=False)
-    assert not is_stock_stat_row(0, "399001", include_indices=False)
-    assert is_stock_stat_row(1, "880001", include_indices=True)
-    assert not is_stock_stat_row(0, "399001", include_indices=True)
+    assert is_stock_stat_row(1, "600000")
+    assert is_stock_stat_row(0, "300001")
+    assert is_stock_stat_row(2, "920001")
+    assert not is_stock_stat_row(0, "399001")
+    assert not is_stock_stat_row(1, "880001")
+    assert not is_stock_stat_row(1, "000001")
 
 
 def test_build_stock_stat_df_units_and_columns():
@@ -264,14 +428,12 @@ def test_build_stock_stat_df_units_and_columns():
     assert row[L["total_assets"]] == 100.0  # 千元→万元
     assert row[L["region"]] == "深圳板块"
     assert row[L["industry"]] == "银行"
-    # 现价/昨收=10/9 且 asof 非今日：涨幅、PE、股息率按昨收快照折算
-    factor = 10.0 / 9.0
+    # zhb/tdxstat 字段不推断交易日，不与实时涨幅聚合。
     assert row[L["stat_asof"]] == "20260929"
-    assert row[L["stat_asof"]] != _today_stat_asof()
-    assert row[L["chg_pct_5d"]] == round(((1.0 + 2.2 / 100.0) * factor - 1.0) * 100.0, 4)
-    assert row[L["pe_ttm"]] == round(9.0 * factor, 4)
-    assert row[L["pe_static"]] == round(8.1 * factor, 4)
-    assert row[L["dividend_yield_pct"]] == round(4.5 / factor, 4)
+    assert row[L["chg_pct_5d"]] == 2.2
+    assert row[L["pe_ttm"]] == 9.0
+    assert row[L["pe_static"]] == 8.1
+    assert row[L["dividend_yield_pct"]] == 4.5
     # 现价 10、流通股本 100 万股：市值=1000 万元；pb=10/2.5=4
     assert row[L["float_mkt_cap"]] == 1000.0
     assert row[L["total_mkt_cap"]] == 2000.0
@@ -328,7 +490,7 @@ def test_build_stock_stat_df_price_zero_falls_back_to_last_close():
     assert row[L["pcf"]] == 10.0
     # 市销用元口径：总市值元 / 营收元
     assert row[L["ps"]] == round((22.19 * 200 * 10000) / (1000.0 * 1000.0), 2)
-    # 现价回退昨收 → 因子=1，tdxstat 价敏字段保持快照
+    # tdxstat 字段始终保持文件原值，与估值价回退无关。
     assert row[L["chg_pct_5d"]] == 1.7
     assert row[L["pe_ttm"]] == -13.29
     assert row[L["dividend_yield_pct"]] == 0.54
@@ -356,14 +518,14 @@ def test_build_stock_stat_df_price_zero_falls_back_to_last_close():
     assert both_zero[L["pcf"]] is None
 
 
-def test_build_stock_stat_df_skips_rebase_when_asof_is_today():
+def test_build_stock_stat_df_keeps_tdxstat_raw_values_for_old_asof():
     """
-    输入：`stat_asof` 为当日、现价≠昨收。
-    输出：tdxstat 价敏字段保持文件原值不折算。
-    用途：当日快照已含最新价语义时直接送出。
+    输入：`stat_asof` 明显早于行情自然日、现价≠昨收。
+    输出：tdxstat 字段仍保持文件原值，不推断交易日或折算。
+    用途：固化 zhb 原值返回契约。
     边界：市值等仍按现价计算。
     """
-    today = _today_stat_asof()
+    stat_asof = "20000104"
     quote = {
         "market": 1,
         "code": "600000",
@@ -384,7 +546,7 @@ def test_build_stock_stat_df_skips_rebase_when_asof_is_today():
         {"600000": fin},
         {
             "600000": {
-                "stat_asof": today,
+                "stat_asof": stat_asof,
                 "chg_pct_5d": 2.2,
                 "pe_ttm": 9.0,
                 "pe_static": 8.1,
@@ -397,7 +559,7 @@ def test_build_stock_stat_df_skips_rebase_when_asof_is_today():
     )
     row = df.iloc[0]
     L = STOCK_STAT_COLUMN_LABELS
-    assert row[L["stat_asof"]] == today
+    assert row[L["stat_asof"]] == stat_asof
     assert row[L["chg_pct_5d"]] == 2.2
     assert row[L["pe_ttm"]] == 9.0
     assert row[L["pe_static"]] == 8.1

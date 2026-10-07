@@ -111,7 +111,10 @@ def test_get_index_kline_sync_does_not_forward_qfq():
     with (
         patch("zsdtdx.biz.index_kline._ensure_active_config_ready"),
         patch("zsdtdx.engine.parallel_fetcher.get_fetcher") as get_fetcher,
-        patch("zsdtdx.biz.index_kline.call_with_client", side_effect=_run_with_client),
+            patch(
+                "zsdtdx.biz.index_kline.call_with_main_client",
+                side_effect=_run_with_client,
+            ),
     ):
         fetcher = MagicMock()
         fetcher.fetch_index_tasks_sync.return_value = []

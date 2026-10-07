@@ -201,7 +201,7 @@ def get_datetime(category, buffer, pos):
     用途：
     1. 执行 `get_datetime` 对应的协议处理、数据解析或调用适配逻辑。
     边界条件：
-    1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+    1. 连接与重试由上层统一客户端负责；本函数只处理当前层数据。
     """
     year = 0
     month = 0
@@ -238,7 +238,7 @@ def get_time(buffer, pos):
     用途：
     1. 执行 `get_time` 对应的协议处理、数据解析或调用适配逻辑。
     边界条件：
-    1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+    1. 连接与重试由上层统一客户端负责；本函数只处理当前层数据。
     """
     (tminutes,) = struct.unpack("<H", buffer[pos : pos + 2])
     hour = int(tminutes / 60)
@@ -606,11 +606,13 @@ def _apply_active_config_path(
                     _ensure_availability_hosts_cache(
                         config_path=resolved_str,
                         cfg=cfg,
+                        parallel_probe=False,
                     )
                 except Exception as exc:
-                    from zsdtdx.util.log import log
+                    from zsdtdx.util.log import emit_log
 
-                    log.error(
+                    emit_log(
+                        "error",
                         "[set_config_path] 后台 TCP 可用地址探测失败: %s",
                         exc,
                     )
@@ -624,9 +626,10 @@ def _apply_active_config_path(
             try:
                 _ensure_availability_hosts_cache(config_path=resolved_str, cfg=cfg)
             except Exception as exc:
-                from zsdtdx.util.log import log
+                from zsdtdx.util.log import emit_log
 
-                log.error(
+                emit_log(
+                    "error",
                     "[set_config_path] 同步 TCP 可用地址探测失败: %s",
                     exc,
                 )
@@ -645,7 +648,7 @@ def _ensure_active_config_ready(caller_name: str) -> str:
     - 当前生效配置路径字符串。
 
     边界条件:
-    - 若用户未显式设置配置，会自动回退到包内默认配置并打印一次提醒。
+    - 若用户未显式设置配置，会自动回退到包内默认配置并按 YAML 日志阈值提醒一次。
     """
     global _DEFAULT_CONFIG_NOTICE_PRINTED
 
@@ -658,9 +661,13 @@ def _ensure_active_config_ready(caller_name: str) -> str:
 
     default_path = _apply_active_config_path(config_path=_DEFAULT_CONFIG_PATH)
     if not _DEFAULT_CONFIG_NOTICE_PRINTED:
-        print(
-            f"[zsdtdx.simple_api] {caller_name} 未先调用 set_config_path()，"
-            f"当前使用默认配置: {default_path}"
+        from zsdtdx.util.log import emit_log
+
+        emit_log(
+            "info",
+            "[zsdtdx.simple_api] %s 未先调用 set_config_path()，当前使用默认配置: %s",
+            caller_name,
+            default_path,
         )
         _DEFAULT_CONFIG_NOTICE_PRINTED = True
     return default_path

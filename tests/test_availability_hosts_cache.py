@@ -205,6 +205,7 @@ def test_set_config_path_async_returns_before_ensure(mock_ensure, tmp_path):
     release.set()
     time.sleep(0.05)
     mock_ensure.assert_called()
+    assert mock_ensure.call_args.kwargs.get("parallel_probe") is False
 
 
 @patch("zsdtdx.engine.unified_client._ensure_availability_hosts_cache")

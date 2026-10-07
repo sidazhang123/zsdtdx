@@ -2,13 +2,12 @@
 模块：`hq.py`。
 
 职责：
-1. 提供 zsdtdx 体系中的协议封装、解析或对外接口能力。
-2. 对上层暴露稳定调用契约，屏蔽底层协议数据细节。
-3. 当前统计：类 1 个，函数 21 个。
+1. 封装标准行情协议命令，向上层提供证券、指数、F10、财务和板块文件请求。
+2. 为每个公开方法创建对应 parser，并通过同一 socket client 完成调用。
 
 边界：
-1. 本模块仅负责当前文件定义范围，不承担其它分层编排职责。
-2. 错误语义、重试策略与容错逻辑以实现与调用方约定为准。
+1. 不负责连接池、host 切换与业务聚合，这些由统一客户端处理。
+2. 返回值保持 parser 原始数据结构，不在本层构造业务 DataFrame。
 """
 
 # coding=utf-8
@@ -109,7 +108,7 @@ class TdxHq_API(BaseSocketClient):
         用途：
         1. 发送 54 字节 0x052D 个股 K 线请求并解析回包。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层统一客户端负责；本函数只处理当前层数据。
         """
         cmd = GetSecurityBarsCmd(self.client, lock=self.lock)
         cmd.setParams(category, market, code, start, count, qfq=qfq)
@@ -130,7 +129,7 @@ class TdxHq_API(BaseSocketClient):
         1. 发送 54 字节 0x052D 指数 K 线请求并解析回包。
         边界条件：
         1. 指数无复权语义，请求 reserved0 固定为 0。
-        2. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        2. 连接与重试由上层统一客户端负责；本函数只处理当前层数据。
         """
         cmd = GetIndexBarsCmd(self.client, lock=self.lock)
         cmd.setParams(category, market, code, start, count)
@@ -192,7 +191,7 @@ class TdxHq_API(BaseSocketClient):
         用途：
         1. 执行 `get_security_count` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层统一客户端负责；本函数只处理当前层数据。
         """
         cmd = GetSecurityCountCmd(self.client, lock=self.lock)
         cmd.setParams(market)
@@ -227,7 +226,7 @@ class TdxHq_API(BaseSocketClient):
         用途：
         1. 执行 `get_minute_time_data` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层统一客户端负责；本函数只处理当前层数据。
         """
         cmd = GetMinuteTimeData(self.client, lock=self.lock)
         cmd.setParams(market, code)
@@ -245,7 +244,7 @@ class TdxHq_API(BaseSocketClient):
         用途：
         1. 执行 `get_history_minute_time_data` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层统一客户端负责；本函数只处理当前层数据。
         """
         cmd = GetHistoryMinuteTimeData(self.client, lock=self.lock)
         cmd.setParams(market, code, date)
@@ -264,7 +263,7 @@ class TdxHq_API(BaseSocketClient):
         用途：
         1. 执行 `get_transaction_data` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层统一客户端负责；本函数只处理当前层数据。
         """
         cmd = GetTransactionData(self.client, lock=self.lock)
         cmd.setParams(market, code, start, count)
@@ -284,7 +283,7 @@ class TdxHq_API(BaseSocketClient):
         用途：
         1. 执行 `get_history_transaction_data` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层统一客户端负责；本函数只处理当前层数据。
         """
         cmd = GetHistoryTransactionData(self.client, lock=self.lock)
         cmd.setParams(market, code, start, count, date)
@@ -301,7 +300,7 @@ class TdxHq_API(BaseSocketClient):
         用途：
         1. 执行 `get_company_info_category` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层统一客户端负责；本函数只处理当前层数据。
         """
         cmd = GetCompanyInfoCategory(self.client, lock=self.lock)
         cmd.setParams(market, code)
@@ -341,7 +340,7 @@ class TdxHq_API(BaseSocketClient):
         用途：
         1. 执行 `get_xdxr_info` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 连接与重试由上层统一客户端负责；本函数只处理当前层数据。
         """
         cmd = GetXdXrInfo(self.client, lock=self.lock)
         cmd.setParams(market, code)
@@ -419,7 +418,8 @@ class TdxHq_API(BaseSocketClient):
         用途：
         1. 内存中分页下载命名文件，不落盘。
         边界条件：
-        1. 元数据失败或连续空页则停止；不解压到银河安装目录。
+        1. 元数据失败、分页异常、连续空页或最终长度不符时返回 None；
+           不把半截文件交给上层，也不解压到银河安装目录。
         """
         filecontent = bytearray()
         current_downloaded_size = 0
@@ -436,15 +436,19 @@ class TdxHq_API(BaseSocketClient):
                 filename, current_downloaded_size, chunk_size
             )
             if not response or not isinstance(response, dict):
-                break
+                return None
             try:
                 page_len = int(response.get("chunksize") or 0)
             except Exception:
                 page_len = 0
             data = bytes(response.get("chunkdata") or b"")
             if page_len > 0 and data:
-                chunk = data[:page_len] if len(data) > page_len else data
-                current_downloaded_size += page_len
+                remaining = total - current_downloaded_size
+                take = min(page_len, remaining)
+                if len(data) < take:
+                    return None
+                chunk = data[:take]
+                current_downloaded_size += take
                 filecontent.extend(chunk)
                 get_zero_length_package_times = 0
                 if reporthook is not None:
@@ -452,8 +456,10 @@ class TdxHq_API(BaseSocketClient):
             else:
                 get_zero_length_package_times = get_zero_length_package_times + 1
                 if get_zero_length_package_times > 2:
-                    break
+                    return None
 
+        if current_downloaded_size != total or len(filecontent) != total:
+            return None
         return filecontent
 
     def get_k_data(self, code, start_date, end_date):
@@ -469,7 +475,8 @@ class TdxHq_API(BaseSocketClient):
         用途：
         1. 执行 `get_k_data` 对应的协议处理、数据解析或调用适配逻辑。
         边界条件：
-        1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+        1. 最多取 10 页；从最新页向历史翻页，空页或不足 800 条的末页停止。
+        2. 连接与重试由上层统一客户端负责；本函数只处理当前层数据。
         """
 
         def __select_market_code(code):
@@ -481,7 +488,7 @@ class TdxHq_API(BaseSocketClient):
             用途：
             1. 执行 `__select_market_code` 对应的协议处理、数据解析或调用适配逻辑。
             边界条件：
-            1. 网络异常、数据异常和重试策略按函数内部与调用方约定处理。
+            1. 连接与重试由上层统一客户端负责；本函数只处理当前层数据。
             """
             code = str(code)
             if code[0] in ["5", "6", "9"] or code[:3] in [
@@ -499,21 +506,25 @@ class TdxHq_API(BaseSocketClient):
         # https://github.com/rainx/zsdtdx/issues/33
         # 0 - 深圳， 1 - 上海
 
-        data = pd.concat(
-            [
-                self.to_df(
-                    self.get_security_bars(
-                        TDXParams.KLINE_TYPE_DAILY,
-                        __select_market_code(code),
-                        code,
-                        (9 - i) * TDXParams.MAX_KLINE_COUNT,
-                        TDXParams.MAX_KLINE_COUNT,
-                    )
-                )
-                for i in range(10)
-            ],
-            axis=0,
-        )
+        pages = []
+        page_size = int(TDXParams.MAX_KLINE_COUNT)
+        for page_index in range(10):
+            page = self.get_security_bars(
+                TDXParams.KLINE_TYPE_DAILY,
+                __select_market_code(code),
+                code,
+                page_index * page_size,
+                page_size,
+            )
+            if not page:
+                break
+            pages.append(self.to_df(page))
+            if len(page) < page_size:
+                break
+        if not pages:
+            return pd.DataFrame()
+        # 服务端 start=0 为最新页；倒序拼页后再按日期筛选，保持历史输出顺序。
+        data = pd.concat(list(reversed(pages)), axis=0)
 
         data = (
             data.assign(date=data["datetime"].apply(lambda x: str(x)[0:10]))

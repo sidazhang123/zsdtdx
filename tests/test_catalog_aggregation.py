@@ -1,6 +1,11 @@
 """离线验收码表聚合层：按侧缓存、使用时过滤、指数同时确保两边。"""
 
+import threading
+import time
 from unittest.mock import MagicMock
+
+import pandas as pd
+import pytest
 
 from zsdtdx.engine.unified_client import UnifiedTdxClient
 
@@ -103,7 +108,7 @@ def test_stock_and_future_filter_at_use_not_download():
         "920002",
     }
 
-    futures = client.get_all_future_list(return_df=False, use_cache=False)
+    futures = client.get_all_future_list(return_df=False)
     future_codes = {row["code"] for row in futures}
     assert future_codes == {"CUL8"}
     assert "IFL8" not in future_codes
@@ -165,6 +170,178 @@ def test_catalog_disk_hit_skips_download(tmp_path):
     assert other._ex_catalog_records[0]["code"] == "CUL8"
 
 
+def test_std_catalog_page_error_never_caches_partial_rows():
+    """输入首分页有数据、下一页返回 None。输出整次失败且旧/半截数据均不可复用。"""
+    client = _catalog_client()
+    client._std_catalog_records = [
+        {"market": 1, "code": "600001", "name": "昨日旧数据"}
+    ]
+    client._std_catalog_date = "2000-01-01"
+    client._std_catalog_markets = lambda: [1]
+    calls = 0
+
+    def page(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [
+                {"code": f"{600000 + index:06d}", "name": f"股票{index}"}
+                for index in range(1600)
+            ]
+        return None
+
+    client.std_pool.call = page
+    with pytest.raises(RuntimeError, match="标准行情码表分页失败"):
+        client._ensure_std_catalog()
+    assert client._std_catalog_records is None
+    assert client._std_catalog_date == ""
+    assert client._stock_df is None
+
+
+def test_std_catalog_short_page_is_terminal():
+    """输入标准码表短页。输出直接结束，不额外请求短页后的空页。"""
+    client = _catalog_client()
+    client._std_catalog_markets = lambda: [2]
+    offsets: list[int] = []
+
+    def page(method, market, start, size, **kwargs):
+        offsets.append(start)
+        if start != 0:
+            raise AssertionError("标准码表短页后不应再请求")
+        return [{"code": "920000", "name": "北交样本"}]
+
+    client.std_pool.call = page
+    rows = client._download_std_security_catalog()
+    assert rows == [{"code": "920000", "name": "北交样本", "market": 2}]
+    assert offsets == [0]
+
+
+def test_ex_catalog_empty_page_is_normal_end(monkeypatch):
+    """输入一整页数据后空页。输出空页只表示没有更早数据，完整结果可缓存。"""
+    client = _catalog_client()
+    page_size = 5
+    monkeypatch.setattr(
+        "zsdtdx.engine.unified_client.TDXParams.EXTENDED_INSTRUMENT_INFO_PAGE_SIZE",
+        page_size,
+    )
+    pages = {
+        0: [
+            {"market": 30, "code": f"CU{index:04d}", "name": f"沪铜{index}"}
+            for index in range(page_size)
+        ],
+        page_size: [],
+    }
+    client.ex_pool.call = lambda method, start, size, **kwargs: pages[start]
+    client._ensure_ex_catalog()
+    assert len(client._ex_catalog_records) == page_size
+    assert client._catalog_memory_fresh("ex") is True
+
+
+def test_catalog_short_page_does_not_end_before_empty_page(monkeypatch):
+    """输入短页后仍有一页数据。输出必须继续翻页，直到服务端明确返回空页。"""
+    client = _catalog_client()
+    monkeypatch.setattr(
+        "zsdtdx.engine.unified_client.TDXParams.EXTENDED_INSTRUMENT_INFO_PAGE_SIZE",
+        5,
+    )
+    offsets: list[int] = []
+    pages = {
+        0: [
+            {"market": 30, "code": "CU01", "name": "沪铜一"},
+            {"market": 30, "code": "CU02", "name": "沪铜二"},
+        ],
+        2: [{"market": 30, "code": "CU03", "name": "沪铜三"}],
+        3: [],
+    }
+
+    def page(method, start, size, **kwargs):
+        offsets.append(start)
+        return pages[start]
+
+    client.ex_pool.call = page
+    rows = client._download_ex_instrument_catalog()
+    assert [row["code"] for row in rows] == ["CU01", "CU02", "CU03"]
+    assert offsets == [0, 2, 3]
+
+
+def test_expired_derived_future_view_is_rebuilt():
+    """输入昨日派生期货表和今日新码表下载。输出不得直接复用昨日派生表。"""
+    client = _catalog_client()
+    client._future_df = pd.DataFrame(
+        [{"code": "OLDL8", "name": "旧主连", "market": 30}]
+    )
+    client._ex_catalog_records = [{"market": 30, "code": "OLDL8", "name": "旧主连"}]
+    client._ex_catalog_date = "2000-01-01"
+    client._download_ex_instrument_catalog = lambda: [
+        {"market": 30, "code": "CUL8", "name": "沪铜主连"}
+    ]
+    rows = client.get_all_future_list(return_df=False)
+    assert [row["code"] for row in rows] == ["CUL8"]
+
+
+def test_one_catalog_write_failure_does_not_disable_other_cache(monkeypatch, tmp_path):
+    """输入 std 写盘失败。输出内存结果仍可用，且 ex 缓存能力不会被连带关闭。"""
+    import zsdtdx.engine.unified_client as unified_module
+
+    client = _catalog_client()
+    client._catalog_cache_enabled = True
+    client._catalog_cache_dir = tmp_path
+    client._download_std_security_catalog = lambda: [
+        {"market": 1, "code": "600000", "name": "浦发银行"}
+    ]
+    client._download_ex_instrument_catalog = lambda: [
+        {"market": 30, "code": "CUL8", "name": "沪铜主连"}
+    ]
+    failures: list[str] = []
+    client._record_failure = lambda *args: failures.append(str(args))
+    real_save = unified_module.save_catalog_cache
+
+    def selective_save(path, **kwargs):
+        if kwargs.get("kind") == "std":
+            raise OSError("磁盘只读")
+        return real_save(path, **kwargs)
+
+    monkeypatch.setattr(unified_module, "save_catalog_cache", selective_save)
+    client.ensure_code_catalog(need_std=True, need_ex=True)
+    assert client._catalog_cache_enabled is True
+    assert client._std_catalog_records[0]["code"] == "600000"
+    assert (tmp_path / "ex_instrument_info.pkl").is_file()
+    assert any("write_failed" in item for item in failures)
+
+
+def test_catalog_cold_start_singleflight_downloads_once(tmp_path):
+    """输入两个客户端同时冷启动同一缓存。输出仅一个下载，另一个在锁后读盘。"""
+    clients = [_catalog_client(), _catalog_client()]
+    for client in clients:
+        client._catalog_cache_enabled = True
+        client._catalog_cache_dir = tmp_path
+    downloads: list[int] = []
+    downloads_lock = threading.Lock()
+
+    def download():
+        with downloads_lock:
+            downloads.append(1)
+        time.sleep(0.1)
+        return [{"market": 1, "code": "600000", "name": "浦发银行"}]
+
+    for client in clients:
+        client._download_std_security_catalog = download
+    threads = [
+        threading.Thread(
+            target=client.ensure_code_catalog,
+            kwargs={"need_std": True},
+        )
+        for client in clients
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+    assert all(not thread.is_alive() for thread in threads)
+    assert downloads == [1]
+    assert all(client._std_catalog_records[0]["code"] == "600000" for client in clients)
+
+
 def test_stock_list_keeps_hk_connect_not_main_board():
     """输入：香港主板与港股通同码、港股通占位码；输出：仅港股通五位代码入股票清单。"""
     client = _catalog_client()
@@ -191,7 +368,7 @@ def test_stock_list_keeps_hk_connect_not_main_board():
     assert client._is_hk_stock_ex(71, "000700") is False
     assert client._route_scope({"source": "ex", "market": 71, "code": "00700"}) == "hk"
     assert client._route_scope({"source": "ex", "market": 31, "code": "00700"}) is None
-    names = client.get_stock_code_name_map(use_cache=True)
+    names = client.get_stock_code_name_map()
     assert "hk.00700" in names
     assert names["hk.00700"] == "腾讯控股"
     assert "hk.02800" in names

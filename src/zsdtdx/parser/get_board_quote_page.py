@@ -9,7 +9,7 @@
 边界：
 1. 服务端硬顶约 80 条/页；请求更大也只回 ≤80。
 2. 不发起网络；组包后由 `call_api` 发送。
-3. 单条解析失败时保留 `parse_error`，不中断整页。
+3. 正文结构不完整或单条解析失败时抛错，不返回残缺页。
 """
 
 from __future__ import annotations
@@ -53,9 +53,7 @@ def enrich_board_quote_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def find_board_record_starts(
-    body: bytes, count: int, start_off: int = 4
-) -> List[int]:
+def find_board_record_starts(body: bytes, count: int, start_off: int = 4) -> List[int]:
     """
     输入：回包正文、期望条数、扫描起点。
     输出：记录起始偏移列表。
@@ -81,12 +79,18 @@ def parse_board_quote_body(body: bytes) -> List[Dict[str, Any]]:
     输入：0x054B 解压正文。
     输出：A/B 字段行列表。
     用途：解析版面分页；供命令类与离线单测共用。
-    边界：正文过短返回空列表；单条失败保留 parse_error。
+    边界：声明 0 条返回空列表；正文过短、条数不匹配或单条失败抛 ValueError。
     """
     if not body or len(body) < 4:
-        return []
+        raise ValueError(f"054B 正文过短: {len(body or b'')} 字节")
     _unk, count = struct.unpack_from("<HH", body, 0)
+    if count <= 0:
+        return []
     starts = find_board_record_starts(body, count, 4)
+    if len(starts) != count:
+        raise ValueError(
+            f"054B 记录数不匹配: 声明 {count} 条，定位 {len(starts)} 条"
+        )
     cmd = GetSecurityQuotesCmd(client=None)
     rows: List[Dict[str, Any]] = []
     for i, start in enumerate(starts):
@@ -103,6 +107,12 @@ def parse_board_quote_body(body: bytes) -> List[Dict[str, Any]]:
         except Exception as exc:
             code = rec[1:7].decode("ascii", errors="replace") if len(rec) >= 7 else ""
             rows.append(OrderedDict([("code", code), ("parse_error", str(exc))]))
+    errors = [row for row in rows if row.get("parse_error")]
+    if errors:
+        detail = "; ".join(
+            f"{row.get('code', '')}: {row.get('parse_error', '')}" for row in errors[:3]
+        )
+        raise ValueError(f"054B 记录解析失败 {len(errors)} 条: {detail}")
     return rows
 
 
@@ -144,6 +154,6 @@ class GetBoardQuotePageCmd(BaseParser):
         输入：解压后的 0x054B 正文。
         输出：带 A/B 字段的行列表。
         用途：版面分页解码。
-        边界：空正文返回 []。
+        边界：服务端声明 0 条返回 []；结构不完整抛 ValueError。
         """
         return parse_board_quote_body(body_buf or b"")

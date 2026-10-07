@@ -8,18 +8,21 @@
 边界：
 1. 单票正文解析在统一客户端。
 2. async 并行在 parallel_fetcher。
-3. 不从 `simple_api` 做模块级导入。
+3. 不依赖 `simple_api`。
 """
 
 from __future__ import annotations
 
 import queue as std_queue
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import pandas as pd
 
-from zsdtdx.util.helper import _ensure_active_config_ready, call_with_client
-from zsdtdx.engine.unified_client import UnifiedTdxClient
+from zsdtdx.biz._client_context import call_with_main_client
+from zsdtdx.util.helper import _ensure_active_config_ready
+
+if TYPE_CHECKING:
+    from zsdtdx.engine.unified_client import UnifiedTdxClient
 
 
 def fetch_company_info(
@@ -64,8 +67,6 @@ def fetch_company_info(
             category=category,
             queue=async_queue,
         )
-
-    from zsdtdx.simple_api import get_client
 
     def _sync_many(client: UnifiedTdxClient):
         """
@@ -120,8 +121,7 @@ def fetch_company_info(
             return pd.DataFrame(all_rows, columns=["code", "category", "content"])
         return all_rows
 
-    return call_with_client(
+    return call_with_main_client(
         _sync_many,
-        get_active_context_client=UnifiedTdxClient.get_active_context_client,
-        build_client=get_client,
+        caller_name="get_company_info",
     )

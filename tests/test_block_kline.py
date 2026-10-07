@@ -2,10 +2,14 @@
 
 import io
 import struct
+import time
 import zipfile
+
+import pytest
 
 from zsdtdx.cache.block_file_cache import (
     BLOCK_FILE_TTL_SECONDS,
+    block_file_cache_path,
     load_fresh_block_files,
     save_block_files,
 )
@@ -120,6 +124,80 @@ def test_block_file_cache_expires_at_six_hours(tmp_path):
     assert fresh is not None
     assert fresh["files"]["zhb.zip"] == files["zhb.zip"]
     assert expired is None
+
+
+def test_block_file_cache_rejects_future_and_nan_timestamps(tmp_path):
+    """输入未来时间与 NaN。输出均不得被当作永不过期的有效缓存。"""
+    files = _files()
+    save_block_files(files, fetched_at=2_000.0, cache_dir=tmp_path)
+    assert load_fresh_block_files(now=1_000.0, cache_dir=tmp_path) is None
+    assert not block_file_cache_path(tmp_path).exists()
+    with pytest.raises(ValueError, match="时间戳非法"):
+        save_block_files(files, fetched_at=float("nan"), cache_dir=tmp_path)
+
+
+def _block_cache_client(tmp_path):
+    """构造只含板块缓存流程所需字段的离线客户端。"""
+    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+    client._catalog_cache_enabled = True
+    client._catalog_cache_dir = tmp_path
+    client._record_failure = lambda *args: None
+    return client
+
+
+def test_semantically_broken_block_cache_is_rebuilt(tmp_path):
+    """输入结构完整但无法解析目录的快照。输出删除坏缓存并用新下载重建。"""
+    broken = {name: b"broken" for name in _files()}
+    save_block_files(broken, cache_dir=tmp_path)
+    client = _block_cache_client(tmp_path)
+    downloads: list[int] = []
+
+    def download():
+        downloads.append(1)
+        return _files()
+
+    client._download_block_named_files = download
+    names = client.get_block_names()
+    assert "汽车拆解" in names
+    assert downloads == [1]
+    loaded = load_fresh_block_files(cache_dir=tmp_path)
+    assert loaded is not None
+    assert loaded["files"]["zhb.zip"] == _files()["zhb.zip"]
+
+
+def test_block_cache_uses_configured_path_and_memory_after_write_failure(
+    monkeypatch, tmp_path
+):
+    """输入自定义目录且磁盘写失败。输出下载结果仍在进程内复用，不重复拉取。"""
+    client = _block_cache_client(tmp_path)
+    downloads: list[int] = []
+
+    def download():
+        downloads.append(1)
+        return _files()
+
+    client._download_block_named_files = download
+    monkeypatch.setattr(
+        "zsdtdx.engine.unified_client.save_block_files",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("磁盘只读")),
+    )
+    first = client.get_block_names()
+    second = client.get_block_names()
+    assert first == second
+    assert downloads == [1]
+    assert client._block_file_cache_dir() == tmp_path
+
+
+def test_stock_concepts_reads_existing_fresh_block_snapshot(tmp_path):
+    """输入已存在的新鲜共享快照。输出股票板块接口不得再次下载同一组三文件。"""
+    save_block_files(_files(), fetched_at=time.time(), cache_dir=tmp_path)
+    client = _block_cache_client(tmp_path)
+    client.get_stock_code_name_map = lambda: {}
+    client._download_named_hq_file = lambda name: (_ for _ in ()).throw(
+        AssertionError(f"不应重新下载 {name}")
+    )
+    result = client.get_stock_concepts()
+    assert result == {"names": [], "map": {}}
 
 
 def test_block_kline_packet_matches_index_layout_except_command():
@@ -242,12 +320,14 @@ def test_get_block_kline_attaches_internal_route(monkeypatch):
         def prepare_block_kline_tasks(self, tasks):
             return UnifiedTdxClient.prepare_block_kline_tasks(self, tasks)
 
-    monkeypatch.setattr("zsdtdx.engine.parallel_fetcher.get_fetcher", lambda: _Fetcher())
+    monkeypatch.setattr(
+        "zsdtdx.engine.parallel_fetcher.get_fetcher", lambda: _Fetcher()
+    )
     monkeypatch.setattr(
         "zsdtdx.biz.block_kline._ensure_active_config_ready", lambda **kwargs: None
     )
     monkeypatch.setattr(
-        "zsdtdx.biz.block_kline.call_with_client",
+        "zsdtdx.biz.block_kline.call_with_main_client",
         lambda fn, **kwargs: fn(_Client()),
     )
     result = get_block_kline(

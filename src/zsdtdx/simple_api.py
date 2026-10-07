@@ -30,26 +30,32 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import pandas as pd
 
+from zsdtdx.biz._client_context import call_with_main_client
 from zsdtdx.biz.block_kline import fetch_block_kline
 from zsdtdx.biz.company_info import fetch_company_info
 from zsdtdx.biz.future_kline import fetch_future_kline
 from zsdtdx.biz.index_kline import fetch_index_kline
 from zsdtdx.biz.stock_kline import fetch_stock_kline
 from zsdtdx.biz.stock_stat import fetch_stock_stat
-from zsdtdx.util.helper import (
-    _apply_active_config_path,
-    _ensure_active_config_ready,
-    call_with_client as _call_with_client,
-)
-from zsdtdx.kline_task import BlockKlineTask, IndexKlineTask, StockKlineTask
 from zsdtdx.engine.parallel_fetcher import (
     StockKlineJob,
-    destroy_parallel_fetcher as _destroy_parallel_fetcher,
-    force_restart_parallel_fetcher as _force_restart_parallel_fetcher,
     get_fetcher,
+)
+from zsdtdx.engine.parallel_fetcher import (
+    destroy_parallel_fetcher as _destroy_parallel_fetcher,
+)
+from zsdtdx.engine.parallel_fetcher import (
+    force_restart_parallel_fetcher as _force_restart_parallel_fetcher,
+)
+from zsdtdx.engine.parallel_fetcher import (
     prewarm_parallel_fetcher as _prewarm_parallel_fetcher,
 )
 from zsdtdx.engine.unified_client import UnifiedTdxClient
+from zsdtdx.kline_task import BlockKlineTask, IndexKlineTask, StockKlineTask
+from zsdtdx.util.helper import (
+    _apply_active_config_path,
+    _ensure_active_config_ready,
+)
 
 
 # ---------- 配置与客户端 ----------
@@ -127,15 +133,14 @@ def get_client(
 
 
 # ---------- 码表与目录 ----------
-def get_stock_code_name(use_cache: bool = True) -> Dict[str, str]:
+def get_stock_code_name() -> Dict[str, str]:
     """获取统一股票代码名称字典。
 
     调用前置约定:
-    - 请先进入 `with get_client():`；
-      一个 with 块内可连续调用多个 `get_*` 函数。
+    - 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接。
 
     输入:
-    - use_cache: 是否使用股票缓存；为 False 时强制刷新股票缓存。
+    - 无缓存开关：自动复用有效缓存，缺失或过期时重建。
       本函数属于全量代码接口，返回范围由
       `config.yaml.stock_scope.defaults_when_codes_none.get_stock_code_name` 控制
       （包内默认 `szsh+bj`；可增配 `hk` 港股通，五位代码，不含香港主板）。
@@ -155,10 +160,9 @@ def get_stock_code_name(use_cache: bool = True) -> Dict[str, str]:
     {"sh.600000": "浦发银行", "sz.000001": "平安银行"}
     ```
     """
-    return _call_with_client(
-        lambda client: client.get_stock_code_name_map(use_cache=use_cache),
-        get_active_context_client=UnifiedTdxClient.get_active_context_client,
-        build_client=lambda: get_client(),
+    return call_with_main_client(
+        lambda client: client.get_stock_code_name_map(),
+        caller_name="get_stock_code_name",
     )
 
 
@@ -166,8 +170,7 @@ def get_stock_concepts() -> Dict[str, Any]:
     """获取股票所属板块（成分归属，不是板块指数名单）。
 
     调用前置约定:
-    - 请先进入 `with get_client():`；
-      一个 with 块内可连续调用多个 `get_*` 函数。
+    - 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接。
     - 与 `get_block_names` 共用三份命名文件，但语义不同：本接口回答「股票属于哪些板块」；
       可请求 K 线的板块指数名请用 `get_block_names`。
 
@@ -181,7 +184,7 @@ def get_stock_concepts() -> Dict[str, Any]:
     - `{names, map}`：names 为有成分的板块名（概念、风格、指数、基础行业），去重按字排序；
       map 为股票名称 -> 所属板块名列表（去重按字排序）。
     - 股票名称来自 `get_stock_code_name` 当日码表；缺失或非当日时先按该路径更新。
-    - 码表中没有名称的代码不进入 map。不写盘。
+    - 码表中没有名称的代码不进入 map。本接口自身不写盘；共享板块缓存有效时直接复用。
 
     调用示例:
     ```python
@@ -194,22 +197,20 @@ def get_stock_concepts() -> Dict[str, Any]:
     {"names": ["5G概念", "芯片"], "map": {"中信特钢": ["5G概念"]}}
     ```
     """
-    return _call_with_client(
+    return call_with_main_client(
         lambda client: client.get_stock_concepts(),
-        get_active_context_client=UnifiedTdxClient.get_active_context_client,
-        build_client=lambda: get_client(),
+        caller_name="get_stock_concepts",
     )
 
 
-def get_etf_code_name(use_cache: bool = True) -> Dict[str, str]:
+def get_etf_code_name() -> Dict[str, str]:
     """获取场内 ETF/LOF（本语境统称 etf）代码名称字典。
 
     调用前置约定:
-    - 请先进入 `with get_client():`；
-      一个 with 块内可连续调用多个 `get_*` 函数。
+    - 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接。
 
     输入:
-    - use_cache: True 复用当日 `catalog_cache/etf_code_name.pkl`；False 强制重下。
+    - 无缓存开关：自动复用当日 `catalog_cache/etf_code_name.pkl`，缺失或过期时重建。
       成分来自 `spec/specetfdata.txt`/`spec/speclofdata.txt`；名称优先
       `infoharbor_ex.name` 与 `zhb.zip`/`ilong.dat` 合并（同码以 ilong 为准），
       缺名回退 std 码表版面短名。另纳入名称文件中命中 etf/lof 的代码；
@@ -230,10 +231,9 @@ def get_etf_code_name(use_cache: bool = True) -> Dict[str, str]:
     {"sz.159915": "创业板ETF易方达", "sh.510050": "上证50ETF华夏", "sz.159105": "恒生生物科技ETF易方达"}
     ```
     """
-    return _call_with_client(
-        lambda client: client.get_etf_code_name_map(use_cache=use_cache),
-        get_active_context_client=UnifiedTdxClient.get_active_context_client,
-        build_client=lambda: get_client(),
+    return call_with_main_client(
+        lambda client: client.get_etf_code_name_map(),
+        caller_name="get_etf_code_name",
     )
 
 
@@ -241,7 +241,7 @@ def get_block_names() -> List[str]:
     """获取可请求 K 线的「全部板块」指数名称列表。
 
     调用前置约定:
-    - 请先进入 `with get_client():`。
+    - 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接。
     - 与 `get_block_kline` 共用三份命名文件的 6 小时本地缓存。
     - 与 `get_stock_concepts` 文件同源，但本接口是板块指数名单，不是股票归属。
 
@@ -250,7 +250,7 @@ def get_block_names() -> List[str]:
 
     输出:
     - 名称列表：概念、非统计风格、地区、研究行业中类；不含指数代码。
-      可直接作为 `get_block_kline` 的 `block_name`。
+      可直接作为 `get_block_kline` 的 `block_name`；历史区间没有行情时返回空 rows，不视为报错。
 
     调用示例:
     ```python
@@ -258,23 +258,21 @@ def get_block_names() -> List[str]:
         names = get_block_names()
     ```
     """
-    return _call_with_client(
+    return call_with_main_client(
         lambda client: client.get_block_names(),
-        get_active_context_client=UnifiedTdxClient.get_active_context_client,
-        build_client=lambda: get_client(),
+        caller_name="get_block_names",
     )
 
 
-def get_all_future_list(return_df: Optional[bool] = None, use_cache: bool = True):
+def get_all_future_list(return_df: Optional[bool] = None):
     """获取统一商品期货列表（郑州/大连/上海/广州）。
 
     调用前置约定:
-    - 请先进入 `with get_client():`；
-      一个 with 块内可连续调用多个 `get_*` 函数。
+    - 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接。
 
     输入:
     - return_df: 是否返回 DataFrame；None 时跟随 `output.return_df_default`（包内默认 True）。
-    - use_cache: 是否使用期货清单缓存；为 False 时强制刷新。
+    - 无缓存开关：自动复用有效缓存，缺失或过期时重建。
 
     调用示例:
     ```python
@@ -287,12 +285,9 @@ def get_all_future_list(return_df: Optional[bool] = None, use_cache: bool = True
     [{"code": "CU2603", "name": "沪铜2603", "market_name": "上海期货", "source": "ex"}]
     ```
     """
-    return _call_with_client(
-        lambda client: client.get_all_future_list(
-            return_df=return_df, use_cache=use_cache
-        ),
-        get_active_context_client=UnifiedTdxClient.get_active_context_client,
-        build_client=lambda: get_client(),
+    return call_with_main_client(
+        lambda client: client.get_all_future_list(return_df=return_df),
+        caller_name="get_all_future_list",
     )
 
 
@@ -385,18 +380,17 @@ def get_stock_stat() -> pd.DataFrame:
     """获取全市场股票统计宽表。
 
     调用前置约定:
-    - 请先进入 `with get_client():`；
-      一个 with 块内可连续调用多个 `get_*` 函数。
+    - 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接。
 
     输入:
-    - 无。分页与过滤由 `config.yaml` 的 `stock_stat` 控制
-      （`page_size`/`finance_batch_size`/`include_indices`/`max_pages`）。
+    - 无。分页与财务批次由 `config.yaml` 的 `stock_stat` 控制
+      （`page_size`/`finance_batch_size`/`finance_workers`）。
       行情 0x054B；财务/股本 0x0010；多日涨幅与估值等来自 zhb/tdxstat + tdxhy。
       市值/市净/市销/市现用现价（现价非正则回退昨收）。
-      市盈率(TTM|静)/股息率(%)/多日涨幅：统计基准日非当日才按现价折算。
+      市盈率(TTM|静)、股息率、多日涨幅与统计基准日按 zhb/tdxstat 文件原值返回。
 
     输出:
-    - 一行一只股票；中文表头。金额万元、量手、股本万股；不含港股；无 codes。
+    - 一行一只 A 股股票；中文表头。金额万元、量手、股本万股；不含指数/港股；无 codes。
     - 返回列说明见 `STOCK_STAT_COLUMN_LABELS` 及 README「字段说明」。
       涨跌额=现价-昨收；涨幅(%)=(现价-昨收)/昨收*100；
       振幅(%)=(最高-最低)/昨收*100；总量(手)=当日成交量；现量(手)=最近分笔量；
@@ -638,11 +632,13 @@ def get_future_latest_price(codes: Optional[Any] = None) -> Dict[str, Optional[f
     ```json
     {"ALL8": 23610.0, "CU2603": 102330.0}
     ```
+
+    边界条件:
+    - 服务端现价非正时回退昨收；两者均为空或非正时返回 None，并写入运行时失败明细。
     """
-    return _call_with_client(
+    return call_with_main_client(
         lambda client: client.get_future_latest_price(codes=codes),
-        get_active_context_client=UnifiedTdxClient.get_active_context_client,
-        build_client=lambda: get_client(),
+        caller_name="get_future_latest_price",
     )
 
 
@@ -654,7 +650,9 @@ def prewarm_parallel_fetcher() -> Dict[str, Any]:
     预热固定开启：默认不要求全部 worker 成功，超时 60 秒，最多 3 轮（写死，不读 YAML）。
 
     输出:
-    - 预热摘要字典（目标进程数、已预热进程数、pid 列表、耗时等）。
+    - 预热摘要字典：`ready_processes` 表示已启动进程数，
+      `connection_ready_workers` 表示已建立行情连接的进程数；预热阶段通常为 0。
+      `warmed_workers` 为兼容旧调用方保留，等价于 `ready_processes`。
 
     什么时候调用:
     - 服务启动或压测前，希望把 async 冷启动成本前移。
@@ -749,8 +747,7 @@ def get_runtime_failures() -> pd.DataFrame:
     """获取运行期失败/无数据明细。
 
     调用前置约定:
-    - 请先进入 `with get_client():`；
-      一个 with 块内可连续调用多个 `get_*` 函数。
+    - 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接。
 
     调用示例:
     ```python
@@ -763,10 +760,9 @@ def get_runtime_failures() -> pd.DataFrame:
     [{"task": "stock_kline", "code": "999999", "freq": "d", "reason": "code_not_found"}]
     ```
     """
-    return _call_with_client(
+    return call_with_main_client(
         lambda client: client.get_failures_df(),
-        get_active_context_client=UnifiedTdxClient.get_active_context_client,
-        build_client=lambda: get_client(),
+        caller_name="get_runtime_failures",
     )
 
 
@@ -774,8 +770,7 @@ def get_runtime_metadata() -> Dict[str, Any]:
     """获取运行元数据快照。
 
     调用前置约定:
-    - 请先进入 `with get_client():`；
-      一个 with 块内可连续调用多个 `get_*` 函数。
+    - 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接。
 
     调用示例:
     ```python
@@ -788,10 +783,9 @@ def get_runtime_metadata() -> Dict[str, Any]:
     {"config_path": "<auto>", "std_active_host": "120.76.1.198:7709"}
     ```
     """
-    return _call_with_client(
+    return call_with_main_client(
         lambda client: client.get_runtime_metadata(),
-        get_active_context_client=UnifiedTdxClient.get_active_context_client,
-        build_client=lambda: get_client(),
+        caller_name="get_runtime_metadata",
     )
 
 

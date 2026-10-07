@@ -19,8 +19,6 @@ import time
 from typing import Any, Dict, List
 from unittest import mock
 
-import pytest
-
 # 把工程 src 加入 sys.path（与 pyproject.toml pythonpath 一致，便于直接 py 本文件调试）。
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _SRC_DIR = os.path.join(_PROJECT_ROOT, "src")
@@ -58,6 +56,7 @@ class TestChunkLocalRowCache:
         p1["oldest_dt"] = "fake"
         p1["page_start"] = 100
         p1["fetched_pages"] = 7
+        p1["history_exhausted"] = True
         p2 = cache.acquire_partition("000001", "d")
         assert p1 is p2, "重复 acquire 应返回同一分区对象"
         assert p2["_n"] == 0
@@ -65,6 +64,7 @@ class TestChunkLocalRowCache:
         assert p2["newest_dt"] is None
         assert p2["page_start"] == 0
         assert p2["fetched_pages"] == 0
+        assert p2["history_exhausted"] is False
 
     def test_distinct_keys_isolated(self):
         """不同 (code,freq) 分区互不影响。"""
@@ -324,8 +324,9 @@ class TestLogChunkRetryNoSecondRecover:
         monkeypatch.setattr(
             pf,
             "_recover_worker_pools_current_thread",
-            lambda *a, **kw: recover_calls.__setitem__("n", recover_calls["n"] + 1)
-            or {},
+            lambda *a, **kw: (
+                recover_calls.__setitem__("n", recover_calls["n"] + 1) or {}
+            ),
         )
         # 强制让 _is_connection_unavailable_error 命中
         monkeypatch.setattr(pf, "_is_connection_unavailable_error", lambda txt: True)
@@ -354,8 +355,9 @@ class TestLogChunkRetryNoSecondRecover:
         monkeypatch.setattr(
             pf,
             "_recover_worker_pools_current_thread",
-            lambda *a, **kw: recover_calls.__setitem__("n", recover_calls["n"] + 1)
-            or {},
+            lambda *a, **kw: (
+                recover_calls.__setitem__("n", recover_calls["n"] + 1) or {}
+            ),
         )
         monkeypatch.setattr(pf, "_is_connection_unavailable_error", lambda txt: False)
         emit_calls: List[Dict[str, Any]] = []

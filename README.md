@@ -168,11 +168,11 @@ with get_client():
 
 **调用前置约定:**
 
-- 请先进入 `with get_client():`；
+- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
 
 **输入:**
 
-- use_cache: 是否使用股票缓存；默认值为True，置为 False 时强制刷新股票缓存。
+- 无缓存开关；自动复用有效缓存，缺失、损坏或过期时重建。
 - 本函数属于全量代码接口，返回范围由配置 `stock_scope.defaults_when_codes_none.get_stock_code_name` 控制（包内默认 `szsh+bj`；可增配 `hk` 港股通）。
 
 **输出:**
@@ -205,7 +205,7 @@ with get_client():
 
 **调用前置约定:**
 
-- 请先进入 `with get_client():`；
+- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
 
 **输出:**
 
@@ -235,11 +235,11 @@ with get_client():
 
 **调用前置约定:**
 
-- 请先进入 `with get_client():`；
+- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
 
 **输入:**
 
-- use_cache: True 复用当日磁盘/内存快照；False 强制重新下载。
+- 无缓存开关；自动复用当日磁盘/内存快照，缺失、损坏或过期时重建。
 - 另纳入名称文件中命中 etf/lof 的代码；排除深指 `399*` 与 `market_rules.etf_name_drop_substr`。
 
 **输出:**
@@ -269,12 +269,12 @@ with get_client():
 
 **调用前置约定:**
 
-- 请先进入 `with get_client():`；
+- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
 
 **输入:**
 
 - return_df: 可选，是否返回 pandas.DataFrame；None 时跟随 `output.return_df_default`（包内默认 True）。
-- use_cache: 是否使用期货清单缓存；为 False 时强制刷新期货清单缓存。
+- 无缓存开关；自动复用有效缓存，缺失、损坏或过期时重建。
 
 **调用示例:**
 
@@ -434,11 +434,11 @@ result = get_index_kline(
 
 **调用前置约定:**
 
-- 请先进入 `with get_client():`；
+- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
 
 **输出:**
 
-- 板块名称列表，不含指数代码；可直接作为 `get_block_kline` 的 `block_name`。
+- 板块名称列表，不含指数代码；可直接作为 `get_block_kline` 的 `block_name`。历史区间没有行情时返回空 rows，不视为报错。
 
 **调用示例:**
 
@@ -605,7 +605,7 @@ with get_client():
 
 **调用前置约定:**
 
-- `mode="sync"`：请先进入 `with get_client():`，主进程按 codes 顺序拉取。
+- `mode="sync"`：可直接调用；进入 `with get_client():` 时可复用主进程连接。
 - `mode="async"`（默认）：走进程池并行，不依赖主进程 with 连接；退出前建议 `destroy_parallel_fetcher()`。
 
 **输入:**
@@ -659,16 +659,16 @@ with get_client():
 
 **调用前置约定:**
 
-- 请先进入 `with get_client():`；
+- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
 
 **输入:**
 
-- 无。分页与过滤由 `config.yaml` 的 `stock_stat` 控制
-  （`page_size` / `finance_batch_size` / `include_indices` / `max_pages`）。
+- 无。分页与财务批次由 `config.yaml` 的 `stock_stat` 控制
+  （`page_size` / `finance_batch_size` / `finance_workers`）。
 - 行情来自 `0x054B`；财务/股本来自批量 `0x0010`；多日涨幅与 PE 等来自
   `zhb.zip`（tdxstat）与 `tdxhy.cfg`，复用板块命名文件 6 小时缓存。
 - 市值 / 市净 / 市销 / 市现用现价，现价非正则回退昨收。
-- 市盈(TTM|静) / 股息率 / 多日涨幅：仅当「统计基准日」不是当日时按现价/昨收折算。
+- 市盈(TTM|静) / 股息率 / 多日涨幅 / 统计基准日按 `zhb.zip` 中 tdxstat 文件原值返回，不根据本机日期或实时价格折算。
 - 不含港股；无 `codes` 入参。返回列为中文表头（含单位）。
 
 **字段说明（仅最终返回列）:**
@@ -685,14 +685,14 @@ with get_client():
 | 价量 | 换手(%) | 总量÷流通股本 |
 | 估值 | 流通市值(万元) / 总市值(万元) | 流通股本×现价 / 总股本×现价 |
 | 估值 | 市净率 / 市销率 / 市现率 | 现价÷每股净资；总市值÷营业收入；现价÷每股现金流 |
-| 估值 | 市盈率(TTM) / 市盈率(静) / 股息率(%) | 非当日统计基准日时按现价折算 |
+| 估值 | 市盈率(TTM) / 市盈率(静) / 股息率(%) | tdxstat 文件原值 |
 | 财务 | 财报更新日期 / 上市日期 | 财务数据更新日期 / 上市交易日 |
 | 财务 | 资产负债率(%) | (总资产−净资产−少数股东权益)/总资产×100 |
 | 财务 | 税后利润(万元) / 净利润(万元) | 含少数股东损益 / 归母净利润 |
 | 财务 | 净资产收益率(%) | 净利润÷净资产×100 |
-| 统计 | 统计基准日 | 快照基准日；折算后仍保留 |
+| 统计 | 统计基准日 | tdxstat 文件记录的快照基准日 |
 | 统计 | 贝塔系数 | 近60日相对大盘（沪→上证、深→深成指） |
-| 统计 | 连涨天数 / n日涨幅(%) 等 | 连涨天数；多日涨幅（可按现价折算） |
+| 统计 | 连涨天数 / n日涨幅(%) 等 | tdxstat 文件原值，不拼接实时涨幅 |
 
 完整返回列名见 `zsdtdx.biz.stock_stat.STOCK_STAT_COLUMN_LABELS`。
 
@@ -720,7 +720,7 @@ with get_client():
 
 **调用前置约定:**
 
-- 请先进入 `with get_client():`；
+- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
 
 **输入:**
 
@@ -757,6 +757,9 @@ with get_client():
 {"ALL8": 23610.0, "CU2603": 102330.0}
 ```
 
+服务端现价非正时回退昨收；现价与昨收均为空或非正时返回 `None`，并可通过
+`get_runtime_failures()` 查看 `no_valid_quote` 明细。
+
 
 
 #### get_runtime_failures
@@ -765,7 +768,7 @@ with get_client():
 
 **调用前置约定:**
 
-- 请先进入 `with get_client():`；
+- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
 
 **调用示例:**
 
@@ -790,7 +793,7 @@ with get_client():
 
 **调用前置约定:**
 
-- 请先进入 `with get_client():`；
+- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
 
 **调用示例:**
 
@@ -811,7 +814,8 @@ with get_client():
 
 ### 默认配置文件内容（可复制）
 
-以下内容与包内默认 `config.yaml` 一致，可整份复制后修改，也可只写需要覆盖的字段（见上文 `set_config_path` 合并说明）。
+以下示例的配置值与包内默认 `config.yaml` 一致，注释为文档精简版；可整份复制后修改，
+也可只写需要覆盖的字段（见上文 `set_config_path` 合并说明）。
 
 ```yaml
 # ---------------------------------------------------------------------------
@@ -830,8 +834,14 @@ with get_client():
 client:
   # with get_client(...) 进入时是否预连接标准/扩展连接池。
   # 取值: true/false
-  # 影响: true 启动更快暴露连接问题；false 首次调用接口时再连接。
-  preconnect_on_enter: true
+  # 影响: true 启动即连接两侧；false 按实际 API 所需侧懒连接，减少冷启动时间与空闲 socket。
+  preconnect_on_enter: false
+
+logging:
+  # 包级唯一日志阈值；仅支持 DEBUG/INFO/ERROR/OFF。
+  # 每条日志的实际级别由代码固定：过程为 INFO、异常为 ERROR、高频诊断为 DEBUG。
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 hosts:
   # 标准行情 IP 池（A股主站）。
@@ -912,8 +922,10 @@ pagination:
   standard_kline_qfq: true
 
 catalog_cache:
-  # 标准/扩展码表与 ETF/LOF 名称板块的磁盘缓存：按自然日分文件保存，使用时再过滤。
-  # ETF 文件为 etf_code_name.pkl；当日已有则 get_etf_code_name 不再下载 0x02C5/0x06B9。
+  # 标准/扩展码表、ETF/LOF 名称板块按自然日缓存；板块三文件按 6 小时缓存。
+  # 调用方无需控制缓存开关：有效即复用，缺失、损坏或过期即自动重建。
+  # ETF 文件为 etf_code_name.pkl；当日已有则 get_etf_code_name 不再下载 0x02C5/0x06B9
+  #（含 infoharbor_ex.name、zhb.zip/ilong.dat 与板块文件）。
   enabled: true
   # 可选：手动指定缓存目录（文件路径则取其父目录）。
   # 留空时自动选择用户可写目录；不可写会回退系统临时目录。
@@ -961,8 +973,8 @@ stock_stat:
   # 全市场股票统计宽表 get_stock_stat。
   page_size: 80
   finance_batch_size: 100
-  include_indices: false
-  max_pages: 0
+  # 0010 财务批次并发线程数；1=串行，内部限制为 1..8。
+  finance_workers: 4
 
 output:
   # 默认返回 DataFrame 还是 list[dict]。
@@ -984,9 +996,15 @@ index_kline:
 - `catalog_cache` 说明：
   - 标准行情（深沪京 `get_security_list`）、扩展行情（`get_instrument_info`）与 ETF/LOF 名称板块分文件按自然日缓存。
   - ETF/LOF 缓存文件为 `etf_code_name.pkl`；`get_etf_code_name` 仅在本地没有当日文件时下载 `0x02C5/0x06B9`。
+  - 板块三文件缓存为 `block_named_files.pkl`，有效期 6 小时；板块名称、板块 K 线、股票板块归属与股票统计共享读取。
   - 股票 / 期货 / 指数在使用时从对应侧过滤；指数会同时确保 std 与 ex 当日缓存最新。
+  - 同一缓存冷启动使用进程内与跨进程 single-flight，避免并发重复下载；缓存写失败只影响该次持久化，不影响已取得的业务数据和其它缓存。
   - 默认缓存位置会自动选择用户可写目录（Windows: `LOCALAPPDATA`，Linux: `XDG_CACHE_HOME` 或 `~/.cache`）。
   - 若目标目录不可写，会自动回退到系统临时目录；仍不可写时自动禁用磁盘缓存，不影响主流程。
+- `logging` 说明：
+  - `level` 是整个 `ZSDTDX` logger 唯一的输出阈值，仅支持 `DEBUG`、`INFO`、`ERROR`、`OFF`。
+  - 过程日志固定为 `INFO`，异常固定为 `ERROR`，逐 chunk 派发/完成与重试细节固定为 `DEBUG`；配置不能改变单条日志所属级别。
+  - `OFF` 仅关闭日志输出，不会删除 `get_runtime_failures()` 中的结构化失败。
 - 常用并行配置位于 `parallel` 段：
   - `process_count_core_multiplier`
   - `task_chunk_max_inflight_multiplier`

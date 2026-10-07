@@ -6,9 +6,9 @@ from __future__ import annotations
 import datetime as dt
 import struct
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-from zsdtdx.engine.parallel_fetcher import _build_index_task_payload, _build_task_payload_for_kind
+from zsdtdx.engine.parallel_fetcher import _build_task_payload_for_kind
 from zsdtdx.parser.get_index_bars import GetIndexBarsCmd
 
 
@@ -42,7 +42,9 @@ class TestIndexPayloadKind(unittest.TestCase):
             "start_time": "2026-01-01 00:00:00",
             "end_time": "2026-01-02 00:00:00",
         }
-        payload = _build_task_payload_for_kind("index", task=task, rows=[], error=None, worker_pid=1)
+        payload = _build_task_payload_for_kind(
+            "index", task=task, rows=[], error=None, worker_pid=1
+        )
         self.assertEqual(payload["task"]["index_name"], "上证指数")
         self.assertNotIn("code", payload["task"])
 
@@ -102,7 +104,9 @@ class TestPlaceholderRawKlineFilter(unittest.TestCase):
             "amount": 1000.0,
             "datetime": "2026-05-18 11:30",
         }
-        self.assertTrue(UnifiedTdxClient._is_placeholder_raw_kline_row(client, placeholder))
+        self.assertTrue(
+            UnifiedTdxClient._is_placeholder_raw_kline_row(client, placeholder)
+        )
         self.assertFalse(UnifiedTdxClient._is_placeholder_raw_kline_row(client, normal))
         filtered = UnifiedTdxClient._filter_placeholder_raw_kline_rows(
             client, [placeholder, normal]
@@ -145,7 +149,8 @@ class TestPlaceholderRawKlineFilter(unittest.TestCase):
 
 
 class TestIndexChunkCache(unittest.TestCase):
-    def test_multi_end_time_second_task_hits_cache(self):
+    def test_terminal_short_page_marks_history_exhausted_for_next_task(self):
+        """首任务已遇末短页时，后续同窗任务只读缓存，不重复请求末页。"""
         from zsdtdx.engine.unified_client import UnifiedTdxClient
 
         from zsdtdx.engine.unified_client import SharedChunkCache
@@ -154,32 +159,53 @@ class TestIndexChunkCache(unittest.TestCase):
         client.pagination = {"standard_kline_page_size": 800, "max_kline_pages": 300}
         client.output_cfg = {"filter_suspended_placeholder_bar": False}
         client._shared_chunk_cache = SharedChunkCache()
-        client._normalize_freq = UnifiedTdxClient._normalize_freq.__get__(client, UnifiedTdxClient)
-        client._freq_to_category = UnifiedTdxClient._freq_to_category.__get__(client, UnifiedTdxClient)
-        client._to_datetime_no_df = UnifiedTdxClient._to_datetime_no_df.__get__(client, UnifiedTdxClient)
-        client._dt_key_for_raw_kline_row = UnifiedTdxClient._dt_key_for_raw_kline_row.__get__(
+        client._normalize_freq = UnifiedTdxClient._normalize_freq.__get__(
             client, UnifiedTdxClient
         )
-        client._normalize_index_task_payload_no_df = UnifiedTdxClient._normalize_index_task_payload_no_df.__get__(
+        client._freq_to_category = UnifiedTdxClient._freq_to_category.__get__(
             client, UnifiedTdxClient
         )
-        client._normalize_index_kline_rows = UnifiedTdxClient._normalize_index_kline_rows.__get__(
+        client._to_datetime_no_df = UnifiedTdxClient._to_datetime_no_df.__get__(
             client, UnifiedTdxClient
         )
-        client._merge_chunk_cache_page_rows = UnifiedTdxClient._merge_chunk_cache_page_rows.__get__(
-            client, UnifiedTdxClient
+        client._dt_key_for_raw_kline_row = (
+            UnifiedTdxClient._dt_key_for_raw_kline_row.__get__(client, UnifiedTdxClient)
         )
-        client._index_route_fingerprint = UnifiedTdxClient._index_route_fingerprint.__get__(
-            client, UnifiedTdxClient
+        client._normalize_index_task_payload_no_df = (
+            UnifiedTdxClient._normalize_index_task_payload_no_df.__get__(
+                client, UnifiedTdxClient
+            )
         )
-        client._reset_index_chunk_partition = UnifiedTdxClient._reset_index_chunk_partition.__get__(
-            client, UnifiedTdxClient
+        client._normalize_index_kline_rows = (
+            UnifiedTdxClient._normalize_index_kline_rows.__get__(
+                client, UnifiedTdxClient
+            )
         )
-        client._ensure_index_chunk_route_valid = UnifiedTdxClient._ensure_index_chunk_route_valid.__get__(
-            client, UnifiedTdxClient
+        client._merge_chunk_cache_page_rows = (
+            UnifiedTdxClient._merge_chunk_cache_page_rows.__get__(
+                client, UnifiedTdxClient
+            )
+        )
+        client._index_route_fingerprint = (
+            UnifiedTdxClient._index_route_fingerprint.__get__(client, UnifiedTdxClient)
+        )
+        client._reset_index_chunk_partition = (
+            UnifiedTdxClient._reset_index_chunk_partition.__get__(
+                client, UnifiedTdxClient
+            )
+        )
+        client._ensure_index_chunk_route_valid = (
+            UnifiedTdxClient._ensure_index_chunk_route_valid.__get__(
+                client, UnifiedTdxClient
+            )
         )
         client.resolve_index_name = MagicMock(
-            return_value={"name": "上证指数", "source": "std", "market": 1, "code": "000001"}
+            return_value={
+                "name": "上证指数",
+                "source": "std",
+                "market": 1,
+                "code": "000001",
+            }
         )
 
         base_ts = int(dt.datetime(2026, 1, 5, 15, 0).timestamp())
@@ -205,7 +231,7 @@ class TestIndexChunkCache(unittest.TestCase):
             {
                 "index_name": "上证指数",
                 "freq": "d",
-                "start_time": "2026-01-05 15:00:00",
+                "start_time": "2000-01-01 00:00:00",
                 "end_time": "2026-01-05 15:00:00",
                 "_index_route_source": "std",
                 "_index_route_market": 1,
@@ -215,7 +241,7 @@ class TestIndexChunkCache(unittest.TestCase):
             {
                 "index_name": "上证指数",
                 "freq": "d",
-                "start_time": "2026-01-05 15:00:00",
+                "start_time": "2000-01-01 00:00:00",
                 "end_time": "2026-01-05 15:00:00",
                 "_index_route_source": "std",
                 "_index_route_market": 1,
@@ -223,7 +249,9 @@ class TestIndexChunkCache(unittest.TestCase):
                 "_index_route_name": "上证指数",
             },
         ]
-        out = client.get_index_kline_rows_for_chunk_tasks(tasks=tasks, enable_cache=True)
+        out = client.get_index_kline_rows_for_chunk_tasks(
+            tasks=tasks, enable_cache=True
+        )
         self.assertEqual(call_count["n"], 1)
         self.assertEqual(out["chunk_network_page_calls"], 1)
         self.assertGreaterEqual(out["chunk_hit_tasks"], 1)

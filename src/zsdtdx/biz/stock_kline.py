@@ -7,16 +7,19 @@
 边界：
 1. 任务类定义在包根 `kline_task.py`。
 2. 不解析行情包，不管理连接池。
-3. 不从 `simple_api` 做模块级导入。
+3. 不依赖 `simple_api`。
 """
 
 from __future__ import annotations
 
-import queue as std_queue
 from typing import Any, Callable, Dict, List, Optional
 
-from zsdtdx.util.helper import _ensure_active_config_ready, normalize_task_input
+from zsdtdx.biz._kline_dispatch import (
+    dispatch_kline_tasks,
+    validate_kline_dispatch_args,
+)
 from zsdtdx.kline_task import StockKlineTask
+from zsdtdx.util.helper import _ensure_active_config_ready, normalize_task_input
 
 
 def fetch_stock_kline(
@@ -36,31 +39,19 @@ def fetch_stock_kline(
     用途：校验任务后交给股票抓取器。
     边界条件：queue 无法 put、钩子不可调用或 mode 非法时抛 ValueError。
     """
-    if queue is not None and not hasattr(queue, "put"):
-        raise ValueError("queue 必须提供 put() 方法")
-    if preprocessor_operator is not None and not callable(preprocessor_operator):
-        raise ValueError("preprocessor_operator 必须是可调用对象")
-
+    mode_key = validate_kline_dispatch_args(
+        queue=queue,
+        preprocessor_operator=preprocessor_operator,
+        mode=mode,
+    )
     _ensure_active_config_ready(caller_name="get_stock_kline")
     normalized_tasks = normalize_task_input(task=task, task_cls=StockKlineTask)
-    mode_key = str(mode or "async").strip().lower()
-
-    from zsdtdx.engine.parallel_fetcher import get_fetcher
-
-    fetcher = get_fetcher()
-    if mode_key == "sync":
-        return fetcher.fetch_stock_tasks_sync(
-            tasks=normalized_tasks,
-            queue=queue,
-            preprocessor_operator=preprocessor_operator,
-            qfq=bool(qfq),
-        )
-    if mode_key == "async":
-        async_queue = queue if queue is not None else std_queue.Queue()
-        return fetcher.fetch_stock_tasks_async(
-            tasks=normalized_tasks,
-            queue=async_queue,
-            preprocessor_operator=preprocessor_operator,
-            qfq=bool(qfq),
-        )
-    raise ValueError("mode 仅支持 'sync' 或 'async'")
+    return dispatch_kline_tasks(
+        mode=mode_key,
+        tasks=normalized_tasks,
+        queue=queue,
+        preprocessor_operator=preprocessor_operator,
+        sync_method="fetch_stock_tasks_sync",
+        async_method="fetch_stock_tasks_async",
+        extra_kwargs={"qfq": bool(qfq)},
+    )

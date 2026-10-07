@@ -14,7 +14,7 @@
 
 import os
 
-from zsdtdx.parser.base import BaseParser
+from zsdtdx.parser.setup_base import SetupResponsePassthroughParser
 
 # 标准行情握手首包前 284 字节常量（来源：银河海王星 F10 抓包 7709 首连）。
 _SETUP1_PREFIX = bytes.fromhex(
@@ -30,7 +30,7 @@ _SETUP1_PREFIX = bytes.fromhex(
 )
 
 
-class SetupCmd1(BaseParser):
+class SetupCmd1(SetupResponsePassthroughParser):
     def setup(self):
         """
         输入：无。
@@ -40,17 +40,7 @@ class SetupCmd1(BaseParser):
         """
         self.send_pkg = bytearray(_SETUP1_PREFIX + os.urandom(8))
 
-    def parseResponse(self, body_buf):
-        """
-        输入：握手回包体。
-        输出：原样 body_buf。
-        用途：握手回包无业务字段，仅确认收包。
-        边界：不解析、不校验内容。
-        """
-        return body_buf
-
-
-class SetupCmd2(BaseParser):
+class SetupCmd2(SetupResponsePassthroughParser):
     def setup(self):
         """
         输入：无。
@@ -60,17 +50,7 @@ class SetupCmd2(BaseParser):
         """
         self.send_pkg = bytearray.fromhex("0c 02 18 94 00 01 03 00 03 00 0d 00 02")
 
-    def parseResponse(self, body_buf):
-        """
-        输入：握手回包体。
-        输出：原样 body_buf。
-        用途：握手回包无业务字段，仅确认收包。
-        边界：不解析、不校验内容。
-        """
-        return body_buf
-
-
-class SetupCmd3(BaseParser):
+class SetupCmd3(SetupResponsePassthroughParser):
     def setup(self):
         """
         输入：无。
@@ -83,12 +63,3 @@ class SetupCmd3(BaseParser):
             "00 00 00 7b 14 3a 41 0e 00 00 00 00 00 00 00 00 00 00 00 00"
             "00 05"
         )
-
-    def parseResponse(self, body_buf):
-        """
-        输入：握手回包体。
-        输出：原样 body_buf。
-        用途：握手回包无业务字段，仅确认收包。
-        边界：不解析、不校验内容。
-        """
-        return body_buf

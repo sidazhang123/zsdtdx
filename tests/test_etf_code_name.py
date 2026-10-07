@@ -59,7 +59,7 @@ def _etf_client() -> UnifiedTdxClient:
 def test_get_etf_code_name_map_include_drop_and_prefix():
     """输入：mock 名称记录。输出：断言。用途：保留 ETF/LOF、剔除 drop、前缀正确。边界：离线。"""
     client = _etf_client()
-    result = client.get_etf_code_name_map(use_cache=True)
+    result = client.get_etf_code_name_map()
     assert result["sz.159915"] == "创业板ETF易方达"
     assert result["sh.510300"] == "沪深300ETF华泰柏瑞"
     assert result["sz.161725"] == "白酒LOF"

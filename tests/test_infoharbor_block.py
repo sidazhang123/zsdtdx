@@ -39,10 +39,7 @@ def _sample_raw() -> bytes:
 def _industry_files() -> tuple[bytes, bytes]:
     """输入：无。输出：行业归属与名称表。用途：离线拼接。边界：含地区行，不应进入行业板块。"""
     hy = (
-        "1|605007|T0207|||\n"
-        "0|000001|T0101|||\n"
-        "1|600000|T010101|||\n"
-        "0|000002|T9999|||\n"
+        "1|605007|T0207|||\n0|000001|T0101|||\n1|600000|T010101|||\n0|000002|T9999|||\n"
     )
     zs = (
         "造纸|880350|2|1|1|T0207\n"
@@ -129,7 +126,7 @@ def test_get_stock_concepts_merges_industry():
             return _zhb_zip(zs_raw)
         return b""
 
-    client.get_stock_code_name_map = lambda use_cache=True: {
+    client.get_stock_code_name_map = lambda: {
         "sz.000001": "平安银行",
         "sh.600000": "浦发银行",
         "sh.605007": "五洲特纸",
@@ -150,6 +147,6 @@ def test_get_stock_concepts_merges_industry():
 def test_get_stock_concepts_empty_download():
     """输入空下载。输出空结构。用途：失败时保持字段。边界：不抛异常。"""
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
-    client.get_stock_code_name_map = lambda use_cache=True: {"sz.000001": "平安银行"}
+    client.get_stock_code_name_map = lambda: {"sz.000001": "平安银行"}
     client._download_named_hq_file = lambda filename: b""
     assert client.get_stock_concepts() == {"names": [], "map": {}}

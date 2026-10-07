@@ -2,6 +2,8 @@
 
 import struct
 
+from zsdtdx.net.hq import TdxHq_API
+from zsdtdx.params import TDXParams
 from zsdtdx.parser.get_index_bars import GetIndexBarsCmd
 from zsdtdx.parser.get_security_bars import (
     GetSecurityBarsCmd,
@@ -13,6 +15,31 @@ def _unpack_head(pkg: bytes):
     """输入 54 字节包；输出前 38 字节结构化字段。"""
     assert len(pkg) == 54
     return struct.unpack("<HIHHHH6sHHHHIIH", pkg[:38])
+
+
+def test_get_k_data_stops_at_short_page_and_preserves_order(monkeypatch):
+    """输入一页满页和一页短页。输出短页即止，并保持日期从旧到新。"""
+    monkeypatch.setattr(TDXParams, "MAX_KLINE_COUNT", 2)
+    api = TdxHq_API()
+    calls: list[int] = []
+    pages = {
+        0: [
+            {"datetime": "2020-03-01 15:00:00", "close": 3.0},
+            {"datetime": "2020-04-01 15:00:00", "close": 4.0},
+        ],
+        2: [{"datetime": "2020-02-01 15:00:00", "close": 2.0}],
+    }
+
+    def fetch(category, market, code, start, count):
+        calls.append(start)
+        if start not in pages:
+            raise AssertionError("短页后不应继续请求")
+        return pages[start]
+
+    api.get_security_bars = fetch
+    result = api.get_k_data("600000", "2020-01-01", "2020-12-31")
+    assert calls == [0, 2]
+    assert result["date"].tolist() == ["2020-02-01", "2020-03-01", "2020-04-01"]
 
 
 def test_pack_standard_kline_request_first_page_qfq():
