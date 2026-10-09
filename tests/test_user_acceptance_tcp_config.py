@@ -168,7 +168,6 @@ def _reset_runtime_state() -> None:
         pf.destroy_parallel_fetcher()
     except Exception:
         pass
-    pf._restore_ensure_worker_client_context_binding()
     _wait_tcp_probe_idle()
 
 
@@ -272,13 +271,16 @@ def _invoke_api(api_name: str) -> Any:
             return get_stock_kline(task=[dict(_STOCK_TASK)], mode="async")
 
     if api_name == "index_sync":
-        with patch.object(
-            UnifiedTdxClient,
-            "resolve_index_name",
-            return_value=dict(_INDEX_ROUTE),
-        ), patch(
-            "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher.fetch_index_tasks_sync",
-            return_value=_index_sync_payload(),
+        with (
+            patch.object(
+                UnifiedTdxClient,
+                "resolve_index_name",
+                return_value=dict(_INDEX_ROUTE),
+            ),
+            patch(
+                "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher.fetch_index_tasks_sync",
+                return_value=_index_sync_payload(),
+            ),
         ):
             return get_index_kline(task=[dict(_INDEX_TASK)], mode="sync")
 
@@ -288,19 +290,22 @@ def _invoke_api(api_name: str) -> Any:
             (),
             {"queue": None, "result": lambda self, timeout=None: []},
         )()
-        with patch.object(
-            UnifiedTdxClient,
-            "resolve_index_name",
-            return_value=dict(_INDEX_ROUTE),
-        ), patch(
-            "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher.fetch_index_tasks_async",
-            return_value=fake_job,
+        with (
+            patch.object(
+                UnifiedTdxClient,
+                "resolve_index_name",
+                return_value=dict(_INDEX_ROUTE),
+            ),
+            patch(
+                "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher.fetch_index_tasks_async",
+                return_value=fake_job,
+            ),
         ):
             return get_index_kline(task=[dict(_INDEX_TASK)], mode="async")
 
     if api_name == "future_kline":
         with patch(
-            "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher.fetch_stock",
+            "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher.fetch_future_kline",
             return_value=pd.DataFrame(),
         ):
             return get_future_kline(
@@ -366,14 +371,19 @@ class TestConfigYamlDrivesConnectionHosts:
         custom_std, _custom_ex = _hosts_from_yaml(custom_yaml_a)
         pkg_std_set = set(pkg_std)
         custom_std_set = set(custom_std)
-        assert pkg_std_set.isdisjoint(custom_std_set), "测试 yaml 须与包内 config 地址池可区分"
+        assert pkg_std_set.isdisjoint(
+            custom_std_set
+        ), "测试 yaml 须与包内 config 地址池可区分"
 
         # --- 未调用 set_config_path：应使用包内 config.yaml ---
         client_default = get_client(separate_instance=True)
         try:
             assert Path(client_default.config_path).resolve() == _PKG_CONFIG
             pool_hosts_default = set(client_default.std_pool.hosts)
-            assert pool_hosts_default.issubset(pkg_std_set) or pool_hosts_default == pkg_std_set
+            assert (
+                pool_hosts_default.issubset(pkg_std_set)
+                or pool_hosts_default == pkg_std_set
+            )
         finally:
             client_default.close()
 
@@ -383,7 +393,9 @@ class TestConfigYamlDrivesConnectionHosts:
         for item in probe_rounds:
             if item["pool"] == "standard":
                 probed_std_default.update(item["hosts"])
-        assert probed_std_default == pkg_std_set, "探测输入应来自包内 config.yaml 的 standard 列表"
+        assert (
+            probed_std_default == pkg_std_set
+        ), "探测输入应来自包内 config.yaml 的 standard 列表"
 
         # 同一配置再次 get_client + get_company_info：不应新增探测轮次
         with patch.object(
@@ -396,13 +408,15 @@ class TestConfigYamlDrivesConnectionHosts:
                 with client2:
                     get_company_info(codes=["600000"], mode="sync")
                 pool_hosts_2 = set(client2.std_pool.hosts)
-                assert pool_hosts_2 == pool_hosts_default or pool_hosts_2.issubset(pkg_std_set)
+                assert pool_hosts_2 == pool_hosts_default or pool_hosts_2.issubset(
+                    pkg_std_set
+                )
             finally:
                 client2.close()
 
-        assert len(probe_rounds) == probe_after_default, (
-            "默认配置下多次调用应复用缓存，TCP 探测不可出现第二轮"
-        )
+        assert (
+            len(probe_rounds) == probe_after_default
+        ), "默认配置下多次调用应复用缓存，TCP 探测不可出现第二轮"
 
         # --- set_config_path(自定义 yaml) ---
         resolved_custom = set_config_path(
@@ -423,9 +437,9 @@ class TestConfigYamlDrivesConnectionHosts:
         for item in probe_rounds:
             if item["pool"] == "standard":
                 probed_std_custom.update(item["hosts"])
-        assert custom_std_set.issubset(probed_std_custom), (
-            "set_config_path 后探测输入须包含自定义 yaml 的 standard 地址"
-        )
+        assert custom_std_set.issubset(
+            probed_std_custom
+        ), "set_config_path 后探测输入须包含自定义 yaml 的 standard 地址"
 
         # 自定义配置下再次 get_client：仍不应新增探测
         probe_after_custom = len(probe_rounds)
@@ -437,9 +451,9 @@ class TestConfigYamlDrivesConnectionHosts:
         finally:
             client3.close()
 
-        assert len(probe_rounds) == probe_after_custom, (
-            "自定义配置下第二次 get_client 不得再触发 TCP 探测"
-        )
+        assert (
+            len(probe_rounds) == probe_after_custom
+        ), "自定义配置下第二次 get_client 不得再触发 TCP 探测"
 
         # 全程仅两轮：默认配置一轮 + 切换 yaml 后一轮
         assert len(probe_rounds) == probe_after_default + (
@@ -501,9 +515,9 @@ class TestConfigYamlDrivesConnectionHosts:
             )
 
         assert isinstance(result, list)
-        assert len(probe_rounds) == probe_count_after_set, (
-            "get_stock_kline(sync) 在缓存已就绪时不得再触发 TCP 探测"
-        )
+        assert (
+            len(probe_rounds) == probe_count_after_set
+        ), "get_stock_kline(sync) 在缓存已就绪时不得再触发 TCP 探测"
 
 
 class TestMatrixKlineApiScenarios:
@@ -559,9 +573,9 @@ class TestMatrixKlineApiScenarios:
             second = _invoke_api(api_name)
             _wait_tcp_probe_idle()
         assert second is not None
-        assert mock_probe.call_count == probe_after_first, (
-            f"{api_name} 默认配置下第二次调用不得再触发 TCP 探测"
-        )
+        assert (
+            mock_probe.call_count == probe_after_first
+        ), f"{api_name} 默认配置下第二次调用不得再触发 TCP 探测"
 
     @pytest.mark.parametrize("api_name", MATRIX_API_NAMES)
     @patch("zsdtdx.engine.unified_client._tcp_probe_and_trim_available_hosts")
@@ -594,9 +608,9 @@ class TestMatrixKlineApiScenarios:
 
         second = _invoke_api(api_name)
         assert second is not None
-        assert mock_probe.call_count == probe_after_first, (
-            f"{api_name} 自定义配置下第二次调用不得再触发 TCP 探测"
-        )
+        assert (
+            mock_probe.call_count == probe_after_first
+        ), f"{api_name} 自定义配置下第二次调用不得再触发 TCP 探测"
 
 
 class TestMatrixRealProcessPoolWorkers:
@@ -635,9 +649,6 @@ class TestMatrixRealProcessPoolWorkers:
             with patch(
                 "zsdtdx.engine.parallel_fetcher.ProcessPoolExecutor",
                 _CapturingProcessPoolExecutor,
-            ), patch(
-                "zsdtdx.engine.parallel_fetcher.random.randint",
-                side_effect=[0, 1, 2, 0, 1, 2],
             ):
                 pf._get_global_process_pool(3)
             self._assert_slot_assignments_not_all_identical()
@@ -660,34 +671,37 @@ class TestMatrixRealProcessPoolWorkers:
         set_config_path(str(custom_yaml_a), async_background_probe=False)
         _wait_tcp_probe_idle()
 
-        fake_job = type("Job", (), {"queue": None, "result": lambda self, timeout=None: []})()
+        fake_job = type(
+            "Job", (), {"queue": None, "result": lambda self, timeout=None: []}
+        )()
 
         def _async_stub(**_kwargs: Any) -> Any:
             pf._get_global_process_pool(3)
             return fake_job
 
         try:
-            with patch(
-                "zsdtdx.engine.parallel_fetcher.ProcessPoolExecutor",
-                _CapturingProcessPoolExecutor,
-            ), patch(
-                "zsdtdx.engine.parallel_fetcher.random.randint",
-                side_effect=[0, 1, 2, 0, 1, 2],
-            ), patch(
-                "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher.fetch_stock_tasks_async",
-                side_effect=_async_stub,
-            ), patch(
-                "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher._ensure_async_prewarm",
-                return_value=None,
+            with (
+                patch(
+                    "zsdtdx.engine.parallel_fetcher.ProcessPoolExecutor",
+                    _CapturingProcessPoolExecutor,
+                ),
+                patch(
+                    "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher.fetch_stock_tasks_async",
+                    side_effect=_async_stub,
+                ),
+                patch(
+                    "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher._ensure_async_prewarm",
+                    return_value=None,
+                ),
             ):
                 probe_before = mock_probe.call_count
                 job = get_stock_kline(task=[dict(_STOCK_TASK)], mode="async")
                 _wait_tcp_probe_idle()
 
             assert job is not None
-            assert mock_probe.call_count == probe_before, (
-                "get_stock_kline(async) 建池路径在缓存已预热后不得再触发 TCP 探测"
-            )
+            assert (
+                mock_probe.call_count == probe_before
+            ), "get_stock_kline(async) 建池路径在缓存已预热后不得再触发 TCP 探测"
             self._assert_slot_assignments_not_all_identical()
         finally:
             _CAPTURED_POOL_INITARGS = []
@@ -738,7 +752,9 @@ class TestAllKlineApiEntryPoints:
     def test_get_stock_kline_async_no_extra_probe(self, warmed_custom_config) -> None:
         probe_rounds, _yaml = warmed_custom_config
         baseline = len(probe_rounds)
-        fake_job = type("Job", (), {"queue": None, "result": lambda self, timeout=None: []})()
+        fake_job = type(
+            "Job", (), {"queue": None, "result": lambda self, timeout=None: []}
+        )()
 
         with patch(
             "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher.fetch_stock_tasks_async",
@@ -762,13 +778,16 @@ class TestAllKlineApiEntryPoints:
             dict(self._DONE_EVENT),
         ]
 
-        with patch.object(
-            UnifiedTdxClient,
-            "resolve_index_name",
-            return_value=dict(self._INDEX_ROUTE),
-        ), patch(
-            "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher.fetch_index_tasks_sync",
-            return_value=payload,
+        with (
+            patch.object(
+                UnifiedTdxClient,
+                "resolve_index_name",
+                return_value=dict(self._INDEX_ROUTE),
+            ),
+            patch(
+                "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher.fetch_index_tasks_sync",
+                return_value=payload,
+            ),
         ):
             result = get_index_kline(task=[dict(self._INDEX_TASK)], mode="sync")
 
@@ -778,22 +797,29 @@ class TestAllKlineApiEntryPoints:
     def test_get_index_kline_async_no_extra_probe(self, warmed_custom_config) -> None:
         probe_rounds, _yaml = warmed_custom_config
         baseline = len(probe_rounds)
-        fake_job = type("Job", (), {"queue": None, "result": lambda self, timeout=None: []})()
+        fake_job = type(
+            "Job", (), {"queue": None, "result": lambda self, timeout=None: []}
+        )()
 
-        with patch.object(
-            UnifiedTdxClient,
-            "resolve_index_name",
-            return_value=dict(self._INDEX_ROUTE),
-        ), patch(
-            "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher.fetch_index_tasks_async",
-            return_value=fake_job,
+        with (
+            patch.object(
+                UnifiedTdxClient,
+                "resolve_index_name",
+                return_value=dict(self._INDEX_ROUTE),
+            ),
+            patch(
+                "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher.fetch_index_tasks_async",
+                return_value=fake_job,
+            ),
         ):
             job = get_index_kline(task=[dict(self._INDEX_TASK)], mode="async")
 
         assert job is not None
         assert len(probe_rounds) == baseline
 
-    def test_get_future_kline_uses_config_without_extra_probe(self, warmed_custom_config) -> None:
+    def test_get_future_kline_uses_config_without_extra_probe(
+        self, warmed_custom_config
+    ) -> None:
         import pandas as pd
 
         probe_rounds, custom_yaml = warmed_custom_config
@@ -801,10 +827,12 @@ class TestAllKlineApiEntryPoints:
         custom_std, _ = _hosts_from_yaml(custom_yaml)
 
         with patch(
-            "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher.fetch_stock",
+            "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher.fetch_future_kline",
             return_value=pd.DataFrame(),
         ) as fetch_mock:
-            df = get_future_kline(codes=["CU"], freq="d", start_time="2026-01-01", end_time="2026-01-02")
+            df = get_future_kline(
+                codes=["CU"], freq="d", start_time="2026-01-01", end_time="2026-01-02"
+            )
 
         assert isinstance(df, pd.DataFrame)
         fetch_mock.assert_called_once()
@@ -828,7 +856,7 @@ class TestAllKlineApiEntryPoints:
         import pandas as pd
 
         with patch(
-            "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher.fetch_stock",
+            "zsdtdx.engine.parallel_fetcher.ParallelKlineFetcher.fetch_future_kline",
             return_value=pd.DataFrame(),
         ):
             get_future_kline(codes=["CU"], freq="d")
@@ -860,12 +888,7 @@ class TestWorkerSlotAssignmentsDiffer:
         num_slots = 4
         seen: List[Tuple[Tuple[Tuple[str, int], ...], Tuple[Tuple[str, int], ...]]] = []
 
-        # 固定随机序列，保证槽位起始下标互不相同
-        with patch(
-            "zsdtdx.engine.parallel_fetcher.random.randint",
-            side_effect=[0, 1, 2, 3, 0, 1, 2, 3],
-        ):
-            assignments = pf._build_worker_host_slot_assignments(snapshot, num_slots)
+        assignments = pf._build_worker_host_slot_assignments(snapshot, num_slots)
 
         assert len(assignments) == num_slots
         for item in assignments:
@@ -888,11 +911,7 @@ class TestWorkerSlotAssignmentsDiffer:
             "standard": [("1.1.1.1", 7709), ("2.2.2.2", 7709), ("3.3.3.3", 7709)],
             "extended": [],
         }
-        with patch(
-            "zsdtdx.engine.parallel_fetcher.random.randint",
-            side_effect=[0, 1, 2],
-        ):
-            assignments = pf._build_worker_host_slot_assignments(snapshot, 3)
+        assignments = pf._build_worker_host_slot_assignments(snapshot, 3)
         assignments_copy = copy.deepcopy(assignments)
         std_hosts, ex_hosts = snapshot["standard"], snapshot["extended"]
         fingerprint = compute_hosts_fingerprint(std_hosts, ex_hosts)

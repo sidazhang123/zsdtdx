@@ -40,8 +40,6 @@ def test_params_holds_domain_constants_moved_from_call_sites():
     assert TDXParams.STOCK_DATE_ONLY_END_TIME == "16:00:00"
     assert TDXParams.FUTURE_DATE_ONLY_START_TIME == "09:00:00"
     assert TDXParams.FUTURE_DATE_ONLY_END_TIME == "15:00:00"
-    assert "CU" in TDXParams.FUTURE_PATTERNS
-    assert "IM" in TDXParams.FUTURE_PATTERNS
 
 
 def test_stock_task_to_dict_normalizes_date_only_window():

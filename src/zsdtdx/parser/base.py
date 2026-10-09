@@ -15,30 +15,9 @@
 import datetime
 import logging
 import struct
-import sys
 import zlib
 
 from zsdtdx.util.log import log
-
-try:
-    import cython
-
-    if cython.compiled:
-
-        def buffer(x):
-            """
-            输入：
-            1. x: 输入参数，约束以协议定义与函数实现为准。
-            输出：
-            1. 返回值语义由函数实现定义；无返回时为 `None`。
-            用途：
-            1. 执行 `buffer` 对应的协议处理、数据解析或调用适配逻辑。
-            边界条件：
-            1. 连接与重试由上层客户端负责；本函数只处理当前协议数据。
-            """
-            return x
-except ImportError:
-    pass
 
 
 class SocketClientNotReady(Exception):
@@ -46,10 +25,6 @@ class SocketClientNotReady(Exception):
 
 
 class SendPkgNotReady(Exception):
-    pass
-
-
-class SendRequestPkgFails(Exception):
     pass
 
 
@@ -117,8 +92,6 @@ class BaseParser(object):
         self.data = None
         self.send_pkg = None
 
-        self.rsp_header = None
-        self.rsp_body = None
         self.rsp_header_len = RSP_HEADER_LEN
 
         if lock:
@@ -126,7 +99,7 @@ class BaseParser(object):
         else:
             self.lock = None
 
-    def setParams(self, *args, **xargs):
+    def setParams(self, *_args, **_kwargs):
         """
         构建请求
         :return:
@@ -226,10 +199,7 @@ class BaseParser(object):
             log.debug("不需要解压")
         else:
             log.debug("需要解压")
-            if sys.version_info[0] == 2:
-                body_buf = zlib.decompress(buffer(body_buf))
-            else:
-                body_buf = zlib.decompress(body_buf)
+            body_buf = zlib.decompress(body_buf)
         if log.isEnabledFor(logging.DEBUG):
             log.debug("recv body: ")
             log.debug(body_buf)

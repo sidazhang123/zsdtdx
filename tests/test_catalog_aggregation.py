@@ -131,10 +131,18 @@ def test_index_discover_requires_both_catalog_sides():
         return [
             {"market": 62, "code": "000905", "name": "中证500"},
             {"market": 30, "code": "CUL8", "name": "沪铜主连"},
+            {"market": 33, "code": "510500", "name": "中证500ETF"},
+            {"market": 33, "code": "017526", "name": "华夏北证50指数C"},
+            {"market": 57, "code": "9099DY", "name": "中证1000指数1号"},
         ]
 
     client._download_std_security_catalog = fake_std
     client._download_ex_instrument_catalog = fake_ex
+    client._get_ex_market_name = lambda market: {
+        33: "开放式基金",
+        57: "券商集合理财",
+        62: "中证指数",
+    }.get(int(market), "")
     records = client._discover_index_route_records(refresh=True)
     assert sides == ["std", "ex"]
     names = {row["name"] for row in records}
@@ -142,6 +150,9 @@ def test_index_discover_requires_both_catalog_sides():
     assert "中证500" in names
     assert "浦发银行" not in names
     assert "沪铜主连" not in names
+    assert "中证500ETF" not in names
+    assert "华夏北证50指数C" not in names
+    assert "中证1000指数1号" not in names
 
 
 def test_catalog_disk_hit_skips_download(tmp_path):

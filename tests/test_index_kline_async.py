@@ -108,11 +108,6 @@ class TestPlaceholderRawKlineFilter(unittest.TestCase):
             UnifiedTdxClient._is_placeholder_raw_kline_row(client, placeholder)
         )
         self.assertFalse(UnifiedTdxClient._is_placeholder_raw_kline_row(client, normal))
-        filtered = UnifiedTdxClient._filter_placeholder_raw_kline_rows(
-            client, [placeholder, normal]
-        )
-        self.assertEqual(len(filtered), 1)
-        self.assertEqual(filtered[0]["datetime"], "2026-05-18 11:30")
 
     def test_append_page_keeps_normal_bars_when_page_has_placeholder(self):
         from zsdtdx.engine.unified_client import UnifiedTdxClient
@@ -153,12 +148,12 @@ class TestIndexChunkCache(unittest.TestCase):
         """首任务已遇末短页时，后续同窗任务只读缓存，不重复请求末页。"""
         from zsdtdx.engine.unified_client import UnifiedTdxClient
 
-        from zsdtdx.engine.unified_client import SharedChunkCache
+        from zsdtdx.engine.unified_client import ChunkLocalRowCache
 
         client = UnifiedTdxClient.__new__(UnifiedTdxClient)
         client.pagination = {"standard_kline_page_size": 800, "max_kline_pages": 300}
         client.output_cfg = {"filter_suspended_placeholder_bar": False}
-        client._shared_chunk_cache = SharedChunkCache()
+        client._shared_chunk_cache = ChunkLocalRowCache()
         client._normalize_freq = UnifiedTdxClient._normalize_freq.__get__(
             client, UnifiedTdxClient
         )

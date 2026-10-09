@@ -103,7 +103,7 @@ py -m pytest tests/ -q --ignore=tests/test_simple_api_retry_e2e.py --ignore=test
 py -m pytest tests/ -q
 ```
 
-- 当前共有 314 个用例；其中 288 个为纯离线测试，26 个配置/重试验收用例需要真实 TCP 可达。
+- 当前共有 321 个用例；其中 295 个为纯离线测试，26 个配置/重试验收用例需要真实 TCP 可达。
 - `pyproject.toml` 已配置 `pythonpath = ["src"]`、`testpaths = ["tests"]`、`norecursedirs = ["manual", ...]`。
 - 不要修改 `tests/` 下现有用例的语义，除非修复接口变更导致的编译/调用错误。
 

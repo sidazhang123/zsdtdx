@@ -48,10 +48,10 @@ def test_get_future_kline_has_no_qfq():
 
 
 def test_get_future_kline_forwards_to_fetcher():
-    """输入：codes/freq/时间窗；输出：biz 层标准化后交给 fetch_stock。"""
+    """输入：codes/freq/时间窗；输出：biz 层标准化后交给期货批处理入口。"""
     with patch("zsdtdx.engine.parallel_fetcher.get_fetcher") as get_fetcher:
         fetcher = MagicMock()
-        fetcher.fetch_stock.return_value = MagicMock()
+        fetcher.fetch_future_kline.return_value = MagicMock()
         get_fetcher.return_value = fetcher
         get_future_kline(
             codes=["CU"],
@@ -59,7 +59,7 @@ def test_get_future_kline_forwards_to_fetcher():
             start_time="2026-02-13",
             end_time="2026-02-13",
         )
-        kwargs = fetcher.fetch_stock.call_args.kwargs
+        kwargs = fetcher.fetch_future_kline.call_args.kwargs
         assert kwargs["codes"] == ["CU"]
         assert kwargs["freqs"] == ["d"]
         assert kwargs["start_time"] == "2026-02-13 09:00:00"

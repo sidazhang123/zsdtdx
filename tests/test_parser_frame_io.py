@@ -8,6 +8,7 @@ from zsdtdx.parser.base import (
     ResponseHeaderRecvFails,
     ResponseRecvFails,
 )
+from zsdtdx.parser.get_history_transaction_data import GetHistoryTransactionData
 
 
 class _FragSocket:
@@ -89,3 +90,10 @@ def test_short_body_raises_recv_error():
     except ResponseRecvFails:
         return
     raise AssertionError("包体未读满应抛 ResponseRecvFails")
+
+
+def test_history_transaction_string_date_is_packed_as_integer():
+    parser = GetHistoryTransactionData(None)
+    parser.setParams(0, "000001", 0, 10, "20261008")
+    packed_date = struct.unpack_from("<I", parser.send_pkg, 12)[0]
+    assert packed_date == 20261008

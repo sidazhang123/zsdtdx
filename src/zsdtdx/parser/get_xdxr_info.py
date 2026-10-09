@@ -100,7 +100,7 @@ class GetXdXrInfo(BaseParser):
             pos += 7
             # noused = struct.unpack(u"<B", body_buf[pos: pos+1])
             pos += 1  # skip a byte
-            year, month, day, hour, minite, pos = get_datetime(9, body_buf, pos)
+            year, month, day, hour, _minute, pos = get_datetime(9, body_buf, pos)
             (category,) = struct.unpack("<B", body_buf[pos : pos + 1])
             pos += 1
 

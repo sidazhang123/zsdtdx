@@ -19,9 +19,6 @@ import six
 
 from zsdtdx.parser.base import BaseParser
 
-# 服务端公司信息正文单页上限（字节）。
-COMPANY_INFO_CONTENT_PAGE_SIZE = 30720
-
 
 class GetCompanyInfoContent(BaseParser):
     def setParams(self, market, code, filename, start, length, category_index):

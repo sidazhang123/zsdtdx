@@ -9,10 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from zsdtdx.parser.get_company_info_category import GetCompanyInfoCategory
-from zsdtdx.parser.get_company_info_content import (
-    COMPANY_INFO_CONTENT_PAGE_SIZE,
-    GetCompanyInfoContent,
-)
+from zsdtdx.parser.get_company_info_content import GetCompanyInfoContent
 from zsdtdx.engine.unified_client import UnifiedTdxClient
 from zsdtdx.params import TDXParams
 
@@ -104,7 +101,7 @@ def test_content_pack_uses_category_index_and_remaining_length():
     assert start == 30720
     assert length == 331141
     assert tail == 0
-    assert COMPANY_INFO_CONTENT_PAGE_SIZE == 30720
+    assert TDXParams.COMPANY_INFO_CHUNK_SIZE == 30720
 
 
 def test_content_parse_uses_uint16_chunk_length():

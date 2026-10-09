@@ -517,17 +517,24 @@ def _load_stock_stat_static_maps(
         if not zhb or not hy_raw:
             raise ValueError("zhb.zip 或 tdxhy.cfg 为空")
         payload = read_zhb_stat_payload(zhb)
-        required = {"tdxstat.cfg", "tdxstat2.cfg", "tdxzs.cfg", "incon.dat"}
+        required = {
+            TDXParams.TDXSTAT_ZIP_MEMBER,
+            TDXParams.TDXSTAT2_ZIP_MEMBER,
+            TDXParams.TDXZS_ZIP_MEMBER,
+            TDXParams.INCON_ZIP_MEMBER,
+        }
         missing = sorted(name for name in required if not payload.get(name))
         if missing:
             raise ValueError(f"zhb.zip 缺少必需成员: {missing}")
 
         stat_map = merge_tdxstat_maps(
-            parse_tdxstat_cfg(payload["tdxstat.cfg"]),
-            parse_tdxstat2_cfg(payload["tdxstat2.cfg"]),
+            parse_tdxstat_cfg(payload[TDXParams.TDXSTAT_ZIP_MEMBER]),
+            parse_tdxstat2_cfg(payload[TDXParams.TDXSTAT2_ZIP_MEMBER]),
         )
-        region_map = parse_region_map_from_tdxzs(payload["tdxzs.cfg"])
-        industry_name_map = parse_industry_name_map_from_incon(payload["incon.dat"])
+        region_map = parse_region_map_from_tdxzs(payload[TDXParams.TDXZS_ZIP_MEMBER])
+        industry_name_map = parse_industry_name_map_from_incon(
+            payload[TDXParams.INCON_ZIP_MEMBER]
+        )
         code_hy_map = parse_tdxhy_code_map(hy_raw)
         if not all((stat_map, region_map, industry_name_map, code_hy_map)):
             raise ValueError("stock_stat 静态映射解析结果为空")

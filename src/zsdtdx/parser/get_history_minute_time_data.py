@@ -59,7 +59,7 @@ class GetHistoryMinuteTimeData(BaseParser):
         prices = []
         for i in range(num):
             price_raw, pos = get_price(body_buf, pos)
-            reversed1, pos = get_price(body_buf, pos)
+            _reserved, pos = get_price(body_buf, pos)
             vol, pos = get_price(body_buf, pos)
             last_price = last_price + price_raw
             price = OrderedDict([("price", float(last_price) / 100), ("vol", vol)])

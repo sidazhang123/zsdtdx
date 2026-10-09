@@ -561,10 +561,10 @@ def get_future_kline(
     """获取商品期货 K 线（多周期批处理，返回合并 DataFrame）。
 
     调用前置约定:
-    - 与 `get_stock_kline` 的 task 路径不同：走 `fetch_stock` DataFrame 批处理。
+    - 与 `get_stock_kline` 的 task 路径不同：走 `fetch_future_kline` DataFrame 批处理。
     - 进程数 > 1 时 worker 并行（不占用主进程连接）；≤ 1 时串行并可复用 with 内连接。
     - 建议 `with get_client():` 以便同块调用其它主进程 API。
-    - 批处理总超时 300 秒、单 future 超时 600 秒，写死不读 YAML。
+    - 批处理总超时 300 秒，写死不读 YAML。
 
     输入:
     - codes: str/list/tuple/set；纯品种按码表「主连」补全（如 `AL`→`ALL8`）；空则全量商品期货；

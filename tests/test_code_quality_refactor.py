@@ -599,7 +599,6 @@ def test_tdx_function_call_error_includes_method_and_endpoint():
         ip = "127.0.0.1"
         port = 7709
         last_ack_time = 0.0
-        last_transaction_failed = False
 
         @update_last_ack_time
         def get_security_bars(self):

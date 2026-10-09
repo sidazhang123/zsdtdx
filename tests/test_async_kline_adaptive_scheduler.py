@@ -496,6 +496,94 @@ def test_windows_spawn_process_only_warmup():
         pf.destroy_parallel_fetcher()
 
 
+def test_prewarm_uses_initialized_live_workers_not_probe_pid_coverage(monkeypatch):
+    """探针被同一 PID 重复领取时，已初始化且存活的 worker 仍应判为就绪。"""
+    import zsdtdx.engine.parallel_fetcher as pf
+    from concurrent.futures import Future
+
+    class _Counter:
+        def __init__(self):
+            self.reads = 0
+
+        @property
+        def value(self):
+            self.reads += 1
+            return 1 if self.reads == 1 else 2
+
+    class _Process:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def is_alive(self):
+            return True
+
+    class _Executor:
+        _zsdtdx_slot_counter = _Counter()
+        _processes = {101: _Process(101), 102: _Process(102)}
+
+        def submit(self, *_args, **_kwargs):
+            future = Future()
+            future.set_result(
+                {
+                    "pid": 101,
+                    "std_ok": False,
+                    "ex_ok": False,
+                    "active_std_host": "",
+                }
+            )
+            return future
+
+    fetcher = pf.ParallelKlineFetcher.__new__(pf.ParallelKlineFetcher)
+    fetcher.num_processes = 2
+    fetcher.task_chunk_inproc_coroutine_workers = 1
+    monkeypatch.setattr(pf, "get_fetcher", lambda: fetcher)
+    monkeypatch.setattr(pf, "_get_global_process_pool", lambda _workers: _Executor())
+
+    summary = pf.prewarm_parallel_fetcher(
+        require_all_workers=True,
+        timeout_seconds=2,
+        max_rounds=1,
+        target_workers=2,
+    )
+
+    assert summary["ready_processes"] == 2
+    assert summary["initialized_workers"] == 2
+    assert summary["probe_covered_workers"] == 1
+    assert summary["warmed_workers"] == 2
+    assert summary["rounds_used"] == 1
+    assert summary["startup_grace_elapsed_seconds"] < 0.2
+
+
+def test_prewarm_ready_state_rejects_dead_initialized_worker():
+    """initializer 已计数但进程已死亡时，就绪数必须按当前存活 worker 收缩。"""
+    import zsdtdx.engine.parallel_fetcher as pf
+
+    class _Counter:
+        value = 2
+
+    class _Process:
+        def __init__(self, pid, alive):
+            self.pid = pid
+            self._alive = alive
+
+        def is_alive(self):
+            return self._alive
+
+    class _Executor:
+        _zsdtdx_slot_counter = _Counter()
+        _processes = {
+            101: _Process(101, True),
+            102: _Process(102, False),
+        }
+
+    state = pf._snapshot_pool_ready_state(_Executor(), target_workers=2)
+
+    assert state["initialized_workers"] == 2
+    assert state["live_pids"] == [101]
+    assert state["ready_processes"] == 1
+    assert pf._resolve_prewarm_ready_processes(state, 2, 2) == 1
+
+
 def test_chunk_attempt_reports_actual_failover_host(monkeypatch):
     """worker 将线程实际活跃 host 回传，父进程可识别首选站 failover。"""
     import zsdtdx.engine.parallel_fetcher as pf

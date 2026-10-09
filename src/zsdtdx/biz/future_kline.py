@@ -31,7 +31,7 @@ def fetch_future_kline(
 
     输入：codes/freq/start_time/end_time 与 get_future_kline 相同。
     输出：字段含 code/freq/open/close/high/low/settlement_price/volume/datetime。
-    用途：标准化后走 ParallelKlineFetcher.fetch_stock。
+    用途：标准化后走 ParallelKlineFetcher.fetch_future_kline。
     边界条件：
     1. freq 为空列表或类型非法时抛 ValueError。
     2. codes 标准化后为空时返回空 DataFrame。
@@ -73,7 +73,7 @@ def fetch_future_kline(
             start_time, end_time
         )
 
-    return fetcher.fetch_stock(
+    return fetcher.fetch_future_kline(
         codes=codes,
         freqs=list(freq_list),
         start_time=normalized_start_time,

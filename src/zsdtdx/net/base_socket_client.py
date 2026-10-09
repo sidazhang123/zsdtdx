@@ -30,8 +30,6 @@ from zsdtdx.util.log import log
 
 # 连接超时（秒）
 CONNECT_TIMEOUT = 5.0
-# 接收包头长度
-RECV_HEADER_LEN = 0x10
 
 # 全局客户端弱引用集合，用于程序退出时清理
 _all_clients = weakref.WeakSet()
@@ -101,7 +99,6 @@ def update_last_ack_time(func):
             ret = func(self, *args, **kw)
         except Exception as e:
             log.debug("hit exception on req exception is " + str(e))
-            self.last_transaction_failed = True
             ret = None
             if self.raise_exception:
                 method_name = getattr(func, "__name__", "unknown")
@@ -179,7 +176,6 @@ class BaseSocketClient(object):
 
         self.client = None
         self.last_ack_time = time.time()
-        self.last_transaction_failed = False
         self.ip = None
         self.port = None
         self.raise_exception = raise_exception
@@ -372,7 +368,7 @@ class BaseSocketClient(object):
         """
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         """
         输入：
         1. exc_type: 输入参数，约束以协议定义与函数实现为准。

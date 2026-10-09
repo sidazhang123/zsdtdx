@@ -110,6 +110,26 @@ def test_is_std_index_item_covers_sz_sh_bj():
     assert client._is_std_index_item(1, "600000", "浦发银行") is False
     assert client._is_std_index_item(2, "899050", "北证50") is True
     assert client._is_std_index_item(2, "920002", "万达轴承") is False
+    assert client._is_std_index_item(0, "395004", "创业板") is True
+    assert client._is_std_index_item(0, "160425", "创业板HA") is False
+    assert client._is_std_index_item(1, "506006", "汇添富科创板") is False
+
+
+def test_index_name_candidate_requires_marker_and_rejects_non_index_products():
+    """输入：指数、基金及债券名称；输出：仅保留命中正向词且未命中排除词的名称。"""
+    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+
+    assert client._is_index_name_candidate("中证500") is True
+    assert client._is_index_name_candidate("国证粮食") is True
+    assert client._is_index_name_candidate("测试样本") is False
+    assert client._is_index_name_candidate("中证500ETF") is False
+    assert client._is_index_name_candidate("恒生指数LOF") is False
+    assert client._is_index_name_candidate("科创主题投资基金") is False
+    assert client._is_index_name_candidate("中证转债指数") is False
+    assert (
+        client._is_index_name_candidate("华夏北证50指数C", context="开放式基金")
+        is False
+    )
 
 
 def test_get_all_stock_list_takes_beijing_from_hq_market_2():

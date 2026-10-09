@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import math
 import multiprocessing as mp
-import os
 import queue as std_queue
 import re
 import sys
@@ -28,7 +27,7 @@ import traceback
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SRC = _ROOT / "src"
@@ -36,6 +35,9 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 _ART = _ROOT / "tests" / "manual" / "artifacts" / "block_kline_full_anomaly"
+_TEST_CONFIG = (
+    _ROOT / "tests" / "manual" / "artifacts" / "live_full_api" / "live_test_config.yaml"
+)
 START_TEXT = "2026-09-21"
 END_TEXT = "2026-09-24"
 FREQS = ("15", "30", "60", "d", "w")
@@ -323,6 +325,7 @@ def main() -> int:
         get_block_names,
         get_client,
         prewarm_parallel_fetcher,
+        set_config_path,
     )
 
     _ART.mkdir(parents=True, exist_ok=True)
@@ -335,6 +338,7 @@ def main() -> int:
     }
     cleanup: Dict[str, Any] = {}
     try:
+        set_config_path(str(_TEST_CONFIG), async_background_probe=True)
         _log("get_block_names ...")
         with get_client():
             names = list(get_block_names() or [])

@@ -50,7 +50,7 @@ class GetMarkets(BaseParser):
         result = []
         for i in range(cnt):
             # 64byte for one
-            (category, raw_name, market, raw_short_name, _, unknown_bytes) = (
+            (category, raw_name, market, raw_short_name, _, _unknown_bytes) = (
                 struct.unpack("<B32sB2s26s2s", body_buf[pos : pos + 64])
             )
             pos += 64
@@ -68,7 +68,6 @@ class GetMarkets(BaseParser):
                         ("category", category),
                         ("name", name.rstrip("\x00")),
                         ("short_name", short_name.rstrip("\x00")),
-                        # ('unknown_bytes', unknown_bytes)
                     ]
                 )
             )

@@ -278,6 +278,27 @@ def compute_hosts_fingerprint(
 # 短地址池阈值：配置侧 hosts 长度 ≤ 该值时，探测后只剔不可达，不再去掉最慢节点。
 _SHORT_HOST_POOL_NO_DROP_SLOWEST_MAX = 3
 
+# 指数目录按名称做双向过滤：先命中指数特征，再排除基金、债券等同名干扰品种。
+_INDEX_NAME_INCLUDE_MARKERS = (
+    "指数",
+    "中证",
+    "国证",
+    "深证",
+    "上证",
+    "沪深",
+    "创业板",
+    "科创",
+    "北证",
+)
+_INDEX_NAME_EXCLUDE_MARKERS = (
+    "etf",
+    "lof",
+    "基金",
+    "债",
+    "reits",
+    "联接",
+)
+
 
 def _tcp_probe_and_trim_available_hosts(
     hosts: List[Tuple[str, int]],
@@ -756,27 +777,6 @@ def _seed_probe_result_cache_from_snapshot(
         if isinstance(ex_list, list) and ex_list:
             _probe_result_cache["extended"] = list(ex_list)
         _last_tcp_probe_hosts_fingerprint = fingerprint
-
-
-def rotate_hosts_list(
-    hosts: List[Tuple[str, int]],
-    start_index: int,
-) -> List[Tuple[str, int]]:
-    """
-    对地址列表做循环旋转，用于 worker 槽位起始下标分配。
-
-    输入：
-    1. hosts: 全量探测排序列表。
-    2. start_index: 起始下标（可大于 len-1，自动取模）。
-    输出：
-    1. 旋转后的新列表。
-    边界条件：
-    1. hosts 为空时返回 []。
-    """
-    if not hosts:
-        return []
-    k = int(start_index) % len(hosts)
-    return list(hosts[k:]) + list(hosts[:k])
 
 
 def _tcp_probe_one(
@@ -1516,7 +1516,7 @@ class ChunkLocalRowCache:
     1. **无锁**：移除原 `_pool_lock` 与 `threading.local` 租约；同进程同 chunk 内的访问天然串行（async 路径
        下每个 chunk 在 `asyncio.to_thread` worker 内独立运行；sync 路径单线程顺序执行）。
     2. **无 free 池**：移除分区软复用，避免跨 chunk 复用 list 槽位的复杂性；分区由 Python GC 在 chunk 结束后回收。
-    3. **API 兼容**：保留 `acquire_partition` / `soft_delete` / `get_partition` 调用契约，外部调用零改动。
+    3. **接口收敛**：仅保留 `acquire_partition` / `soft_delete`，分别负责获取与释放分区。
     4. **命中率统计**：partition 保留 `_partition_key/_n/oldest_dt/newest_dt/page_start/fetched_pages`，
        并用 `history_exhausted` 记录空页或末短页，避免同 chunk 后续任务重复拉末页。
 
@@ -1533,7 +1533,7 @@ class ChunkLocalRowCache:
 
     @staticmethod
     def _new_partition(partition_key: str) -> Dict[str, Any]:
-        """构造一个空分区，字段与原 SharedChunkCache._new_partition 一致以保持上层兼容。"""
+        """构造一个空分区，初始化行缓存、时间边界与分页状态。"""
         return {
             "cache_rows": [],
             "_n": 0,
@@ -1561,7 +1561,7 @@ class ChunkLocalRowCache:
         partition_key = f"{code}|{freq}"
         existing = self._partitions.get(partition_key)
         if existing is not None:
-            # 同 chunk 内幂等：复用现有分区但归零游标，保持与 SharedChunkCache.acquire 相同语义。
+            # 同 chunk 内幂等：复用现有分区但归零分页游标与边界。
             existing["_n"] = 0
             existing["oldest_dt"] = None
             existing["newest_dt"] = None
@@ -1573,24 +1573,16 @@ class ChunkLocalRowCache:
         self._partitions[partition_key] = partition
         return partition
 
-    def get_partition(self, code: str, freq: str) -> Dict[str, Any]:
-        """兼容别名；等价于 acquire_partition。"""
-        return self.acquire_partition(code, freq)
-
     def soft_delete(self, code: str, freq: str) -> None:
         """chunk 结束：从内部表中移除分区引用，等待 GC 回收。
 
         输入：code/freq；输出：无。
         边界：
         1. 重复调用安全（key 不存在时静默 no-op）。
-        2. 与 SharedChunkCache.soft_delete 不同：不再"归还 free 池"。
+        2. 不维护 free 池，删除后由 GC 回收。
         """
         partition_key = f"{code}|{freq}"
         self._partitions.pop(partition_key, None)
-
-
-# 兼容别名：旧代码与外部测试可能仍引用 SharedChunkCache。
-SharedChunkCache = ChunkLocalRowCache
 
 
 class UnifiedTdxClient:
@@ -1735,7 +1727,7 @@ class UnifiedTdxClient:
             "extended": list(self.ex_pool.hosts),
         }
         # chunk 级 2D 分区缓存（(code|index_name, freq) → 分区）；股票/指数共用
-        self._shared_chunk_cache = SharedChunkCache()
+        self._shared_chunk_cache = ChunkLocalRowCache()
 
     def _resolve_config_path(self, config_path: Optional[str]) -> Path:
         """输入配置路径，输出可读取绝对路径；支持相对/绝对路径；不存在时抛错。"""
@@ -2106,15 +2098,6 @@ class UnifiedTdxClient:
         """
         return self._get_ex_market_name_no_df(int(market)) == self.HK_EX_MARKET_NAME
 
-    def _is_hk_stock_ex_no_df(self, market: int, code: str) -> bool:
-        """输入扩展市场与代码，输出是否港股通标的；用于无 DataFrame 路由；固定按5位数字过滤。"""
-        if not self._is_hk_market_ex_no_df(int(market)):
-            return False
-        raw_code = str(code).strip()
-        if not raw_code.isdigit():
-            return False
-        return len(raw_code) == 5
-
     def _stock_code_with_prefix_no_df(self, source: str, market: int, code: str) -> str:
         """输入来源市场与代码，输出前缀代码；用于无 DataFrame 输出；未知来源回退原代码。"""
         c = str(code).strip()
@@ -2252,14 +2235,6 @@ class UnifiedTdxClient:
         amount_tiny = amount_v is None or abs(amount_v) <= eps
         return vol_tiny and amount_tiny
 
-    def _filter_placeholder_raw_kline_rows(
-        self, rows: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """逐条剔除 o=h=l=c 且量额近零的占位 bar；不丢弃同页其它正常 bar。"""
-        if not rows:
-            return []
-        return [row for row in rows if not self._is_placeholder_raw_kline_row(row)]
-
     def _append_raw_kline_page_rows(
         self,
         rows: List[Dict[str, Any]],
@@ -2356,6 +2331,7 @@ class UnifiedTdxClient:
         import numpy as np
 
         n = len(rows)
+        source_key = str(source).strip().lower()
         normalized_freq = self._normalize_freq(freq)
         prefixed_code = self._stock_code_with_prefix_no_df(
             source=source, market=market, code=code
@@ -2446,7 +2422,9 @@ class UnifiedTdxClient:
                     "high": float(highs[i]),
                     "low": float(lows[i]),
                     "volume": int(volumes[i]),
-                    "amount": int(amounts[i]),
+                    "amount": max(0, int(amounts[i]))
+                    if source_key == "ex"
+                    else int(amounts[i]),
                     "datetime": dt_str,
                 }
             )
@@ -2969,19 +2947,11 @@ class UnifiedTdxClient:
         task_items = [dict(item[1]) for item in ordered_tasks]
 
         route_source = str(task_items[0].get("_route_source", "")).strip().lower()
-        try:
-            normalized_code, route = self._resolve_stock_route_no_df(
-                base_code,
-                base_freq,
-                route_source=route_source if route_source in {"std", "ex"} else None,
-            )
-        except TypeError as exc:
-            if "route_source" not in str(exc):
-                raise
-            # 兼容外部子类/测试仍覆盖历史二参数解析钩子。
-            normalized_code, route = self._resolve_stock_route_no_df(
-                base_code, base_freq
-            )
+        normalized_code, route = self._resolve_stock_route_no_df(
+            base_code,
+            base_freq,
+            route_source=route_source if route_source in {"std", "ex"} else None,
+        )
         if not bool(enable_cache):
             results: List[Dict[str, Any]] = []
             for task in task_items:
@@ -3581,6 +3551,24 @@ class UnifiedTdxClient:
             return self._is_beijing_stock_code(code)
         return False
 
+    @staticmethod
+    def _is_index_name_candidate(name: str, context: str = "") -> bool:
+        """名称须命中指数特征，且名称/上下文均不能命中基金、债券等排除词。"""
+        name_text = str(name or "").strip()
+        if name_text == "":
+            return False
+        normalized_name = name_text.casefold()
+        if not any(
+            marker.casefold() in normalized_name
+            for marker in _INDEX_NAME_INCLUDE_MARKERS
+        ):
+            return False
+        normalized_context = f"{name_text} {str(context or '').strip()}".casefold()
+        return not any(
+            marker.casefold() in normalized_context
+            for marker in _INDEX_NAME_EXCLUDE_MARKERS
+        )
+
     def _is_std_index_item(self, market: int, code: str, name: str) -> bool:
         """
         输入标准市场、代码与名称，输出是否纳入 HQ 指数目录。
@@ -3593,20 +3581,19 @@ class UnifiedTdxClient:
         用途：
         1. 从深沪京码表中筛出指数，供 `resolve_index_name` 使用。
         边界条件：
-        1. 名称关键字未命中时，深市 399、沪市 000、京市 899 仍纳入。
+        1. 必须属于深沪京指数代码段、命中指数名称关键词，且不能命中排除关键词。
         """
-        markers = ("指数", "中证", "深证", "上证", "沪深", "创业板", "科创", "北证")
-        if any(marker in str(name) for marker in markers):
-            return True
-        raw_code = str(code).strip()
-        m = int(market)
-        if m == 0:
-            return raw_code.startswith("399")
-        if m == 1:
-            return raw_code.startswith("000")
-        if m == 2:
-            return raw_code.startswith("899")
-        return False
+        raw_code = str(code or "").strip()
+        market_value = int(market)
+        if market_value == 0:
+            code_matched = raw_code.startswith("39")
+        elif market_value == 1:
+            code_matched = raw_code.startswith("000")
+        elif market_value == 2:
+            code_matched = raw_code.startswith("899")
+        else:
+            code_matched = False
+        return code_matched and self._is_index_name_candidate(name)
 
     def _beijing_std_route(self, code: str, name: str) -> Dict[str, Any]:
         """输入北交所代码与名称，输出标准行情 market=2 路由；名称未知时为空串。"""
@@ -3975,8 +3962,6 @@ class UnifiedTdxClient:
         self.ensure_code_catalog(need_std=True, need_ex=True, refresh=bool(refresh))
         records: List[Dict[str, Any]] = []
         seen_keys: set[str] = set()
-        index_name_markers = ("指数", "中证", "深证", "上证", "沪深", "创业板", "科创")
-
         for item in self._std_catalog_records or []:
             name = str(item.get("name", "")).strip()
             code = str(item.get("code", "")).strip()
@@ -4012,10 +3997,9 @@ class UnifiedTdxClient:
             if name == "" or code == "" or market < 0:
                 continue
             market_name = str(self._get_ex_market_name(market) or "").strip()
-            should_keep = "指数" in market_name or any(
-                marker in name for marker in index_name_markers
-            )
-            if not should_keep:
+            if "指数" not in market_name or not self._is_index_name_candidate(
+                name, context=market_name
+            ):
                 continue
             key = f"ex|{market}|{code}|{name}"
             if key in seen_keys:
@@ -4574,11 +4558,6 @@ class UnifiedTdxClient:
             self._ensure_std_catalog(refresh=refresh)
         if need_ex:
             self._ensure_ex_catalog(refresh=refresh)
-
-    def _fetch_all_instrument_info(self, refresh: bool = False) -> List[Dict[str, Any]]:
-        """输入是否刷新，输出扩展合约全量未过滤码表。"""
-        self.ensure_code_catalog(need_ex=True, refresh=refresh)
-        return list(self._ex_catalog_records or [])
 
     def _rebuild_stock_views_from_catalogs(self) -> None:
         """从已加载的 std/ex 码表过滤出股票清单与路由。"""
@@ -5925,6 +5904,8 @@ class UnifiedTdxClient:
         result = result[base_cols].copy()
         for col in ["open", "close", "high", "low", "volume", "amount"]:
             result[col] = pd.to_numeric(result[col], errors="coerce")
+        if str(source).strip().lower() == "ex":
+            result["amount"] = result["amount"].clip(lower=0)
         result["datetime"] = pd.to_datetime(result["datetime"], errors="coerce")
         result = (
             result.dropna(subset=["datetime"])
@@ -6715,7 +6696,7 @@ class UnifiedTdxClient:
         self._push_context_client(context_client)
         return context_client
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         """输入异常上下文，输出False；用于with退出自动close；保持异常透传。"""
         context_client = self._entered_client
         if context_client is None:

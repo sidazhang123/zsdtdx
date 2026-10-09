@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import copy
 import threading
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -20,7 +19,6 @@ from zsdtdx.engine.unified_client import (
     compute_hosts_fingerprint,
     get_probe_result_cache,
     resolve_presorted_hosts_for_connection,
-    rotate_hosts_list,
 )
 
 
@@ -92,7 +90,9 @@ def test_ensure_skips_when_cache_usable(mock_probe):
 
 @patch("zsdtdx.engine.unified_client._tcp_probe_and_trim_available_hosts")
 def test_ensure_writes_cache_once(mock_probe):
-    mock_probe.side_effect = lambda hosts, timeout, fallback, name: list(hosts)[:1] or list(fallback)
+    mock_probe.side_effect = lambda hosts, timeout, fallback, name: list(hosts)[
+        :1
+    ] or list(fallback)
 
     cfg = _minimal_cfg(["1.1.1.1:7709", "2.2.2.2:7709"])
     result = _ensure_availability_hosts_cache(cfg=cfg, force=True)
@@ -150,12 +150,6 @@ def test_resolve_uses_presorted_without_ensure(mock_probe, tmp_path):
     )
     assert out["standard"] == presorted["standard"]
     mock_probe.assert_not_called()
-
-
-def test_rotate_hosts_list():
-    hosts = [("a", 1), ("b", 2), ("c", 3)]
-    assert rotate_hosts_list(hosts, 1) == [("b", 2), ("c", 3), ("a", 1)]
-    assert rotate_hosts_list(hosts, 4) == rotate_hosts_list(hosts, 1)
 
 
 def test_build_worker_slot_assignments_rotate_not_shuffle():

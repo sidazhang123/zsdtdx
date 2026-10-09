@@ -8,7 +8,7 @@
 
 边界：
 1. 本文件不发起 socket 请求；真实网络单点探测与弱网离线注入见 tests/manual/ 下对应脚本。
-2. 测试基于"目标态"断言；不再保留对历史 SharedChunkCache 池逻辑的兼容性测试。
+2. 测试基于"目标态"断言；不保留历史分区池兼容接口。
 """
 
 import os
@@ -33,14 +33,14 @@ if _SRC_DIR not in sys.path:
 
 class TestChunkLocalRowCache:
     """
-    阶段二改造点 B4：用 ChunkLocalRowCache 取代 SharedChunkCache。
+    阶段二改造点 B4：使用 ChunkLocalRowCache 管理 chunk 内分区。
 
     验收要点：
     1. 同 chunk 内对同 (code,freq) 重复 acquire 返回同一对象，并归零游标；
     2. 不同 (code,freq) 互不影响；
     3. soft_delete 后再 acquire 是新分区（不复用 list 槽位）；
     4. 移除 `_pool_lock` 与 `_free` 池属性；
-    5. 公开 API（acquire_partition/get_partition/soft_delete/SharedChunkCache 别名）继续可用。
+    5. 分区通过 acquire_partition/soft_delete 管理。
     """
 
     def _new_cache(self):
@@ -94,19 +94,6 @@ class TestChunkLocalRowCache:
         assert not hasattr(cache, "_pool_lock"), "应移除 _pool_lock"
         assert not hasattr(cache, "_free"), "应移除 _free 池"
         assert not hasattr(cache, "_local"), "应移除 threading.local 租约"
-
-    def test_shared_chunk_cache_alias(self):
-        """SharedChunkCache 仍可作为兼容别名引用（外部测试与遗留代码可继续用）。"""
-        from zsdtdx.engine.unified_client import ChunkLocalRowCache, SharedChunkCache
-
-        assert SharedChunkCache is ChunkLocalRowCache
-
-    def test_get_partition_equivalent_to_acquire(self):
-        """get_partition 是 acquire_partition 的兼容别名。"""
-        cache = self._new_cache()
-        p1 = cache.get_partition("000001", "d")
-        p2 = cache.acquire_partition("000001", "d")
-        assert p1 is p2
 
 
 # =============================================================================
@@ -406,7 +393,9 @@ class TestFetchChunkBundleAsyncSchema:
 
         # 桩 worker client context 与 chunk 执行器，避免真建连。
         monkeypatch.setattr(pf, "_ensure_worker_client_context", lambda: object())
-        monkeypatch.setattr(pf, "_cleanup_worker_dead_thread_connections", lambda: None)
+        monkeypatch.setattr(
+            pf, "_cleanup_worker_dead_thread_connections", lambda _target: None
+        )
 
         async def _fake_chunk(payload):
             return {
@@ -717,7 +706,7 @@ class TestBundleWatchdog:
         fetcher.chunk_retry_max_attempts = 0
         fetcher.bundle_watchdog_grace_seconds = 0.0
         fetcher.force_recycle_on_timeout = True
-        fetcher._ensure_async_prewarm = lambda: None
+        fetcher._ensure_async_prewarm = lambda *, target_workers: None
         fetcher._build_chunk_task_detail = lambda _detail: {}
 
         task = {
@@ -728,7 +717,6 @@ class TestBundleWatchdog:
         }
         chunk = pf.TaskChunk(chunk_id="c1", code="000001", freq="d", tasks=[task])
         fetcher._build_task_chunks = lambda _tasks: [chunk]
-        fetcher._build_index_task_chunks = lambda _tasks: []
         fetcher._build_chunk_bundles = lambda chunks, _workers: [
             pf.ChunkBundle(bundle_id=1, chunks=chunks)
         ]

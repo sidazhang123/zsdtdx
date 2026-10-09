@@ -126,7 +126,6 @@ def _install_mock_worker(
     import zsdtdx.engine.parallel_fetcher as pf
 
     _reset_parallel_state()
-    pf._restore_ensure_worker_client_context_binding()
     pf._worker_client_holder = None
     pf._worker_client_context = None
     pf._worker_client_pid = None
@@ -156,7 +155,9 @@ def _install_mock_worker(
         }
     }
 
-    def _resolve_stock_route_no_df(code: str, freq: str):
+    def _resolve_stock_route_no_df(
+        code: str, freq: str, route_source: str | None = None
+    ):
         return "600000", dict(ctx._stock_route["600000"])
 
     ctx._resolve_stock_route_no_df = _resolve_stock_route_no_df  # type: ignore[method-assign]
@@ -185,12 +186,9 @@ class TestSimpleApiSameConnectionRetryE2E(unittest.TestCase):
     _worker_ensure_patch: Any = None
 
     def tearDown(self) -> None:
-        import zsdtdx.engine.parallel_fetcher as pf
-
         if self._worker_ensure_patch is not None:
             self._worker_ensure_patch.stop()
             self._worker_ensure_patch = None
-        pf._restore_ensure_worker_client_context_binding()
         _reset_parallel_state()
 
     def test_sync_transient_none_confirm_then_success(self):
@@ -270,12 +268,9 @@ class TestSimpleApiChunkReconnectRetryE2E(unittest.TestCase):
     _worker_ensure_patch: Any = None
 
     def tearDown(self) -> None:
-        import zsdtdx.engine.parallel_fetcher as pf
-
         if self._worker_ensure_patch is not None:
             self._worker_ensure_patch.stop()
             self._worker_ensure_patch = None
-        pf._restore_ensure_worker_client_context_binding()
         _reset_parallel_state()
 
     def _make_flaky_chunk_fetch(self, state: Dict[str, int]):

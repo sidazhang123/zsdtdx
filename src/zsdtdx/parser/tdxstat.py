@@ -21,6 +21,8 @@ import zipfile
 from collections import OrderedDict
 from typing import Any, Dict, Optional, Sequence
 
+from zsdtdx.params import TDXParams
+
 # 挂到 get_stock_stat 宽表的 tdxstat/tdxstat2 字段（原样合并，不按现价重算）。
 TDXSTAT_FIELD_KEYS = (
     "stat_asof",
@@ -240,10 +242,10 @@ def read_zhb_stat_payload(zhb_raw: bytes) -> Dict[str, bytes]:
     边界：损坏或缺成员时对应键不存在；不落盘。
     """
     wanted = {
-        "tdxstat.cfg",
-        "tdxstat2.cfg",
-        "tdxzs.cfg",
-        "incon.dat",
+        TDXParams.TDXSTAT_ZIP_MEMBER,
+        TDXParams.TDXSTAT2_ZIP_MEMBER,
+        TDXParams.TDXZS_ZIP_MEMBER,
+        TDXParams.INCON_ZIP_MEMBER,
     }
     out: Dict[str, bytes] = {}
     if not zhb_raw:

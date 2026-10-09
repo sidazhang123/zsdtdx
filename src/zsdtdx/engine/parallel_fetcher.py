@@ -21,7 +21,6 @@ import json
 import math
 import os
 import queue as queue_mod
-import random
 import threading
 import time
 import warnings
@@ -47,8 +46,6 @@ from zsdtdx.engine.adaptive_scheduler import (
     AdaptivePermit,
 )
 from zsdtdx.engine.unified_client import UnifiedTdxClient
-from zsdtdx.params import TDXParams
-from zsdtdx.util.helper import parse_future_symbol
 from zsdtdx.util.log import emit_log, event_level_name, is_event_enabled
 
 
@@ -69,26 +66,12 @@ def _kline_symbol_field(kind: str) -> str:
     return "code"
 
 
-def _is_symbol_kline_kind(kind: str) -> bool:
-    """
-    输入任务种类，输出是否按名称分片。
-
-    输入：kind。
-    输出：指数与板块为 True。
-    用途：这两种任务都按名称加周期分组。
-    边界条件：股票为 False。
-    """
-    return str(kind or "").strip().lower() in {"index", "block"}
-
-
 try:
     import psutil
 except ImportError:
     psutil = None
 
 warnings.filterwarnings("ignore")
-# 保留模块属性供旧测试/扩展 patch；目标态槽位分配已改为确定性轮转。
-_RANDOM_COMPAT = random
 
 
 # =============================================================================
@@ -490,6 +473,13 @@ def _get_global_process_pool(max_workers: int) -> ProcessPoolExecutor:
                     slot_result_queue,
                 ),
             )
+            # 复用 initializer 已有的共享槽位计数器判断 worker 是否完成启动。
+            # 绑定到具体 pool，避免并发重启后误读新池的全局计数器。
+            setattr(
+                _global_process_pool,
+                "_zsdtdx_slot_counter",
+                _global_pool_slot_counter,
+            )
             _global_pool_epoch += 1
             _emit_log("info", f"[Parallel] 创建全局进程池 (workers: {max_workers})")
 
@@ -857,6 +847,53 @@ def _snapshot_pool_processes(pool: ProcessPoolExecutor) -> List[Any]:
         return []
 
 
+def _snapshot_pool_ready_state(
+    pool: ProcessPoolExecutor,
+    target_workers: int,
+) -> Dict[str, Any]:
+    """读取指定进程池已经初始化且仍存活的 worker 数，不改变池状态。"""
+    target = max(1, int(target_workers))
+    initialized_workers = 0
+    counter = getattr(pool, "_zsdtdx_slot_counter", None)
+    if counter is not None:
+        try:
+            # multiprocessing.Value 的 value 读取已经由其同步包装器保护。
+            initialized_workers = max(0, int(counter.value))
+        except Exception:
+            initialized_workers = 0
+
+    live_pids: set[int] = set()
+    processes = _snapshot_pool_processes(pool)
+    for proc in processes:
+        try:
+            pid = int(getattr(proc, "pid", 0) or 0)
+            if pid > 0 and bool(proc.is_alive()):
+                live_pids.add(pid)
+        except Exception:
+            continue
+
+    ready_processes = min(target, initialized_workers)
+    if processes:
+        ready_processes = min(ready_processes, len(live_pids))
+    return {
+        "ready_processes": int(ready_processes),
+        "initialized_workers": int(initialized_workers),
+        "live_pids": sorted(live_pids),
+        "has_initializer_counter": bool(counter is not None),
+    }
+
+
+def _resolve_prewarm_ready_processes(
+    ready_state: Dict[str, Any],
+    probe_covered_workers: int,
+    target_workers: int,
+) -> int:
+    """内置池按初始化与存活交集判定；无计数器的兼容 executor 才回退探针数。"""
+    if bool(ready_state.get("has_initializer_counter", False)):
+        return min(target_workers, max(0, int(ready_state.get("ready_processes", 0))))
+    return min(target_workers, max(0, int(probe_covered_workers)))
+
+
 def force_restart_parallel_fetcher(
     *,
     prewarm: bool = True,
@@ -1208,24 +1245,6 @@ def _ensure_worker_client_context():
         return _worker_client_context
 
 
-_ENSURE_WORKER_CTX_BUILTIN = _ensure_worker_client_context
-
-
-def _restore_ensure_worker_client_context_binding() -> None:
-    """
-    将 `_ensure_worker_client_context` 恢复为模块内置实现。
-
-    输入：无。
-    输出：无。
-    用途：
-    1. 测试 patch 后恢复，避免 MagicMock 残留导致后续用例走错路径。
-    边界条件：
-    1. 可重复调用；恢复后不影响已缓存的 worker 上下文对象。
-    """
-    global _ensure_worker_client_context
-    _ensure_worker_client_context = _ENSURE_WORKER_CTX_BUILTIN
-
-
 def _is_connection_unavailable_error(error_text: str) -> bool:
     """
     判断错误是否属于“连接不可用”类别。
@@ -1453,6 +1472,12 @@ def prewarm_parallel_fetcher(
     worker_states: Dict[int, Dict[str, Any]] = {}
     round_errors: list[str] = []
     rounds_used = 0
+    ready_state: Dict[str, Any] = {
+        "ready_processes": 0,
+        "initialized_workers": 0,
+        "live_pids": [],
+        "has_initializer_counter": False,
+    }
 
     _emit_log(
         "info",
@@ -1510,12 +1535,22 @@ def prewarm_parallel_fetcher(
                 if not future.done():
                     future.cancel()
 
+        ready_state = _snapshot_pool_ready_state(executor, target_workers)
+        ready_processes = _resolve_prewarm_ready_processes(
+            ready_state,
+            len(warmed_pids),
+            target_workers,
+        )
+
         _emit_log(
             "info",
             "[Parallel] 预热轮次完成",
             {
                 "round": int(round_idx),
                 "target_workers": int(target_workers),
+                "ready_processes": int(ready_processes),
+                "initialized_workers": int(ready_state.get("initialized_workers", 0)),
+                "live_pids": list(ready_state.get("live_pids", [])),
                 "warmed_workers": int(len(warmed_pids)),
                 "warmed_pids": sorted(warmed_pids),
                 "std_host_distribution": _summarize_worker_std_host_distribution(
@@ -1523,10 +1558,34 @@ def prewarm_parallel_fetcher(
                 ),
             },
         )
-        if len(warmed_pids) >= target_workers:
+        if ready_processes >= target_workers:
             break
 
+    # Windows spawn 下可能已创建全部进程，但最后一个 worker 尚未执行到 initializer。
+    # 仅在预热轮次耗尽后短暂读取现有状态，不再提交任务，也不引入额外同步原语。
+    startup_grace_started = time.monotonic()
+    startup_grace_deadline = min(
+        started_at + timeout_budget,
+        startup_grace_started + 1.0,
+    )
+    while (
+        ready_processes < target_workers and time.monotonic() < startup_grace_deadline
+    ):
+        time.sleep(0.05)
+        ready_state = _snapshot_pool_ready_state(executor, target_workers)
+        ready_processes = _resolve_prewarm_ready_processes(
+            ready_state,
+            len(warmed_pids),
+            target_workers,
+        )
+
+    startup_grace_elapsed = round(time.monotonic() - startup_grace_started, 3)
     elapsed_total = round(time.monotonic() - started_at, 3)
+    ready_processes = _resolve_prewarm_ready_processes(
+        ready_state,
+        len(warmed_pids),
+        target_workers,
+    )
     connection_ready_workers = sum(
         1
         for state in worker_states.values()
@@ -1534,12 +1593,16 @@ def prewarm_parallel_fetcher(
     )
     summary: Dict[str, Any] = {
         "target_workers": int(target_workers),
-        "ready_processes": int(len(warmed_pids)),
+        "ready_processes": int(ready_processes),
+        "initialized_workers": int(ready_state.get("initialized_workers", 0)),
+        "live_pids": list(ready_state.get("live_pids", [])),
+        "probe_covered_workers": int(len(warmed_pids)),
         "connection_ready_workers": int(connection_ready_workers),
         # 兼容旧调用方；其语义始终是进程已启动，不代表行情连接已建立。
-        "warmed_workers": int(len(warmed_pids)),
+        "warmed_workers": int(ready_processes),
         "warmed_pids": sorted(warmed_pids),
         "elapsed_seconds": float(elapsed_total),
+        "startup_grace_elapsed_seconds": float(startup_grace_elapsed),
         "rounds_used": int(rounds_used),
         "require_all_workers": bool(require_all_workers),
         "worker_states": [dict(worker_states[pid]) for pid in sorted(worker_states)],
@@ -1550,9 +1613,9 @@ def prewarm_parallel_fetcher(
     if round_errors:
         summary["errors"] = round_errors[:10]
 
-    if require_all_workers and len(warmed_pids) < target_workers:
+    if require_all_workers and ready_processes < target_workers:
         message = (
-            f"[Parallel] 预热失败：目标进程 {target_workers}，已预热 {len(warmed_pids)}，"
+            f"[Parallel] 预热失败：目标进程 {target_workers}，已就绪 {ready_processes}，"
             f"timeout={timeout_budget}s rounds={rounds_limit}"
         )
         _emit_log("error", message, summary)
@@ -1640,35 +1703,6 @@ def _init_worker(
         atexit.register(_close_worker_client_context)
     except Exception:
         pass
-
-
-def is_future_code(code: str) -> bool:
-    """
-    判断代码是否应走期货 K 线通路。
-
-    输入：
-    1. code: 任意代码字符串。
-    输出：
-    1. bool，True 表示识别为期货代码。
-    用途：
-    1. 在旧版 DataFrame 接口中做股票/期货分流。
-    边界条件：
-    1. 空值返回 False。
-    2. `CUL8`/`ALL8` 等 L+数字连续合约视为期货，不把 `L` 并进品种字母。
-    3. 带 3~4 位合约月份的代码（如 `CU2603`）按品种前缀匹配 `TDXParams.FUTURE_PATTERNS`。
-    4. 纯品种代码（如 `CU`、`L-F`）按品种名匹配；带连字符的品种视为期货。
-    """
-    if not code:
-        return False
-    kind, variety = parse_future_symbol(code)
-    if kind == "continuous":
-        return True
-    if kind == "other":
-        return False
-    if kind == "variety" and "-" in variety:
-        return True
-    compact = variety.replace("-", "")
-    return variety in TDXParams.FUTURE_PATTERNS or compact in TDXParams.FUTURE_PATTERNS
 
 
 def get_optimal_process_count(core_multiplier: float = 1.5) -> int:
@@ -2534,78 +2568,11 @@ def _submit_attempt_call(
 
 
 def _shutdown_attempt_executor(executor: Any) -> None:
-    """输入线程池，输出无。边界：复用池不关闭；测试替换进来的池可以关闭且不等待。"""
+    """输入线程池，输出无；复用池不关闭，其余线程池不等待地关闭。"""
     if executor is None or executor is _worker_attempt_executor:
         return
     try:
         executor.shutdown(wait=False, cancel_futures=True)
-    except TypeError:
-        try:
-            executor.shutdown(wait=False)
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-
-def _fetch_one_chunk_attempt_with_timeout(prep: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    在线程内执行单次 chunk attempt，并在超时时关闭本次 socket。
-
-    输入：
-    1. prep: `_prepare_one_task_chunk` 返回的准备结果。
-    输出：
-    1. 单次 attempt 的 chunk 报告字典。
-    用途：
-    1. 让同步 chunk 路径也具备外层墙钟超时，避免阻塞调用方。
-    边界条件：
-    1. 超时后关闭本次尝试的 socket，使阻塞中的 recv/connect 返回，并抛 TimeoutError。
-    """
-    chunk_timeout = float(prep["chunk_timeout"])
-    executor, future, closer = _submit_attempt_call(
-        _fetch_one_chunk_fetch_attempt,
-        (prep,),
-        thread_name="zsdtdx_chunk_attempt",
-    )
-    try:
-        return future.result(timeout=chunk_timeout)
-    except TimeoutError as exc:
-
-        def _discard_late_error(finished: Any) -> None:
-            try:
-                finished.exception()
-            except Exception:
-                pass
-
-        future.add_done_callback(_discard_late_error)
-        closer.close()
-        raise TimeoutError("chunk attempt timeout") from exc
-    finally:
-        _shutdown_attempt_executor(executor)
-
-
-def _recover_chunk_connection_before_retry(
-    prep: Dict[str, Any], error_text: str
-) -> None:
-    """
-    在连接不可用错误重试前执行一次连接恢复。
-
-    输入：
-    1. prep: chunk 准备结果。
-    2. error_text: 本次失败摘要。
-    输出：无。
-    用途：
-    1. 保持“连接不可用先恢复再重试”的目标态语义，同时让 `_log_chunk_retry` 只负责日志。
-    边界条件：
-    1. 非连接不可用错误不处理；恢复失败不覆盖原始失败原因。
-    """
-    if not _is_connection_unavailable_error(error_text):
-        return
-    try:
-        _recover_worker_pools_current_thread(
-            "chunk_connection_unavailable",
-            _infer_recover_target_from_chunk(prep),
-        )
     except Exception:
         pass
 
@@ -2969,11 +2936,7 @@ async def _fetch_chunk_bundle_async(bundle_payload: Dict[str, Any]) -> Dict[str,
         )
         chunk_reports.extend(reports)
     finally:
-        try:
-            _cleanup_worker_dead_thread_connections(bundle_route_source)
-        except TypeError:
-            # 兼容外部测试/扩展仍按历史无参签名替换清理钩子。
-            _cleanup_worker_dead_thread_connections()
+        _cleanup_worker_dead_thread_connections(bundle_route_source)
 
     # 不再返回 bundle-level "payloads"：父进程的 _iter_task_payloads_parallel_chunked
     # 通过 chunk_reports[i].payloads 取数，bundle 级聚合曾是无意义的双倍 pickle 浪费。
@@ -3066,9 +3029,11 @@ def _serialize_task_list(
     return result
 
 
-def _fetch_batch(task_list: List[Tuple[int, str, str, str, str]]) -> Dict[str, Any]:
+def _fetch_future_batch(
+    task_list: List[Tuple[int, str, str, str, str]],
+) -> Dict[str, Any]:
     """
-    进程worker：批量获取任务数据
+    进程 worker：批量获取期货 K 线数据。
 
     输入: [(idx, code, freq, start_time, end_time), ...]
     输出: {"data": DataFrame, "failures": [(code, freq, error), ...]}
@@ -3093,16 +3058,9 @@ def _fetch_batch(task_list: List[Tuple[int, str, str, str, str]]) -> Dict[str, A
         idx, code, freq, start_time, end_time = task
 
         try:
-            is_future = is_future_code(code)
-
-            if is_future:
-                iterator = client_context.get_future_kline(
-                    codes=code, freq=freq, start_time=start_time, end_time=end_time
-                )
-            else:
-                iterator = client_context.get_stock_kline(
-                    codes=code, freq=freq, start_time=start_time, end_time=end_time
-                )
+            iterator = client_context.get_future_kline(
+                codes=code, freq=freq, start_time=start_time, end_time=end_time
+            )
 
             batch_count = 0
             for batch in iterator:
@@ -3153,7 +3111,6 @@ class ParallelKlineFetcher:
         parallel_cfg = self.config.get("parallel", {})
         # get_future_kline 的 DataFrame 批处理仍使用这四项，不再从配置读取。
         self.parallel_total_timeout_seconds = 300.0
-        self.parallel_result_timeout_seconds = 600.0
         self.force_recycle_on_timeout = True
         self.timeout_fallback_to_serial = True
         self.task_chunk_cache_min_tasks = 2
@@ -3610,10 +3567,6 @@ class ParallelKlineFetcher:
     def _build_task_chunks(self, tasks: List[Dict[str, Any]]) -> List[TaskChunk]:
         """构建股票任务 chunk（按 code+freq 分组）。"""
         return self._build_grouped_task_chunks(tasks, group_key="code")
-
-    def _build_index_task_chunks(self, tasks: List[Dict[str, Any]]) -> List[TaskChunk]:
-        """构建指数任务 chunk（按 index_name+freq 分组）。"""
-        return self._build_grouped_task_chunks(tasks, group_key="index_name")
 
     def _build_chunk_bundles(
         self, chunks: List[TaskChunk], inproc_workers: int
@@ -4546,11 +4499,7 @@ class ParallelKlineFetcher:
                 ),
             ),
         )
-        try:
-            self._ensure_async_prewarm(target_workers=useful_workers)
-        except TypeError:
-            # 兼容外部子类/测试仍实现历史无参钩子。
-            self._ensure_async_prewarm()
+        self._ensure_async_prewarm(target_workers=useful_workers)
 
         def _run_async_worker() -> List[Dict[str, Any]]:
             outputs: List[Dict[str, Any]] = []
@@ -4681,7 +4630,7 @@ class ParallelKlineFetcher:
             qfq=False,
         )
 
-    def fetch_stock(
+    def fetch_future_kline(
         self,
         codes: List[str],
         freqs: List[str],
@@ -4689,9 +4638,9 @@ class ParallelKlineFetcher:
         end_time: Optional[str],
     ) -> pd.DataFrame:
         """
-        获取股票/期货K线数据
+        获取期货 K 线数据。
 
-        输入: 代码列表、频率列表、时间范围
+        输入: 期货代码列表、频率列表、时间范围
         输出: 合并后的单个 DataFrame
         """
         tasks = [(code, freq) for code in codes for freq in freqs]
@@ -4705,21 +4654,21 @@ class ParallelKlineFetcher:
                 "info",
                 f"[Info] 进程数不足，使用串行模式 (进程数: {self.num_processes}, 任务数: {len(tasks)})",
             )
-            return self._fetch_serial(tasks, start_time, end_time)
+            return self._fetch_future_serial(tasks, start_time, end_time)
 
         _emit_log(
             "info",
             f"[Info] 默认并行模式 (进程数: {self.num_processes}, 任务数: {len(tasks)})",
         )
-        return self._fetch_parallel(tasks, start_time, end_time)
+        return self._fetch_future_parallel(tasks, start_time, end_time)
 
-    def _fetch_serial(
+    def _fetch_future_serial(
         self,
         tasks: List[Tuple[str, str]],
         start_time: Optional[str],
         end_time: Optional[str],
     ) -> pd.DataFrame:
-        """串行模式获取，返回合并后的DataFrame"""
+        """串行获取期货 K 线，返回合并后的 DataFrame。"""
         all_data = []
         failures = []
 
@@ -4735,13 +4684,8 @@ class ParallelKlineFetcher:
         try:
             for code, freq in tasks:
                 try:
-                    is_future = is_future_code(code)
-                    iterator = (
-                        client.get_future_kline if is_future else client.get_stock_kline
-                    )
-
                     batch_count = 0
-                    for df in iterator(
+                    for df in client.get_future_kline(
                         codes=code, freq=freq, start_time=start_time, end_time=end_time
                     ):
                         if isinstance(df, pd.DataFrame) and not df.empty:
@@ -4765,11 +4709,8 @@ class ParallelKlineFetcher:
                 and hasattr(context_client, "_record_failure")
             ):
                 for code, freq, error in failures:
-                    task_type = (
-                        "future_kline" if is_future_code(code) else "stock_kline"
-                    )
                     context_client._record_failure(
-                        task_type, code, "fetch_error", error, freq
+                        "future_kline", code, "fetch_error", error, freq
                     )
         finally:
             if should_close:
@@ -4782,14 +4723,14 @@ class ParallelKlineFetcher:
             return pd.concat(all_data, ignore_index=True)
         return pd.DataFrame()
 
-    def _fetch_parallel(
+    def _fetch_future_parallel(
         self,
         tasks: List[Tuple[str, str]],
         start_time: Optional[str],
         end_time: Optional[str],
     ) -> pd.DataFrame:
         """
-        并行模式获取，返回合并后的单个 DataFrame
+        并行获取期货 K 线，返回合并后的单个 DataFrame。
         """
         # 准备任务参数
         task_args = [
@@ -4810,8 +4751,6 @@ class ParallelKlineFetcher:
         all_failures = []
         done_tasks = 0
         total_timeout = max(1.0, float(self.parallel_total_timeout_seconds))
-        per_future_timeout = max(1.0, float(self.parallel_result_timeout_seconds))
-
         try:
             # 获取全局进程池
             executor = _get_global_process_pool(num_processes)
@@ -4833,7 +4772,7 @@ class ParallelKlineFetcher:
                         **task_payload,
                     },
                 )
-                future = executor.submit(_fetch_batch, chunk)
+                future = executor.submit(_fetch_future_batch, chunk)
                 futures[future] = {
                     "dispatch_index": int(dispatch_idx),
                     "chunk": chunk,
@@ -4851,7 +4790,7 @@ class ParallelKlineFetcher:
                     chunk = meta["chunk"]
                     chunk_task_count = int(len(chunk))
                     try:
-                        result = future.result(timeout=per_future_timeout)
+                        result = future.result()
                         chunk_df = result.get("data", pd.DataFrame())
                         chunk_failures = result.get("failures", [])
                         worker_pid = int(result.get("worker_pid", 0) or 0)
@@ -4882,6 +4821,9 @@ class ParallelKlineFetcher:
                             },
                         )
                     except Exception as e:
+                        error_text = str(e)[:200]
+                        for _idx, code, freq, _start, _end in chunk:
+                            all_failures.append((code, freq, error_text))
                         done_tasks += chunk_task_count
                         _emit_log(
                             "error",
@@ -4957,7 +4899,7 @@ class ParallelKlineFetcher:
                             "fallback_task_count": int(len(timeout_tasks)),
                         },
                     )
-                    fallback_df = self._fetch_serial(
+                    fallback_df = self._fetch_future_serial(
                         timeout_tasks, start_time, end_time
                     )
                     if isinstance(fallback_df, pd.DataFrame) and not fallback_df.empty:
@@ -4969,13 +4911,8 @@ class ParallelKlineFetcher:
                     context_client = UnifiedTdxClient.get_active_context_client()
                     if context_client and hasattr(context_client, "_record_failure"):
                         for code, freq, error in all_failures:
-                            task_type = (
-                                "future_kline"
-                                if is_future_code(code)
-                                else "stock_kline"
-                            )
                             context_client._record_failure(
-                                task_type, code, "fetch_error", error, freq
+                                "future_kline", code, "fetch_error", error, freq
                             )
                 except Exception as e:
                     _emit_log("error", f"[Parallel] 记录失败信息时出错: {e}")
@@ -4983,7 +4920,7 @@ class ParallelKlineFetcher:
         except Exception as e:
             _emit_log("error", f"[Parallel Error] 执行失败: {e}")
             # 出错时回退到串行
-            return self._fetch_serial(tasks, start_time, end_time)
+            return self._fetch_future_serial(tasks, start_time, end_time)
 
         # 合并所有结果
         if all_data:
