@@ -174,7 +174,7 @@ def get_stock_concepts() -> Dict[str, Any]:
       可请求 K 线的板块指数名请用 `get_block_names`。
 
     输入:
-    - 无。标准行情主机取配置 `hosts.standard`。
+    - 无。标准行情主机取配置 `hosts.standard.szshbj` 与 `hosts.standard.szsh_only`。
       `infoharbor_block.dat` 提供概念、风格、指数；
       `tdxhy.cfg` 提供股票的通达信行业码；
       `zhb.zip` 内的 `tdxzs.cfg` 把行业码换成钢铁、煤炭、水泥等行业板块名。

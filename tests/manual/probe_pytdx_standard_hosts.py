@@ -2,7 +2,7 @@
 pytdx 标准行情 IP 池探测脚本。
 
 用途：
-1. 读取 `src/zsdtdx/config.yaml` 的 `hosts.standard`。
+1. 读取 `src/zsdtdx/config.yaml` 的两个 `hosts.standard` 能力分组。
 2. 使用 site-packages 的 `pytdx.hq.TdxHq_API` 对每个 host 逐个做连通性探测。
 3. 同时验证最小查询（`get_security_count`），并输出 JSON 结果文件。
 
@@ -57,7 +57,10 @@ def _load_standard_hosts(config_path: Path) -> List[Tuple[str, int]]:
         raise FileNotFoundError(f"配置文件不存在: {config_path}")
 
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    host_items = list((((raw.get("hosts") or {}).get("standard")) or []))
+    standard = ((raw.get("hosts") or {}).get("standard")) or {}
+    host_items = list(standard.get("szshbj") or []) + list(
+        standard.get("szsh_only") or []
+    )
 
     hosts: List[Tuple[str, int]] = []
     for item in host_items:

@@ -164,8 +164,14 @@ def main():
             (artifacts / f"{engine}.yaml").read_text(encoding="utf-8")
         )
         if cfg.get("pin_hosts", True):
-            for source in ("standard", "extended"):
-                config["hosts"][source] = config["hosts"][source][:1]
+            standard = config["hosts"]["standard"]
+            if isinstance(standard, dict):
+                standard["szshbj"] = standard.get("szshbj", [])[:1]
+                standard["szsh_only"] = []
+            else:
+                # baseline 快照仍读取其发布时的扁平配置结构。
+                config["hosts"]["standard"] = standard[:1]
+            config["hosts"]["extended"] = config["hosts"]["extended"][:1]
         (artifacts / f"contract_{engine}.yaml").write_text(
             yaml.safe_dump(config, allow_unicode=True), encoding="utf-8"
         )
@@ -173,10 +179,15 @@ def main():
         ("baseline", "baseline"),
         ("thread", cfg.get("thread_snapshot", "thread_snapshot")),
     ):
+        engine_src = (
+            HERE.parents[1] / "src"
+            if engine == "thread" and folder == "current"
+            else artifacts / folder / "src"
+        )
         env = {
             **os.environ,
             "PYTHONPATH": os.pathsep.join(
-                [str(HERE / "kline_capture_hook"), str(artifacts / folder / "src")]
+                [str(HERE / "kline_capture_hook"), str(engine_src)]
             ),
             "ZSDTDX_CONTRACT_ENGINE": engine,
             "PYTHONIOENCODING": "utf-8",

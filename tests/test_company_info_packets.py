@@ -23,6 +23,10 @@ def _attach_pinned_pool(client, fake_call, hosts=None):
     """
     pool = MagicMock()
     pool.hosts = list(hosts or [("127.0.0.1", 7709)])
+    pool.host_groups = {
+        "szsh": set(pool.hosts),
+        "szshbj": set(pool.hosts),
+    }
     pool.get_active_host.return_value = f"{pool.hosts[0][0]}:{pool.hosts[0][1]}"
     pool.connect_thread_to_host.return_value = True
     pool.rotate_thread_host.return_value = False
@@ -506,6 +510,27 @@ def test_company_info_content_threads_bind_category_host():
     pool.call.assert_not_called()
 
 
+def test_beijing_company_info_excludes_szsh_only_hosts():
+    """北交所 F10 目录为空时也是业务终态，只访问 szshbj 组且不换到深沪专用站。"""
+    client = _client_for_stock("920001", 2)
+    hosts = [("10.0.0.1", 7709), ("10.0.0.2", 7709)]
+    pool = _attach_pinned_pool(client, lambda *args, **kwargs: [], hosts=hosts)
+    pool.host_groups = {"szsh": set(hosts), "szshbj": {hosts[0]}}
+    connected = []
+
+    def connect(host, port):
+        """输入目标地址，输出成功；记录目录实际选站。"""
+        connected.append((str(host), int(port)))
+        return True
+
+    pool.connect_thread_to_host.side_effect = connect
+    rows = UnifiedTdxClient.get_company_info_content(
+        client, code="920001", return_df=False
+    )
+    assert rows == []
+    assert connected == [hosts[0]]
+
+
 @pytest.mark.parametrize("first_response", [None, b"x"])
 def test_company_info_retries_whole_stock_when_content_host_fails(first_response):
     """输入第一台站正文中断或短包；输出换站重拉目录并使用新站自己的 start。"""
@@ -534,14 +559,10 @@ def test_company_info_retries_whole_stock_when_content_host_fails(first_response
         host, port = state["host"]
         return f"{host}:{port}"
 
-    def rotate():
-        """输入无。输出切到第二台站。边界：只改替身状态。"""
-        state["host"] = ("10.0.0.2", 7709)
-        return True
-
     def connect(host, port):
-        """输入目标站。输出是否等于当前替身站。边界：不建 socket。"""
-        return (str(host), int(port)) == state["host"]
+        """输入目标站。输出成功并切换替身站。边界：不建 socket。"""
+        state["host"] = (str(host), int(port))
+        return True
 
     def fake_call(method_name, *args, allow_none=False, **kwargs):
         """
@@ -566,7 +587,6 @@ def test_company_info_retries_whole_stock_when_content_host_fails(first_response
         hosts=[("10.0.0.1", 7709), ("10.0.0.2", 7709)],
     )
     pool.get_active_host.side_effect = get_active_host
-    pool.rotate_thread_host.side_effect = rotate
     pool.connect_thread_to_host.side_effect = connect
 
     rows = UnifiedTdxClient.get_company_info_content(
@@ -604,13 +624,14 @@ def test_company_info_raises_when_every_host_fails():
         host, port = state["host"]
         return f"{host}:{port}"
 
-    def rotate():
-        """输入无。输出切到第二台站。边界：只改替身状态。"""
-        state["host"] = ("10.0.0.2", 7709)
+    pool.get_active_host.side_effect = get_active_host
+
+    def connect(host, port):
+        """输入目标站。输出成功并切换替身站。边界：不建 socket。"""
+        state["host"] = (str(host), int(port))
         return True
 
-    pool.get_active_host.side_effect = get_active_host
-    pool.rotate_thread_host.side_effect = rotate
+    pool.connect_thread_to_host.side_effect = connect
 
     try:
         UnifiedTdxClient.get_company_info_content(

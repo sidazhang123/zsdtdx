@@ -1,6 +1,6 @@
 # 基准工具已生成 baseline/thread_snapshot 后运行；所有用户参数只放 YAML。
 artifact_dir: artifacts/refactor/benchmark_final
-thread_snapshot: final_snapshot
+thread_snapshot: current
 pin_hosts: true
 freeze_kline_responses: true
 start_time: "2026-10-12"

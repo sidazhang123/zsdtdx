@@ -540,16 +540,19 @@ def _validate_config_or_raise(cfg: Dict[str, Any], resolved_path: str) -> None:
     1. standard hosts 缺失或无效时抛出 ValueError。
     2. extended 配置存在但无效时抛出 ValueError。
     """
-    from zsdtdx.engine.unified_client import normalize_hosts_entries
+    from zsdtdx.engine.unified_client import (
+        _normalize_standard_host_groups_from_cfg,
+        normalize_hosts_entries,
+    )
 
     if not isinstance(cfg, dict):
         raise ValueError(f"配置无效（非字典）: {resolved_path}")
 
     hosts_cfg = cfg.get("hosts", {}) or {}
-    std_raw = hosts_cfg.get("standard", [])
-    if not std_raw:
+    std_raw = hosts_cfg.get("standard", {})
+    if not isinstance(std_raw, dict) or not std_raw:
         raise ValueError(f"配置缺少 hosts.standard: {resolved_path}")
-    normalize_hosts_entries(std_raw)
+    _normalize_standard_host_groups_from_cfg(cfg)
 
     ex_raw = hosts_cfg.get("extended", []) or []
     if ex_raw:

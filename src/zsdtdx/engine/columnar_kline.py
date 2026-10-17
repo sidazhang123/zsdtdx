@@ -78,16 +78,24 @@ def _page(client, route, code, category, start, kind, qfq):
     kwargs = {"qfq": bool(qfq)} if kind == "stock" else {}
     token = columnar_decode.set(True)
     try:
-        result = pool.call(
-            method,
-            category,
-            int(route["market"]),
-            code,
-            start,
-            size,
-            allow_none=True,
-            **kwargs,
+        host_group = (
+            "szshbj"
+            if source == "std" and int(route["market"]) == 2
+            else "szsh"
+            if source == "std"
+            else "all"
         )
+        with pool.host_scope(host_group):
+            result = pool.call(
+                method,
+                category,
+                int(route["market"]),
+                code,
+                start,
+                size,
+                allow_none=True,
+                **kwargs,
+            )
         if result is None:
             raise ConnectionError(
                 f"{pool.name} 无可用连接：K线页请求重试耗尽，未取得合法回包"

@@ -259,6 +259,58 @@ def test_failover_success_does_not_reduce_host_capacity():
     pool.close()
 
 
+def test_allowed_hosts_share_physical_quota_without_cross_group_routing():
+    """能力过滤只限制候选站，物理站配额仍由同一个控制器状态统一计数。"""
+    controller = AdaptiveConcurrencyController(
+        max_threads=2, chunks_per_lease=1, threads_per_host_std=1
+    )
+    bj_host = ("bj", 7709)
+    szsh_only_host = ("szsh", 7709)
+    controller.update_hosts("std", [bj_host, szsh_only_host])
+    permit = controller.acquire("std", max_units=1, timeout=0, allowed_hosts={bj_host})
+    assert permit.host == bj_host
+    with pytest.raises(TimeoutError):
+        controller.acquire("std", max_units=1, timeout=0, allowed_hosts={bj_host})
+    snapshot = controller.snapshot()["sides"]["std"]
+    assert set(snapshot) == {"bj:7709", "szsh:7709"}
+    controller.release(permit, success=True)
+
+
+def test_beijing_waiter_does_not_block_available_szsh_only_host():
+    """北交候选站满载时，等待队列不会阻塞可使用深沪专用站的后续任务。"""
+    controller = AdaptiveConcurrencyController(
+        max_threads=2, chunks_per_lease=1, threads_per_host_std=1
+    )
+    bj_host = ("bj", 7709)
+    szsh_only_host = ("szsh", 7709)
+    controller.update_hosts("std", [bj_host, szsh_only_host])
+    occupied = controller.acquire(
+        "std", max_units=1, timeout=0, allowed_hosts={bj_host}
+    )
+    waiting_started = threading.Event()
+    waiting_result = {}
+
+    def wait_for_beijing():
+        """输入无，输出无；先登记等待，再在北交配额释放后保存凭证。"""
+        waiting_started.set()
+        waiting_result["permit"] = controller.acquire(
+            "std", max_units=1, timeout=2, allowed_hosts={bj_host}
+        )
+
+    waiter = threading.Thread(target=wait_for_beijing)
+    waiter.start()
+    assert waiting_started.wait(timeout=1)
+    szsh = controller.acquire(
+        "std", max_units=1, timeout=0.5, allowed_hosts={bj_host, szsh_only_host}
+    )
+    assert szsh.host == szsh_only_host
+    controller.release(szsh, success=True)
+    controller.release(occupied, success=True)
+    waiter.join(timeout=2)
+    assert waiting_result["permit"].host == bj_host
+    controller.release(waiting_result["permit"], success=True)
+
+
 def iterator_fixture(monkeypatch, execute, workers=2, timeout=0.1):
     """输入可控执行体，输出真实线程运行时及抓取器；禁用公网探测。"""
     from zsdtdx.engine import parallel_fetcher as pf

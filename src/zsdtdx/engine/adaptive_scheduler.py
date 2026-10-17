@@ -149,7 +149,7 @@ class AdaptiveConcurrencyController:
         self._side_thread_budget = {"std": 0, "ex": 0}
         self._side_inflight = {"std": 0, "ex": 0}
         self._next_ticket = 1
-        self._waiting_tickets: Dict[str, list[int]] = {"std": [], "ex": []}
+        self._waiting_tickets: Dict[Tuple[str, Any], list[int]] = {}
         self._active_permits: Dict[int, AdaptivePermit] = {}
         self._inflight_threads = 0
         self._round_robin_cursor = {"std": 0, "ex": 0}
@@ -270,7 +270,12 @@ class AdaptiveConcurrencyController:
             state.cooldown_until = 0.0
 
     def _select_host_with_capacity(
-        self, source: str, max_units: int, now: float, preferred_host=None
+        self,
+        source: str,
+        max_units: int,
+        now: float,
+        preferred_host=None,
+        allowed_hosts: Optional[set[HostTuple]] = None,
     ) -> Optional[Tuple[_HostWindow, int]]:
         """输入路由、需求和时间，输出可分配 host 及槽位数；无容量返回 None。"""
         states = list(self._hosts[source].values())
@@ -279,6 +284,8 @@ class AdaptiveConcurrencyController:
         start = int(self._round_robin_cursor[source]) % len(states)
         ordered = states[start:] + states[:start]
         for offset, state in enumerate(ordered):
+            if allowed_hosts is not None and state.host not in allowed_hosts:
+                continue
             if preferred_host is not None and state.host != preferred_host:
                 continue
             if not bool(state.selectable):
@@ -293,7 +300,9 @@ class AdaptiveConcurrencyController:
             return state, units
         return None
 
-    def _side_may_progress_locked(self, source: str) -> bool:
+    def _side_may_progress_locked(
+        self, source: str, allowed_hosts: Optional[set[HostTuple]] = None
+    ) -> bool:
         """
         输入侧名，输出该侧继续等待是否还有机会获批。
 
@@ -301,6 +310,8 @@ class AdaptiveConcurrencyController:
         边界：调用方必须已持有控制器锁。
         """
         for state in self._hosts[source].values():
+            if allowed_hosts is not None and state.host not in allowed_hosts:
+                continue
             if bool(state.selectable) or int(state.thread_inflight) > 0:
                 return True
         return False
@@ -312,9 +323,10 @@ class AdaptiveConcurrencyController:
         max_units: int,
         timeout: Optional[float] = None,
         preferred_host=None,
+        allowed_hosts: Optional[Iterable[Any]] = None,
     ) -> AdaptivePermit:
         """
-        按本侧 FIFO 获取一个线程准入凭证。
+        按本侧同一候选地址集合 FIFO 获取一个线程准入凭证。
 
         输入：
         1. source: std/ex。
@@ -325,6 +337,11 @@ class AdaptiveConcurrencyController:
         timeout 为 None 抛 RuntimeError，有限超时抛 TimeoutError。
         """
         source_key = _normalize_source(source)
+        allowed_set = None
+        if allowed_hosts is not None:
+            allowed_set = {_normalize_host(item) for item in allowed_hosts}
+            if not allowed_set:
+                raise RuntimeError(f"{source_key} 路由没有可用 host")
         deadline = (
             None if timeout is None else time.monotonic() + max(0.0, float(timeout))
         )
@@ -333,17 +350,21 @@ class AdaptiveConcurrencyController:
                 raise RuntimeError(f"{source_key} 无可达 host，无法调度")
             ticket = int(self._next_ticket)
             self._next_ticket += 1
-            self._waiting_tickets[source_key].append(ticket)
+            queue_key = (
+                source_key,
+                None if allowed_set is None else frozenset(allowed_set),
+            )
+            waiting = self._waiting_tickets.setdefault(queue_key, [])
+            waiting.append(ticket)
             try:
                 while True:
                     now = time.monotonic()
                     if not self._hosts[
                         source_key
-                    ] or not self._side_may_progress_locked(source_key):
+                    ] or not self._side_may_progress_locked(source_key, allowed_set):
                         if deadline is None:
                             raise RuntimeError(f"{source_key} 无可达 host，无法调度")
                         raise TimeoutError(f"{source_key} 自适应调度准入等待超时")
-                    waiting = self._waiting_tickets[source_key]
                     is_head = bool(waiting and int(waiting[0]) == ticket)
                     selected = None
                     side_budget = int(self._side_thread_budget[source_key])
@@ -353,11 +374,17 @@ class AdaptiveConcurrencyController:
                         and self._side_inflight[source_key] < side_budget
                     ):
                         selected = self._select_host_with_capacity(
-                            source_key, max_units, now, preferred_host
+                            source_key,
+                            max_units,
+                            now,
+                            preferred_host,
+                            allowed_set,
                         )
                     if selected is not None:
                         state, units = selected
                         waiting.pop(0)
+                        if not waiting:
+                            self._waiting_tickets.pop(queue_key, None)
                         state.thread_inflight += 1
                         self._side_inflight[source_key] += 1
                         self._inflight_threads += 1
@@ -380,13 +407,16 @@ class AdaptiveConcurrencyController:
                         cooldowns = [
                             state.cooldown_until
                             for state in self._hosts[source_key].values()
+                            if allowed_set is None or state.host in allowed_set
                             if state.cooldown_until > now
                         ]
                         wait_for = max(0.05, min(cooldowns) - now) if cooldowns else 0.5
                     self._condition.wait(timeout=wait_for)
             except Exception:
-                if ticket in self._waiting_tickets[source_key]:
-                    self._waiting_tickets[source_key].remove(ticket)
+                if ticket in waiting:
+                    waiting.remove(ticket)
+                    if not waiting:
+                        self._waiting_tickets.pop(queue_key, None)
                     self._condition.notify_all()
                 raise
 
@@ -461,7 +491,7 @@ class AdaptiveConcurrencyController:
             self._hosts = {"std": {}, "ex": {}}
             self._side_thread_budget = {"std": 0, "ex": 0}
             self._side_inflight = {"std": 0, "ex": 0}
-            self._waiting_tickets = {"std": [], "ex": []}
+            self._waiting_tickets = {}
             self._active_permits.clear()
             self._inflight_threads = 0
             self._round_robin_cursor = {"std": 0, "ex": 0}

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-钉死当前 config.yaml hosts.standard 各站，对比同一已收盘 A 股 15 分钟 K 线是否跨站不一致。
+钉死当前 config.yaml 两个标准行情能力组，对比同一已收盘 A 股 15 分钟 K 线是否跨站不一致。
 
 边界：
 1. 直连 TdxHq_API，不走连接池轮换。
@@ -75,7 +75,11 @@ def _load_std_hosts() -> List[Tuple[str, int]]:
     """读取包内标准行情 host 列表。"""
     raw = yaml.safe_load((_SRC / "zsdtdx" / "config.yaml").read_text(encoding="utf-8"))
     out: List[Tuple[str, int]] = []
-    for item in ((raw.get("hosts") or {}).get("standard") or []):
+    standard = ((raw.get("hosts") or {}).get("standard")) or {}
+    host_items = list(standard.get("szshbj") or []) + list(
+        standard.get("szsh_only") or []
+    )
+    for item in host_items:
         text = str(item).strip()
         if ":" not in text:
             continue

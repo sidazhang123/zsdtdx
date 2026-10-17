@@ -110,7 +110,10 @@ def _hosts_from_yaml(path: Path) -> Tuple[List[Tuple[str, int]], List[Tuple[str,
     with open(path, "r", encoding="utf-8") as fp:
         cfg = yaml.safe_load(fp) or {}
     hosts_cfg = cfg.get("hosts", {}) or {}
-    std = normalize_hosts_entries(hosts_cfg.get("standard", []))
+    standard_cfg = hosts_cfg.get("standard", {}) or {}
+    std = normalize_hosts_entries(
+        list(standard_cfg.get("szshbj", [])) + list(standard_cfg.get("szsh_only", []))
+    )
     ex_raw = hosts_cfg.get("extended", []) or []
     ex = normalize_hosts_entries(ex_raw) if ex_raw else []
     return std, ex
@@ -142,7 +145,7 @@ def _probed_standard_hosts(probe_rounds: List[Dict[str, Any]]) -> set[Tuple[str,
     """汇总 mock 探测记录中的 standard 地址集合。"""
     out: set[Tuple[str, int]] = set()
     for item in probe_rounds:
-        if item.get("pool") == "standard":
+        if str(item.get("pool", "")).startswith("standard"):
             out.update(item.get("hosts") or [])
     return out
 
@@ -265,7 +268,10 @@ def custom_yaml_a(tmp_path: Path) -> Path:
     """与包内 config 明显不同的自定义 yaml A。"""
     cfg = {
         "hosts": {
-            "standard": ["10.10.10.1:7709", "10.10.10.2:7709", "10.10.10.3:7709"],
+            "standard": {
+                "szshbj": ["10.10.10.1:7709", "10.10.10.2:7709"],
+                "szsh_only": ["10.10.10.3:7709"],
+            },
             "extended": ["10.10.20.1:7720"],
         },
         "pool": {"probe_timeout": 0.01, "connect_timeout": 1.0, "max_retry": 1},
@@ -330,7 +336,7 @@ class TestConfigYamlDrivesConnectionHosts:
         assert probe_after_default >= 1, "首次使用默认配置应触发至少一次探测"
         probed_std_default = set()
         for item in probe_rounds:
-            if item["pool"] == "standard":
+            if str(item["pool"]).startswith("standard"):
                 probed_std_default.update(item["hosts"])
         assert probed_std_default == pkg_std_set, (
             "探测输入应来自包内 config.yaml 的 standard 列表"
@@ -374,7 +380,7 @@ class TestConfigYamlDrivesConnectionHosts:
 
         probed_std_custom = set()
         for item in probe_rounds:
-            if item["pool"] == "standard":
+            if str(item["pool"]).startswith("standard"):
                 probed_std_custom.update(item["hosts"])
         assert custom_std_set.issubset(probed_std_custom), (
             "set_config_path 后探测输入须包含自定义 yaml 的 standard 地址"
@@ -707,7 +713,7 @@ class TestAllKlineApiEntryPoints:
         assert pf._active_config_path is None
         probed = set()
         for item in probe_rounds:
-            if item["pool"] == "standard":
+            if str(item["pool"]).startswith("standard"):
                 probed.update(item["hosts"])
         # 串行模式下可能不触发 probe；若触发则须来自包内 config
         if probed:

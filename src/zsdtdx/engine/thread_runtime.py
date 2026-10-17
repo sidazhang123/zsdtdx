@@ -53,6 +53,13 @@ class LeasedFailoverPool(PersistentFailoverPool):
         self._idle = {host: [] for host in self.hosts}
         self._closed = False
         self.peer = None
+        self.configure_host_groups(
+            {
+                name: list(hosts)
+                for name, hosts in getattr(original, "host_groups", {}).items()
+                if name != "all"
+            }
+        )
 
     def _get_thread_data(self):
         """输入无，输出常驻工作线程的连接状态；注册只做一次，销毁时统一回收。"""
@@ -100,12 +107,15 @@ class LeasedFailoverPool(PersistentFailoverPool):
         self.release_thread(success=False, discard=True)
         check_deadline()
         host = self.hosts[index]
+        if host not in self._eligible_host_set():
+            return False
         try:
             permit = self.controller.acquire(
                 self.source,
                 max_units=1,
                 timeout=min(remaining(), 0.25),
                 preferred_host=host,
+                allowed_hosts=self._eligible_host_set(),
             )
         except TimeoutError:
             return False
@@ -154,10 +164,19 @@ class LeasedFailoverPool(PersistentFailoverPool):
         if self.peer is not None:
             self.peer.release_thread()
         if self._get_thread_data().get("api") is not None:
-            return True
-        for _ in self.hosts:
+            data = self._get_thread_data()
+            active_index = int(data.get("active_index", -1))
+            if 0 <= active_index < len(self.hosts):
+                if self.hosts[active_index] in self._eligible_host_set():
+                    return True
+            self.release_thread(success=True)
+        eligible = self._eligible_host_set()
+        for _ in eligible:
             permit = self.controller.acquire(
-                self.source, max_units=1, timeout=remaining()
+                self.source,
+                max_units=1,
+                timeout=remaining(),
+                allowed_hosts=eligible,
             )
             if self._install_connection(permit):
                 return True

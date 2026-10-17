@@ -24,7 +24,10 @@ from zsdtdx.engine.unified_client import (
 def _minimal_cfg(std_hosts=None, ex_hosts=None):
     std_hosts = std_hosts or ["1.1.1.1:7709"]
     cfg = {
-        "hosts": {"standard": std_hosts, "extended": ex_hosts or []},
+        "hosts": {
+            "standard": {"szshbj": std_hosts, "szsh_only": []},
+            "extended": ex_hosts or [],
+        },
         "pool": {"probe_timeout": 0.01},
     }
     return cfg
@@ -56,6 +59,7 @@ def test_cache_usable_requires_fingerprint_and_nonempty():
     fp = compute_hosts_fingerprint(std, ex)
     with uc._probe_result_cache_lock:
         uc._probe_result_cache["standard"] = list(std)
+        uc._probe_result_cache["standard_szshbj"] = list(std)
         uc._last_tcp_probe_hosts_fingerprint = fp
     assert _cache_usable_for_cfg(cfg)
 
@@ -66,6 +70,7 @@ def test_cache_unusable_when_fingerprint_changes():
     fp_a = compute_hosts_fingerprint(std_a, [])
     with uc._probe_result_cache_lock:
         uc._probe_result_cache["standard"] = list(std_a)
+        uc._probe_result_cache["standard_szshbj"] = list(std_a)
         uc._last_tcp_probe_hosts_fingerprint = fp_a
     assert _cache_usable_for_cfg(cfg_a)
 
@@ -80,6 +85,7 @@ def test_ensure_skips_when_cache_usable(mock_probe):
     fp = compute_hosts_fingerprint(std, [])
     with uc._probe_result_cache_lock:
         uc._probe_result_cache["standard"] = list(std)
+        uc._probe_result_cache["standard_szshbj"] = list(std)
         uc._last_tcp_probe_hosts_fingerprint = fp
 
     result = _ensure_availability_hosts_cache(cfg=cfg, force=False)
@@ -202,6 +208,66 @@ def test_config_yaml_no_probe_on_init():
     cfg_path = Path(__file__).resolve().parents[1] / "src" / "zsdtdx" / "config.yaml"
     text = cfg_path.read_text(encoding="utf-8")
     assert "probe_on_init" not in text
+
+
+def test_default_standard_groups_isolate_fufeng_from_beijing():
+    """默认配置把三个富丰站仅放入深沪组，北交能力组不包含它们。"""
+    cfg_path = Path(__file__).resolve().parents[1] / "src" / "zsdtdx" / "config.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    standard = cfg["hosts"]["standard"]
+    fufeng = {
+        "1.202.143.37:7709",
+        "111.203.134.118:7709",
+        "117.133.128.226:7709",
+    }
+    assert fufeng == set(standard["szsh_only"])
+    assert fufeng.isdisjoint(standard["szshbj"])
+
+
+@patch("zsdtdx.engine.unified_client._tcp_probe_and_trim_available_hosts")
+def test_standard_groups_probe_separately_and_keep_union(mock_probe):
+    """两组独立探测并在物理池保序合并，能力边界不会被探测结果抹平。"""
+    mock_probe.side_effect = lambda hosts, timeout, fallback, name: list(hosts)
+    cfg = {
+        "hosts": {
+            "standard": {
+                "szshbj": ["1.1.1.1:7709"],
+                "szsh_only": ["2.2.2.2:7709"],
+            },
+            "extended": [],
+        },
+        "pool": {"probe_timeout": 0.01},
+    }
+    _ensure_availability_hosts_cache(cfg=cfg, force=True)
+    cache = get_probe_result_cache()
+    assert cache["standard_szshbj"] == [("1.1.1.1", 7709)]
+    assert cache["standard_szsh_only"] == [("2.2.2.2", 7709)]
+    assert cache["standard"] == [("1.1.1.1", 7709), ("2.2.2.2", 7709)]
+
+
+@patch("zsdtdx.engine.unified_client._tcp_probe_and_trim_available_hosts")
+def test_standard_groups_probe_concurrently(mock_probe):
+    """两个非空标准能力组并行探测，首次启动不会串行叠加两组超时。"""
+    barrier = threading.Barrier(2)
+
+    def synchronized_probe(hosts, timeout, fallback, name):
+        """输入探测参数，输出原地址；两组必须同时进入才可通过屏障。"""
+        barrier.wait(timeout=1)
+        return list(hosts)
+
+    mock_probe.side_effect = synchronized_probe
+    cfg = {
+        "hosts": {
+            "standard": {
+                "szshbj": ["1.1.1.1:7709"],
+                "szsh_only": ["2.2.2.2:7709"],
+            },
+            "extended": [],
+        },
+        "pool": {"probe_timeout": 0.01},
+    }
+    _ensure_availability_hosts_cache(cfg=cfg, force=True)
+    assert barrier.n_waiting == 0
 
 
 def _fake_probe_latency_map(latency_by_host):

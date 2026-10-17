@@ -26,10 +26,10 @@ def test_deep_merge_overrides_leaf_keeps_sibling():
 
 
 def test_deep_merge_list_full_replace():
-    base = {"hosts": {"standard": ["1.1.1.1:7709", "2.2.2.2:7709"]}}
-    overlay = {"hosts": {"standard": ["9.9.9.9:7709"]}}
+    base = {"hosts": {"standard": {"szshbj": ["1.1.1.1:7709", "2.2.2.2:7709"]}}}
+    overlay = {"hosts": {"standard": {"szshbj": ["9.9.9.9:7709"]}}}
     merged = _deep_merge_config_overlay(base, overlay)
-    assert merged["hosts"]["standard"] == ["9.9.9.9:7709"]
+    assert merged["hosts"]["standard"]["szshbj"] == ["9.9.9.9:7709"]
 
 
 def test_load_merged_default_path_equals_builtin():

@@ -283,7 +283,7 @@ def test_side_specific_probe_does_not_touch_other_pool(monkeypatch):
     monkeypatch.setattr(uc, "_tcp_probe_and_trim_available_hosts", _fake_trim)
     cfg = {
         "hosts": {
-            "standard": ["1.1.1.1:7709"],
+            "standard": {"szshbj": ["1.1.1.1:7709"], "szsh_only": []},
             "extended": ["2.2.2.2:7720"],
         },
         "pool": {"probe_timeout": 0.01},

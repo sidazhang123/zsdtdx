@@ -257,14 +257,16 @@ def normalize_hosts_entries(hosts: List[Any]) -> List[Tuple[str, int]]:
 def compute_hosts_fingerprint(
     std_hosts: List[Tuple[str, int]],
     ex_hosts: List[Tuple[str, int]],
-) -> Tuple[Tuple[Tuple[str, int], ...], Tuple[Tuple[str, int], ...]]:
+    std_groups: Optional[Dict[str, List[Tuple[str, int]]]] = None,
+) -> Tuple[Any, ...]:
     """
     计算 standard / extended 地址集合指纹（与 YAML 列表顺序无关）。
 
     输入：
     1. std_hosts / ex_hosts: 已规范化的 (host, port) 列表。
+    2. std_groups: 标准行情能力分组；为空时全部标准地址视为 `szshbj`。
     输出：
-    1. 二元组 (standard 排序元组, extended 排序元组)，用于判断集合是否变化。
+    1. 含物理池及两个标准能力组排序元组的指纹，用于判断集合或分组是否变化。
     用途：
     1. 仅在地址集合变化时重新执行 TCP 全池探测。
     边界条件：
@@ -272,7 +274,14 @@ def compute_hosts_fingerprint(
     """
     std_key = tuple(sorted((str(h).strip(), int(p)) for h, p in std_hosts))
     ex_key = tuple(sorted((str(h).strip(), int(p)) for h, p in ex_hosts))
-    return (std_key, ex_key)
+    groups = std_groups or {"szshbj": std_hosts, "szsh_only": []}
+    szshbj_key = tuple(
+        sorted((str(h).strip(), int(p)) for h, p in groups.get("szshbj", []))
+    )
+    szsh_only_key = tuple(
+        sorted((str(h).strip(), int(p)) for h, p in groups.get("szsh_only", []))
+    )
+    return (std_key, ex_key, szshbj_key, szsh_only_key)
 
 
 # 短地址池阈值：配置侧 hosts 长度 ≤ 该值时，探测后只剔不可达，不再去掉最慢节点。
@@ -395,9 +404,7 @@ def _tcp_probe_and_trim_available_hosts(
 # ---------------------------------------------------------------------------
 _probe_result_cache: Dict[str, List[Tuple[str, int]]] = {}
 _probe_result_cache_lock = threading.Lock()
-_last_tcp_probe_hosts_fingerprint: Optional[
-    Tuple[Tuple[Tuple[str, int], ...], Tuple[Tuple[str, int], ...]]
-] = None
+_last_tcp_probe_hosts_fingerprint: Optional[Tuple[Any, ...]] = None
 _ensure_availability_lock = threading.Lock()
 _ensure_inflight_event = threading.Event()
 _ensure_inflight_event.set()
@@ -408,7 +415,7 @@ def get_probe_result_cache() -> Dict[str, List[Tuple[str, int]]]:
     返回当前进程 TCP 探测排序结果快照。
 
     输入：无。
-    输出：含 standard/extended 列表副本的字典。
+    输出：含 standard、两个标准能力组及 extended 列表副本的字典。
     边界条件：未写入过时可能缺少 key 或为空列表。
     """
     with _probe_result_cache_lock:
@@ -429,7 +436,8 @@ def _normalize_hosts_from_cfg(
     1. standard 无效或为空时抛出 ValueError。
     """
     hosts_cfg = cfg.get("hosts", {}) or {}
-    std_hosts = normalize_hosts_entries(hosts_cfg.get("standard", []))
+    std_groups = _normalize_standard_host_groups_from_cfg(cfg)
+    std_hosts = _deduplicate_hosts(std_groups["szshbj"] + std_groups["szsh_only"])
     ex_raw = hosts_cfg.get("extended", []) or []
     if not ex_raw:
         ex_hosts: List[Tuple[str, int]] = []
@@ -439,6 +447,41 @@ def _normalize_hosts_from_cfg(
         except ValueError:
             ex_hosts = []
     return std_hosts, ex_hosts
+
+
+def _deduplicate_hosts(hosts: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+    """输入地址序列，输出保序去重列表；空输入返回空列表。"""
+    result: List[Tuple[str, int]] = []
+    seen: set[Tuple[str, int]] = set()
+    for host in hosts:
+        item = (str(host[0]).strip(), int(host[1]))
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def _normalize_standard_host_groups_from_cfg(
+    cfg: Dict[str, Any],
+) -> Dict[str, List[Tuple[str, int]]]:
+    """
+    输入完整配置，输出标准行情能力分组。
+
+    `szshbj` 支持深沪北，`szsh_only` 仅支持深沪；`szsh_only` 可为空，
+    `szshbj` 必须至少包含一个合法地址，确保北交所路由始终有确定落点。
+    """
+    hosts_cfg = cfg.get("hosts", {}) or {}
+    standard_cfg = hosts_cfg.get("standard", {}) or {}
+    if not isinstance(standard_cfg, dict):
+        raise ValueError("hosts.standard 必须包含 szshbj 与 szsh_only 分组")
+    groups: Dict[str, List[Tuple[str, int]]] = {}
+    for name in ("szshbj", "szsh_only"):
+        raw = standard_cfg.get(name, []) or []
+        groups[name] = normalize_hosts_entries(raw) if raw else []
+    if not groups["szshbj"]:
+        raise ValueError("hosts.standard.szshbj 至少需要一个合法地址")
+    return groups
 
 
 def _cache_usable_for_cfg(cfg: Dict[str, Any]) -> bool:
@@ -453,11 +496,14 @@ def _cache_usable_for_cfg(cfg: Dict[str, Any]) -> bool:
     1. 配置侧为空的池不要求缓存项；指纹不一致视为不可用。
     """
     std_hosts, ex_hosts = _normalize_hosts_from_cfg(cfg)
-    fp_new = compute_hosts_fingerprint(std_hosts, ex_hosts)
+    std_groups = _normalize_standard_host_groups_from_cfg(cfg)
+    fp_new = compute_hosts_fingerprint(std_hosts, ex_hosts, std_groups)
     with _probe_result_cache_lock:
         if _last_tcp_probe_hosts_fingerprint != fp_new:
             return False
         if std_hosts and not _probe_result_cache.get("standard"):
+            return False
+        if std_groups["szshbj"] and not _probe_result_cache.get("standard_szshbj"):
             return False
         if ex_hosts and not _probe_result_cache.get("extended"):
             return False
@@ -476,7 +522,8 @@ def _cache_sources_usable_for_cfg(
     if not sources:
         return True
     std_hosts, ex_hosts = _normalize_hosts_from_cfg(cfg)
-    fp_new = compute_hosts_fingerprint(std_hosts, ex_hosts)
+    std_groups = _normalize_standard_host_groups_from_cfg(cfg)
+    fp_new = compute_hosts_fingerprint(std_hosts, ex_hosts, std_groups)
     with _probe_result_cache_lock:
         if _last_tcp_probe_hosts_fingerprint != fp_new:
             return False
@@ -484,6 +531,12 @@ def _cache_sources_usable_for_cfg(
             "standard" in sources
             and std_hosts
             and not _probe_result_cache.get("standard")
+        ):
+            return False
+        if (
+            "standard" in sources
+            and std_groups["szshbj"]
+            and not _probe_result_cache.get("standard_szshbj")
         ):
             return False
         if (
@@ -502,6 +555,7 @@ def _probe_trim_and_write_availability_cache(
     required_sources: Optional[set[str]] = None,
     *,
     parallel_probe: bool = True,
+    std_groups: Optional[Dict[str, List[Tuple[str, int]]]] = None,
 ) -> Dict[str, List[Tuple[str, int]]]:
     """
     对 std/ex 执行 TCP 探测裁剪并写入 `_probe_result_cache`。
@@ -509,29 +563,63 @@ def _probe_trim_and_write_availability_cache(
     输入：
     1. std_hosts / ex_hosts: 配置侧规范化地址。
     2. probe_timeout: 单地址探测超时（秒）。
+    3. std_groups: 标准行情能力分组；两组并发探测以避免启动墙钟叠加。
     输出：
-    1. 写入后的 standard/extended 列表字典。
+    1. 写入后的物理池、标准能力组和 extended 列表字典。
     边界条件：
     1. 某池配置为空则跳过探测，缓存中不写该 key。
     """
     global _last_tcp_probe_hosts_fingerprint
 
     sources = required_sources or {"standard", "extended"}
+    groups = std_groups or {"szshbj": std_hosts, "szsh_only": []}
+    std_group_trimmed: Dict[str, List[Tuple[str, int]]] = {
+        "szshbj": [],
+        "szsh_only": [],
+    }
     std_trimmed: List[Tuple[str, int]] = []
     ex_trimmed: List[Tuple[str, int]] = []
     if std_hosts and "standard" in sources:
-        if parallel_probe:
-            std_trimmed = _tcp_probe_and_trim_available_hosts(
-                std_hosts, probe_timeout, std_hosts, "standard"
-            )
+        active_groups = [
+            (group_name, list(groups.get(group_name) or []))
+            for group_name in ("szshbj", "szsh_only")
+            if groups.get(group_name)
+        ]
+        if parallel_probe and len(active_groups) > 1:
+            # 两个能力组同时探测，启动墙钟不叠加；物理地址后续仍保序合并并统一计配额。
+            with _ThreadPoolExecutor(max_workers=len(active_groups)) as executor:
+                futures = {
+                    group_name: executor.submit(
+                        _tcp_probe_and_trim_available_hosts,
+                        group_hosts,
+                        probe_timeout,
+                        group_hosts,
+                        f"standard.{group_name}",
+                    )
+                    for group_name, group_hosts in active_groups
+                }
+                for group_name, _group_hosts in active_groups:
+                    std_group_trimmed[group_name] = futures[group_name].result()
         else:
-            std_trimmed = _tcp_probe_and_trim_available_hosts(
-                std_hosts,
-                probe_timeout,
-                std_hosts,
-                "standard",
-                parallel=False,
-            )
+            for group_name, group_hosts in active_groups:
+                if parallel_probe:
+                    std_group_trimmed[group_name] = _tcp_probe_and_trim_available_hosts(
+                        group_hosts,
+                        probe_timeout,
+                        group_hosts,
+                        f"standard.{group_name}",
+                    )
+                else:
+                    std_group_trimmed[group_name] = _tcp_probe_and_trim_available_hosts(
+                        group_hosts,
+                        probe_timeout,
+                        group_hosts,
+                        f"standard.{group_name}",
+                        parallel=False,
+                    )
+        std_trimmed = _deduplicate_hosts(
+            std_group_trimmed["szshbj"] + std_group_trimmed["szsh_only"]
+        )
     if ex_hosts and "extended" in sources:
         if parallel_probe:
             ex_trimmed = _tcp_probe_and_trim_available_hosts(
@@ -545,12 +633,18 @@ def _probe_trim_and_write_availability_cache(
                 "extended",
                 parallel=False,
             )
-    fp_new = compute_hosts_fingerprint(std_hosts, ex_hosts)
+    fp_new = compute_hosts_fingerprint(std_hosts, ex_hosts, groups)
     with _probe_result_cache_lock:
         if std_trimmed and "standard" in sources:
             _probe_result_cache["standard"] = list(std_trimmed)
+            _probe_result_cache["standard_szshbj"] = list(std_group_trimmed["szshbj"])
+            _probe_result_cache["standard_szsh_only"] = list(
+                std_group_trimmed["szsh_only"]
+            )
         elif not std_hosts and "standard" in sources:
             _probe_result_cache.pop("standard", None)
+            _probe_result_cache.pop("standard_szshbj", None)
+            _probe_result_cache.pop("standard_szsh_only", None)
         if ex_trimmed and "extended" in sources:
             _probe_result_cache["extended"] = list(ex_trimmed)
         elif not ex_hosts and "extended" in sources:
@@ -558,6 +652,8 @@ def _probe_trim_and_write_availability_cache(
         _last_tcp_probe_hosts_fingerprint = fp_new
     return {
         "standard": list(std_trimmed),
+        "standard_szshbj": list(std_group_trimmed["szshbj"]),
+        "standard_szsh_only": list(std_group_trimmed["szsh_only"]),
         "extended": list(ex_trimmed),
     }
 
@@ -659,12 +755,14 @@ def _ensure_availability_hosts_cache(
         pool_cfg = loaded_cfg.get("pool", {}) or {}
         probe_timeout = float(pool_cfg.get("probe_timeout", 0.8))
         std_hosts, ex_hosts = _normalize_hosts_from_cfg(loaded_cfg)
+        std_groups = _normalize_standard_host_groups_from_cfg(loaded_cfg)
         trimmed = _probe_trim_and_write_availability_cache(
             std_hosts,
             ex_hosts,
             probe_timeout,
             required_sources=sources,
             parallel_probe=parallel_probe,
+            std_groups=std_groups,
         )
         return {
             "skipped": False,
@@ -713,7 +811,7 @@ def resolve_presorted_hosts_for_connection(
     2. presorted_hosts: 调用方已有的地址排序快照。
     3. sync_if_missing: True 时缓存不可用则调用 ensure；False 时不可用则抛错。
     输出：
-    1. 含 standard/extended 列表的字典（副本）。
+    1. 含 standard、两个标准能力组与 extended 列表的字典（副本）。
     用途：
     1. UnifiedTdxClient 与共享线程运行时建连前统一取址。
     边界条件：
@@ -723,6 +821,8 @@ def resolve_presorted_hosts_for_connection(
         presorted_map = dict(presorted_hosts or {})
         return {
             "standard": list(presorted_map.get("standard") or []),
+            "standard_szshbj": list(presorted_map.get("standard_szshbj") or []),
+            "standard_szsh_only": list(presorted_map.get("standard_szsh_only") or []),
             "extended": list(presorted_map.get("extended") or []),
         }
 
@@ -735,6 +835,8 @@ def resolve_presorted_hosts_for_connection(
         cache = get_probe_result_cache()
         return {
             "standard": list(cache.get("standard") or []),
+            "standard_szshbj": list(cache.get("standard_szshbj") or []),
+            "standard_szsh_only": list(cache.get("standard_szsh_only") or []),
             "extended": list(cache.get("extended") or []),
         }
 
@@ -748,6 +850,8 @@ def resolve_presorted_hosts_for_connection(
     cache = get_probe_result_cache()
     return {
         "standard": list(cache.get("standard") or []),
+        "standard_szshbj": list(cache.get("standard_szshbj") or []),
+        "standard_szsh_only": list(cache.get("standard_szsh_only") or []),
         "extended": list(cache.get("extended") or []),
     }
 
@@ -902,6 +1006,11 @@ class PersistentFailoverPool:
         self.hosts = list(hosts)
         self.connect_timeout = float(connect_timeout)
         self.api_kwargs = api_kwargs or {}
+        self.host_groups: Dict[str, set[Tuple[str, int]]] = {
+            "all": set(self.hosts),
+            "szsh": set(self.hosts),
+            "szshbj": set(self.hosts),
+        }
 
         # P0改造：线程本地存储
         self._local = threading.local()
@@ -921,6 +1030,50 @@ class PersistentFailoverPool:
         }
         self._used_hosts_lock = threading.Lock()
         self._global_used_hosts = set()
+
+    def configure_host_groups(self, groups: Dict[str, List[Tuple[str, int]]]) -> None:
+        """输入能力分组，输出无；只保留当前物理池内地址并始终维护 all 组。"""
+        configured: Dict[str, set[Tuple[str, int]]] = {
+            "all": set(self.hosts),
+            "szsh": set(self.hosts),
+            "szshbj": set(self.hosts),
+        }
+        for name, hosts in (groups or {}).items():
+            configured[str(name)] = {
+                (str(host[0]).strip(), int(host[1]))
+                for host in hosts
+                if (str(host[0]).strip(), int(host[1])) in configured["all"]
+            }
+        self.host_groups = configured
+
+    def _eligible_host_set(self) -> set[Tuple[str, int]]:
+        """输入无，输出当前线程允许地址；未设置能力范围时返回全部物理地址。"""
+        data = self._get_thread_data()
+        eligible = data.get("eligible_hosts")
+        return set(self.hosts) if eligible is None else set(eligible)
+
+    @contextmanager
+    def host_scope(self, group_name: str):
+        """
+        输入能力组名，输出上下文；范围内建连、重连和换站只能使用该组地址。
+
+        进入时若当前连接不属于目标组会先断开；未知或空组直接抛错，避免静默越权。
+        """
+        group = str(group_name or "all")
+        allowed = set(self.host_groups.get(group, set()))
+        if not allowed:
+            raise RuntimeError(f"{self.name} host 能力组不可用: {group}")
+        data = self._get_thread_data()
+        previous = data.get("eligible_hosts")
+        data["eligible_hosts"] = allowed
+        active_index = int(data.get("active_index", -1))
+        if 0 <= active_index < len(self.hosts):
+            if self.hosts[active_index] not in allowed:
+                self.reset_thread_connection(reconnect=False)
+        try:
+            yield self
+        finally:
+            data["eligible_hosts"] = previous
 
     def _prune_dead_thread_data(self):
         """
@@ -1060,6 +1213,8 @@ class PersistentFailoverPool:
         if _attempt_aborted():
             return False
         host, port = self.hosts[index]
+        if (host, port) not in self._eligible_host_set():
+            return False
         api = self.api_cls(**self.api_kwargs)
         try:
             ok = api.connect(host, port, time_out=self.connect_timeout)
@@ -1104,9 +1259,13 @@ class PersistentFailoverPool:
         """
         thread_data = self._get_thread_data()
         if thread_data["api"] is not None and thread_data["active_index"] >= 0:
-            return True
+            active_host = self.hosts[int(thread_data["active_index"])]
+            if active_host in self._eligible_host_set():
+                return True
+            self.reset_thread_connection(reconnect=False)
         preferred_index = int(thread_data.get("preferred_index", -1) or -1)
-        indexes = list(range(len(self.hosts)))
+        allowed = self._eligible_host_set()
+        indexes = [index for index, host in enumerate(self.hosts) if host in allowed]
         if 0 <= preferred_index < len(indexes):
             indexes.remove(preferred_index)
             indexes.insert(0, preferred_index)
@@ -1703,11 +1862,24 @@ class UnifiedTdxClient:
             sync_if_missing=not bool(shared_runtime_client),
         )
         std_list = list(resolved_hosts.get("standard") or [])
+        std_szshbj = list(resolved_hosts.get("standard_szshbj") or [])
+        std_szsh_only = list(resolved_hosts.get("standard_szsh_only") or [])
         ex_list = list(resolved_hosts.get("extended") or [])
         if not std_list:
-            std_list = self._normalize_hosts(
-                self.config.get("hosts", {}).get("standard", [])
-            )
+            configured_groups = _normalize_standard_host_groups_from_cfg(self.config)
+            std_szshbj = list(configured_groups["szshbj"])
+            std_szsh_only = list(configured_groups["szsh_only"])
+            std_list = _deduplicate_hosts(std_szshbj + std_szsh_only)
+        if not std_szshbj:
+            configured_groups = _normalize_standard_host_groups_from_cfg(self.config)
+            std_szshbj = [
+                host for host in configured_groups["szshbj"] if host in std_list
+            ]
+            std_szsh_only = [
+                host for host in configured_groups["szsh_only"] if host in std_list
+            ]
+            if not std_szshbj:
+                std_szshbj = list(std_list)
         if not ex_list:
             ex_raw = self.config.get("hosts", {}).get("extended", []) or []
             if ex_raw:
@@ -1719,6 +1891,13 @@ class UnifiedTdxClient:
             std_list,
             connect_timeout,
             api_kwargs=api_kwargs,
+        )
+        self.std_pool.configure_host_groups(
+            {
+                "szshbj": std_szshbj,
+                "szsh_only": std_szsh_only,
+                "szsh": std_list,
+            }
         )
         self.ex_pool = PersistentFailoverPool(
             "extended",
@@ -1741,6 +1920,8 @@ class UnifiedTdxClient:
         self._shared_runtime_client_flag = bool(shared_runtime_client)
         self._presorted_hosts_snapshot: Dict[str, List[Tuple[str, int]]] = {
             "standard": list(self.std_pool.hosts),
+            "standard_szshbj": list(std_szshbj),
+            "standard_szsh_only": list(std_szsh_only),
             "extended": list(self.ex_pool.hosts),
         }
         # chunk 级 2D 分区缓存（(code|index_name, freq) → 分区）；股票/指数共用
@@ -1821,7 +2002,18 @@ class UnifiedTdxClient:
         边界条件：
         1. 固定 allow_none=True；重试逻辑仅在 pool.call 内实现一次。
         """
-        return pool.call(method_name, *args, allow_none=True, **kwargs)
+        std_pool = getattr(self, "std_pool", None)
+        host_group = "all"
+        if pool is std_pool and method_name in {
+            "get_security_bars",
+            "get_index_bars",
+            "get_block_bars",
+        }:
+            market = int(args[1]) if len(args) > 1 else -1
+            host_group = "szshbj" if market == 2 else "szsh"
+        scope = pool.host_scope(host_group) if pool is std_pool else nullcontext()
+        with scope:
+            return pool.call(method_name, *args, allow_none=True, **kwargs)
 
     def _to_datetime(self, value: Any) -> pd.Timestamp:
         """输入时间值，输出 Timestamp；用于统一过滤；非法时间抛错。"""
@@ -4443,13 +4635,15 @@ class UnifiedTdxClient:
         for market in self._std_catalog_markets():
             start = 0
             while True:
-                page = self.std_pool.call(
-                    "get_security_list",
-                    market,
-                    start,
-                    security_page,
-                    allow_none=True,
-                )
+                host_group = "szshbj" if int(market) == 2 else "szsh"
+                with self.std_pool.host_scope(host_group):
+                    page = self.std_pool.call(
+                        "get_security_list",
+                        market,
+                        start,
+                        security_page,
+                        allow_none=True,
+                    )
                 if page is None:
                     raise RuntimeError(
                         f"标准行情码表分页失败: market={market}, start={start}"
@@ -6483,10 +6677,15 @@ class UnifiedTdxClient:
         # 北交所行情路由为 market=2，但 F10 目录/正文需走 market=0。
         market = self._company_info_protocol_market(route)
         category_filter = self._normalize_category_filter(category)
-        raw_hosts = getattr(self.std_pool, "hosts", None)
-        host_count = (
-            len(raw_hosts) if isinstance(raw_hosts, (list, tuple)) and raw_hosts else 1
-        )
+        host_group = "szshbj" if self._route_scope(route) == "bj" else "szsh"
+        configured_groups = getattr(self.std_pool, "host_groups", {})
+        if isinstance(configured_groups, dict) and host_group in configured_groups:
+            eligible_hosts = list(configured_groups.get(host_group) or [])
+        else:
+            eligible_hosts = list(getattr(self.std_pool, "hosts", []) or [])
+        eligible_hosts.sort(key=lambda item: self.std_pool.hosts.index(item))
+        if not eligible_hosts:
+            raise RuntimeError(f"standard host 能力组不可用: {host_group}")
         # 这些状态说明当前站的文件没有按目录读完，换站后必须重拉目录。
         retry_status = {
             "none_terminated",
@@ -6498,9 +6697,9 @@ class UnifiedTdxClient:
         last_attempt: Optional[Tuple[List[Dict[str, Any]], List[str], set]] = None
         last_error: Optional[Exception] = None
 
-        for attempt in range(int(host_count)):
-            if attempt > 0 and not self.std_pool.rotate_thread_host():
-                break
+        for bind_target in eligible_hosts:
+            if not self.std_pool.connect_thread_to_host(*bind_target):
+                continue
             try:
                 categories = self.std_pool.call_current_host(
                     "get_company_info_category",
