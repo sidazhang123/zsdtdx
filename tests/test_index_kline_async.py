@@ -43,7 +43,7 @@ class TestIndexPayloadKind(unittest.TestCase):
             "end_time": "2026-01-02 00:00:00",
         }
         payload = _build_task_payload_for_kind(
-            "index", task=task, rows=[], error=None, worker_pid=1
+            "index", task=task, rows=[], error=None
         )
         self.assertEqual(payload["task"]["index_name"], "上证指数")
         self.assertNotIn("code", payload["task"])

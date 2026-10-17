@@ -1,0 +1,8 @@
+config: artifacts/refactor/benchmark_final/thread.yaml
+task_file: artifacts/refactor/demo_tasks_10k.json
+output: artifacts/refactor/thread_fault_injection.json
+timeout_seconds: 120
+rounds: 3
+interval_seconds: 0.3
+fraction: 0.25
+seed: 42

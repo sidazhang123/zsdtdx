@@ -11,7 +11,6 @@ import pytest
 import yaml
 
 from zsdtdx.util.helper import _apply_active_config_path, _validate_config_or_raise
-from zsdtdx.engine.parallel_fetcher import _build_worker_host_slot_assignments
 import zsdtdx.engine.unified_client as uc
 from zsdtdx.engine.unified_client import (
     _cache_usable_for_cfg,
@@ -90,9 +89,9 @@ def test_ensure_skips_when_cache_usable(mock_probe):
 
 @patch("zsdtdx.engine.unified_client._tcp_probe_and_trim_available_hosts")
 def test_ensure_writes_cache_once(mock_probe):
-    mock_probe.side_effect = lambda hosts, timeout, fallback, name: list(hosts)[
-        :1
-    ] or list(fallback)
+    mock_probe.side_effect = lambda hosts, timeout, fallback, name: (
+        list(hosts)[:1] or list(fallback)
+    )
 
     cfg = _minimal_cfg(["1.1.1.1:7709", "2.2.2.2:7709"])
     result = _ensure_availability_hosts_cache(cfg=cfg, force=True)
@@ -130,7 +129,7 @@ def test_concurrent_ensure_single_flight(mock_probe):
     assert len(probe_calls) >= 1
 
 
-def test_resolve_worker_sync_if_missing_false_raises():
+def test_resolve_shared_runtime_sync_if_missing_false_raises():
     with pytest.raises(RuntimeError, match="sync_if_missing=False"):
         resolve_presorted_hosts_for_connection(
             cfg=_minimal_cfg(),
@@ -150,19 +149,6 @@ def test_resolve_uses_presorted_without_ensure(mock_probe, tmp_path):
     )
     assert out["standard"] == presorted["standard"]
     mock_probe.assert_not_called()
-
-
-def test_build_worker_slot_assignments_rotate_not_shuffle():
-    snapshot = {
-        "standard": [("h1", 7709), ("h2", 7709), ("h3", 7709)],
-        "extended": [],
-    }
-    assignments = _build_worker_host_slot_assignments(snapshot, 4)
-    assert len(assignments) == 4
-    full_set = set(snapshot["standard"])
-    for item in assignments:
-        assert set(item["standard"]) == full_set
-        assert len(item["standard"]) == 3
 
 
 def test_validate_config_or_raise_no_client(tmp_path):

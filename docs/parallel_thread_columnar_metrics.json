@@ -1,0 +1,62 @@
+{
+  "demo_10k": {
+    "baseline": {
+      "wall_seconds": 14.108438599971123,
+      "cpu_seconds": 34.78125,
+      "peak_rss_bytes": 847249408
+    },
+    "thread": {
+      "wall_seconds": 5.638439700007439,
+      "cpu_seconds": 5.96875,
+      "peak_rss_bytes": 701407232
+    },
+    "speedup": 2.5021884334335454,
+    "memory_saved": 0.17213606126237624,
+    "cpu_remaining": 0.17160826594788858,
+    "tasks": 10000,
+    "rows": 840585,
+    "error_kinds": {
+      "no_data": 314
+    }
+  },
+  "full_market_daily": {
+    "baseline": {
+      "wall_seconds": 50.39569729997311,
+      "cpu_seconds": 92.828125,
+      "peak_rss_bytes": 653500416
+    },
+    "thread": {
+      "wall_seconds": 17.63319920003414,
+      "cpu_seconds": 22.109375,
+      "peak_rss_bytes": 228098048
+    },
+    "speedup": 2.858000793178559,
+    "memory_saved": 0.6509595978589247,
+    "cpu_remaining": 0.23817539134825788,
+    "tasks": 5581,
+    "rows": 22250,
+    "error_kinds": {
+      "no_data": 13
+    }
+  },
+  "mixed_periods": {
+    "baseline": {
+      "wall_seconds": 0.7754282999085262,
+      "cpu_seconds": 1.359375,
+      "peak_rss_bytes": 618414080
+    },
+    "thread": {
+      "wall_seconds": 1.498214800027199,
+      "cpu_seconds": 0.65625,
+      "peak_rss_bytes": 212189184
+    },
+    "speedup": 0.5175681750670523,
+    "memory_saved": 0.6568817061862499,
+    "cpu_remaining": 0.4827586206896552,
+    "tasks": 84,
+    "rows": 3696,
+    "error_kinds": {
+      "no_data": 24
+    }
+  }
+}

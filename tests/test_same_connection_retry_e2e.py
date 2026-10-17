@@ -6,7 +6,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SRC = _ROOT / "src"
@@ -60,7 +60,9 @@ class TestPoolHostCallLadder(unittest.TestCase):
         api.get_security_bars = MagicMock(return_value=None)
         pool = _pool_with_connected_api(api)
 
-        with patch.object(pool, "_reconnect_active_host", return_value=True) as reconnect_mock:
+        with patch.object(
+            pool, "_reconnect_active_host", return_value=True
+        ) as reconnect_mock:
             result = pool.call(
                 "get_security_bars",
                 4,
@@ -83,9 +85,10 @@ class TestPoolHostCallLadder(unittest.TestCase):
         hosts = [("127.0.0.1", 7709), ("127.0.0.2", 7709)]
         pool = _pool_with_connected_api(api, hosts=hosts)
 
-        with patch.object(pool, "_reconnect_active_host", return_value=True), patch.object(
-            pool, "_rotate", return_value=True
-        ) as rotate_mock:
+        with (
+            patch.object(pool, "_reconnect_active_host", return_value=True),
+            patch.object(pool, "_rotate", return_value=True) as rotate_mock,
+        ):
             result = pool.call(
                 "get_security_bars",
                 4,
@@ -144,7 +147,11 @@ class TestPoolHostCallLadder(unittest.TestCase):
         api.get_security_bars = MagicMock(side_effect=RuntimeError("socket boom"))
         pool = _pool_with_connected_api(api)
 
-        with patch.object(pool, "_reconnect_active_host", return_value=True):
+        def reconnect():
+            pool._get_thread_data()["api"] = api
+            return True
+
+        with patch.object(pool, "_reconnect_active_host", side_effect=reconnect):
             with self.assertRaises(RuntimeError):
                 pool.call(
                     "get_security_bars",
@@ -164,9 +171,10 @@ class TestPoolHostCallLadder(unittest.TestCase):
         api.get_security_bars = MagicMock(return_value=None)
         pool = _pool_with_connected_api(api)
 
-        with patch.object(pool, "_reconnect_active_host", return_value=True), patch.object(
-            pool, "_rotate"
-        ) as rotate_mock:
+        with (
+            patch.object(pool, "_reconnect_active_host", return_value=True),
+            patch.object(pool, "_rotate") as rotate_mock,
+        ):
             pool.call(
                 "get_security_bars",
                 4,
@@ -201,62 +209,6 @@ class TestUnifiedClientKlineWrapper(unittest.TestCase):
         _args, kwargs = mock_pool.call.call_args
         self.assertIs(kwargs.get("allow_none"), True)
         self.assertIs(kwargs.get("qfq"), True)
-
-
-class TestChunkBehaviorUnchangedOnNone(unittest.TestCase):
-    def test_persistent_none_does_not_trigger_chunk_recover(self):
-        import asyncio
-
-        import zsdtdx.engine.parallel_fetcher as pf
-
-        chunk_payload = {
-            "chunk_id": "c1",
-            "task_kind": "stock",
-            "tasks": [
-                {
-                    "code": "sh.600000",
-                    "freq": "d",
-                    "start_time": "2026-01-01 00:00:00",
-                    "end_time": "2026-01-02 00:00:00",
-                }
-            ],
-            "enable_cache": False,
-            "chunk_retry_max_attempts": 2,
-            "reconnect_on_unavailable": True,
-        }
-
-        stub_report = {
-            "chunk_id": "c1",
-            "chunk_task_count": 1,
-            "chunk_hit_tasks": 0,
-            "chunk_network_page_calls": 0,
-            "task_detail": [],
-            "payloads": [
-                {
-                    "task": chunk_payload["tasks"][0],
-                    "rows": [],
-                    "error": "no_data",
-                    "worker_pid": 0,
-                }
-            ],
-            "failures": [("sh.600000", "d", "no_data")],
-            "worker_pid": 0,
-        }
-
-        with patch.object(
-            pf,
-            "_fetch_one_task_chunk_async",
-            new_callable=AsyncMock,
-            return_value=stub_report,
-        ) as fetch_mock, patch(
-            "zsdtdx.engine.parallel_fetcher._recover_worker_standard_connection_current_thread"
-        ) as recover_mock:
-            result = asyncio.run(pf._fetch_one_task_chunk_async(chunk_payload))
-
-        fetch_mock.assert_called_once()
-        recover_mock.assert_not_called()
-        self.assertEqual(len(result.get("payloads") or []), 1)
-        self.assertEqual(result["payloads"][0].get("error"), "no_data")
 
 
 if __name__ == "__main__":

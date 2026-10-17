@@ -61,7 +61,20 @@ def test_future_batch_does_not_depend_on_variety_whitelist(monkeypatch):
             raise AssertionError(f"期货代码不应进入股票路由: {kwargs}")
 
     client = _Client()
-    monkeypatch.setattr(pf, "_ensure_worker_client_context", lambda: client)
+    monkeypatch.setattr(pf, "_ensure_shared_client_context", lambda: client)
+
+    def fetch_columns(client_arg, tasks, kind, qfq):
+        assert kind == "future" and qfq is False
+        client_arg.future_calls.append({"codes": tasks[0]["code"]})
+        return {"results": [{"error": None, "task": tasks[0]}]}
+
+    monkeypatch.setattr(
+        "zsdtdx.engine.columnar_kline.fetch_chunk_columns", fetch_columns
+    )
+    monkeypatch.setattr(
+        "zsdtdx.engine.columnar_kline.materialize_task_columns",
+        lambda client_arg, item: pd.DataFrame([{"code": item["task"]["code"]}]),
+    )
     result = pf._fetch_future_batch([(0, "AD2612", "d", "2026-09-14", "2026-09-18")])
 
     assert len(result["data"]) == 1
@@ -69,10 +82,14 @@ def test_future_batch_does_not_depend_on_variety_whitelist(monkeypatch):
     assert client.future_calls[0]["codes"] == "AD2612"
 
 
-def test_future_worker_failure_is_recorded_without_serial_fallback(monkeypatch):
+def test_future_thread_failure_is_recorded_without_serial_fallback(monkeypatch):
     """worker 级异常应逐任务记入运行态失败，但不触发串行补拉。"""
 
     class _Executor:
+        import threading
+
+        stopped = threading.Event()
+
         def submit(self, *_args, **_kwargs):
             future = Future()
             future.set_exception(RuntimeError("worker crashed"))
@@ -86,7 +103,7 @@ def test_future_worker_failure_is_recorded_without_serial_fallback(monkeypatch):
             self.failures.append(args)
 
     context = _Context()
-    monkeypatch.setattr(pf, "_get_global_process_pool", lambda _workers: _Executor())
+    monkeypatch.setattr(pf, "_get_global_thread_runtime", lambda _workers: _Executor())
     monkeypatch.setattr(
         pf.UnifiedTdxClient,
         "get_active_context_client",
@@ -94,7 +111,8 @@ def test_future_worker_failure_is_recorded_without_serial_fallback(monkeypatch):
     )
 
     fetcher = pf.ParallelKlineFetcher.__new__(pf.ParallelKlineFetcher)
-    fetcher.num_processes = 2
+    fetcher.num_threads = 2
+    fetcher.threads_per_host_ex = 1
     fetcher.parallel_total_timeout_seconds = 300.0
     fetcher.force_recycle_on_timeout = False
     fetcher.timeout_fallback_to_serial = False

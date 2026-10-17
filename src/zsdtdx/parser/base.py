@@ -170,6 +170,8 @@ class BaseParser(object):
         if not (self.send_pkg):
             raise SendPkgNotReady("send pkg not ready")
 
+        if hasattr(self.client, "__dict__"):
+            self.client._zsdtdx_frame_pending = True
         self.client.sendall(self.send_pkg)
         sent = len(self.send_pkg)
         self.client.send_pkg_num += 1
@@ -199,7 +201,14 @@ class BaseParser(object):
             log.debug("不需要解压")
         else:
             log.debug("需要解压")
-            body_buf = zlib.decompress(body_buf)
+            decoder = zlib.decompressobj()
+            body_buf = decoder.decompress(body_buf, int(unzipsize) + 1)
+            if not decoder.eof or decoder.unconsumed_tail or decoder.unused_data:
+                raise ResponseRecvFails("回包压缩长度或结束标记错误")
+        if len(body_buf) != int(unzipsize):
+            raise ResponseRecvFails("回包解压长度与头部不一致")
+        if hasattr(self.client, "__dict__"):
+            self.client._zsdtdx_frame_pending = False
         if log.isEnabledFor(logging.DEBUG):
             log.debug("recv body: ")
             log.debug(body_buf)

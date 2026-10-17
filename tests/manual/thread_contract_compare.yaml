@@ -1,0 +1,12 @@
+# 基准工具已生成 baseline/thread_snapshot 后运行；所有用户参数只放 YAML。
+artifact_dir: artifacts/refactor/benchmark_final
+thread_snapshot: final_snapshot
+pin_hosts: true
+freeze_kline_responses: true
+start_time: "2026-10-12"
+end_time: "2026-10-15"
+timeout_seconds: 120
+stock_code: "600000"
+hk_code: "00700"
+index_name: "上证指数"
+future_code: "CU"

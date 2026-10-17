@@ -167,7 +167,9 @@ def run_sequential(
 
         for idx, code in enumerate(codes, start=1):
             try:
-                rows = get_company_info(codes=[code], category=None, return_df=False, mode="sync")
+                rows = get_company_info(
+                    codes=[code], category=None, return_df=False, mode="sync"
+                )
                 out_rows, part = _normalize_rows(code, rows)
                 digests.update(part)
                 total_rows += _append_jsonl(content_path, out_rows)
@@ -285,7 +287,7 @@ def run_parallel(
                 "elapsed_seconds": 0.0,
             },
         )
-        _progress(f"[parallel] 待拉取股票数={total_codes}，开始预热进程池")
+        _progress(f"[parallel] 待拉取股票数={total_codes}，开始预热线程运行时")
         prewarm = prewarm_parallel_fetcher()
         _progress(f"[parallel] 预热完成: {json.dumps(prewarm, ensure_ascii=False)}")
         _write_json(
@@ -371,7 +373,9 @@ def run_parallel(
     return meta
 
 
-def compare_runs(baseline_dir: Path, target_dir: Path, out_path: Path) -> Dict[str, Any]:
+def compare_runs(
+    baseline_dir: Path, target_dir: Path, out_path: Path
+) -> Dict[str, Any]:
     """
     输入基线目录与目标目录，输出对比摘要并落盘。
 
@@ -379,7 +383,9 @@ def compare_runs(baseline_dir: Path, target_dir: Path, out_path: Path) -> Dict[s
     """
     base_meta = json.loads((baseline_dir / "meta.json").read_text(encoding="utf-8"))
     tgt_meta = json.loads((target_dir / "meta.json").read_text(encoding="utf-8"))
-    base_digests = json.loads((baseline_dir / "digests.json").read_text(encoding="utf-8"))
+    base_digests = json.loads(
+        (baseline_dir / "digests.json").read_text(encoding="utf-8")
+    )
     tgt_digests = json.loads((target_dir / "digests.json").read_text(encoding="utf-8"))
 
     base_keys = set(base_digests)
@@ -399,9 +405,7 @@ def compare_runs(baseline_dir: Path, target_dir: Path, out_path: Path) -> Dict[s
 
     # 仅对基线已有键做内容对照（顺序中途终止时基线为子集）
     overlap_mismatch = mismatch
-    coverage = (
-        round(len(common) / len(base_keys), 4) if base_keys else None
-    )
+    coverage = round(len(common) / len(base_keys), 4) if base_keys else None
 
     report = {
         "baseline_meta": base_meta,
@@ -419,9 +423,7 @@ def compare_runs(baseline_dir: Path, target_dir: Path, out_path: Path) -> Dict[s
         "elapsed_baseline_seconds": base_sec,
         "elapsed_baseline_minutes_official": round(base_sec / 60.0, 2),
         "elapsed_target_seconds": tgt_sec,
-        "speedup_vs_official_baseline": None
-        if speedup is None
-        else round(speedup, 3),
+        "speedup_vs_official_baseline": None if speedup is None else round(speedup, 3),
         # 基线可能是中途终止子集：目标覆盖全部基线键且公共键无正文差异即视为对照通过。
         "content_equal_on_baseline_subset": len(only_base) == 0
         and len(overlap_mismatch) == 0,

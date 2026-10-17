@@ -132,17 +132,17 @@ def test_filter_stock_df_by_scopes_equivalent_to_apply():
     assert df.loc[legacy_mask, "code"].tolist() == df.loc[current_mask, "code"].tolist()
 
 
-def test_enter_passes_presorted_hosts_and_worker_client_to_inner():
+def test_enter_passes_presorted_hosts_and_shared_runtime_client_to_inner():
     init_calls: list[dict] = []
 
     def recording_init(
-        self, config_path=None, presorted_hosts=None, worker_client=False
+        self, config_path=None, presorted_hosts=None, shared_runtime_client=False
     ):
         init_calls.append(
             {
                 "config_path": config_path,
                 "presorted_hosts": presorted_hosts,
-                "worker_client": worker_client,
+                "shared_runtime_client": shared_runtime_client,
             }
         )
         self.config_path = str(config_path or "")
@@ -175,7 +175,7 @@ def test_enter_passes_presorted_hosts_and_worker_client_to_inner():
         self._future_zhulian_by_variety = {}
         self._runtime_failures = []
         self._entered_client = None
-        self._worker_client_flag = bool(worker_client)
+        self._shared_runtime_client_flag = bool(shared_runtime_client)
         self._presorted_hosts_snapshot = dict(presorted_hosts or {})
         self._shared_chunk_cache = object()
 
@@ -199,14 +199,14 @@ def test_enter_passes_presorted_hosts_and_worker_client_to_inner():
                     outer = UnifiedTdxClient(
                         config_path="dummy.yaml",
                         presorted_hosts=presorted,
-                        worker_client=True,
+                        shared_runtime_client=True,
                     )
                     init_calls.clear()
                     inner = outer.__enter__()
                     assert inner is not None
                     assert len(init_calls) == 1
                     call = init_calls[0]
-                    assert call["worker_client"] is True
+                    assert call["shared_runtime_client"] is True
                     assert call["presorted_hosts"] == presorted
                     with patch.object(UnifiedTdxClient, "close", lambda self: None):
                         outer.__exit__(None, None, None)
@@ -425,85 +425,6 @@ def test_paginate_kline_short_page_is_terminal():
     )
     assert len(rows) == 1
     assert calls == [0]
-
-
-def test_parallel_fetcher_no_chunk_timeout_executor_shutdown():
-    pf_path = (
-        Path(__file__).resolve().parents[1]
-        / "src"
-        / "zsdtdx"
-        / "engine"
-        / "parallel_fetcher.py"
-    )
-    text = pf_path.read_text(encoding="utf-8")
-    assert "_shutdown_chunk_timeout_executor" not in text
-    assert "_get_chunk_timeout_executor" not in text
-    assert "task_chunk_inproc_coroutine_workers" in text
-
-
-def test_parallel_fetcher_loads_coroutine_workers_from_config(tmp_path):
-    custom_cfg = tmp_path / "coroutine_workers.yaml"
-    custom_cfg.write_text(
-        "parallel:\n  task_chunk_inproc_coroutine_workers: 9\n",
-        encoding="utf-8",
-    )
-    from zsdtdx.engine.parallel_fetcher import (
-        ParallelKlineFetcher,
-        set_active_config_path,
-    )
-
-    set_active_config_path(str(custom_cfg.resolve()))
-    fetcher = ParallelKlineFetcher(config_path=None)
-    assert int(fetcher.task_chunk_inproc_coroutine_workers) == 3
-
-
-def test_fetch_one_task_chunk_async_timeout_marks_all_tasks_failed():
-    import asyncio
-
-    from zsdtdx.engine import parallel_fetcher as pf
-
-    chunk_payload = {
-        "chunk_id": "c1",
-        "task_kind": "stock",
-        "tasks": [
-            {
-                "code": "600000",
-                "freq": "d",
-                "start_time": "2026-01-01",
-                "end_time": "2026-01-02",
-            },
-            {
-                "code": "600001",
-                "freq": "d",
-                "start_time": "2026-01-01",
-                "end_time": "2026-01-02",
-            },
-        ],
-        "chunk_timeout_seconds": 0.01,
-        "chunk_retry_max_attempts": 0,
-    }
-
-    async def instant_timeout(_prep):
-        raise asyncio.TimeoutError("chunk attempt timeout")
-
-    with patch.object(
-        pf, "_fetch_one_chunk_attempt_with_timeout_async", side_effect=instant_timeout
-    ):
-        with patch.object(
-            pf,
-            "_recover_worker_pools_current_thread",
-            return_value={"std": {}, "ex": {}},
-        ):
-            report = asyncio.run(pf._fetch_one_task_chunk_async(chunk_payload))
-
-    assert int(report.get("chunk_hit_tasks", 0)) == 0
-    payloads = list(report.get("payloads") or [])
-    assert len(payloads) == 2
-    assert all(str(item.get("error") or "").strip() for item in payloads)
-    assert all(
-        "attempt timeout" in str(item.get("error") or "").lower() for item in payloads
-    )
-    assert report.get("congested") is True
 
 
 def test_index_chunk_partition_refresh_at_most_once():

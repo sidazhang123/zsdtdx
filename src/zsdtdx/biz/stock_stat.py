@@ -591,7 +591,7 @@ def fetch_stock_stat() -> pd.DataFrame:
     """
     输入：无。
     输出：全市场股票统计宽表 DataFrame。
-    用途：simple_api 业务门面；复用活跃主进程客户端完成跨源聚合。
+    用途：simple_api 业务门面；复用活跃上下文客户端完成跨源聚合。
     边界：无 codes；配置见 `config.yaml` 的 `stock_stat`；无活跃上下文时临时客户端会自动关闭。
     """
     return call_with_main_client(

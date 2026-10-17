@@ -16,13 +16,6 @@
 
 from __future__ import annotations
 
-import datetime as _dt
-from typing import Any, Dict, List
-
-import numpy as np
-
-from zsdtdx.util.helper import format_socket_kline_page_inplace, get_price, get_volume
-
 
 def parse_diff_encoded_kline_page(
     body_buf,
@@ -30,120 +23,14 @@ def parse_diff_encoded_kline_page(
     *,
     with_index_counts: bool = False,
     absolute_ohlc: bool = False,
-) -> List[Dict[str, Any]]:
-    """
-    解析标准行情 K 线单页（差分或绝对价）。
+):
+    """输入标准页及格式，输出行列表或上下文指定的列页；坏包抛错。"""
+    from zsdtdx.parser.kline_columns import columnar_decode, parse_standard_columns
 
-    输入：body_buf 回包体；category K 线周期；with_index_counts 为 True 时解析涨跌家数；
-    absolute_ohlc 为 True 时 OHLC 按绝对价 `/1000`（板块 0x0523），否则按差分链。
-    输出：已格式化的 K 线 dict 列表（OHLC 2dp，vol/amount 整数，datetime，_ts）。
-    边界条件：空页返回 []；绝对价模式不累积 pre_diff_base。
-    """
-    ret_count = body_buf[0] | (body_buf[1] << 8)
-    if ret_count <= 0:
-        return []
-
-    buf = memoryview(body_buf) if not isinstance(body_buf, memoryview) else body_buf
-    cat = int(category)
-
-    opens = np.empty(ret_count, dtype=np.float64)
-    closes = np.empty(ret_count, dtype=np.float64)
-    highs = np.empty(ret_count, dtype=np.float64)
-    lows = np.empty(ret_count, dtype=np.float64)
-    volumes = np.empty(ret_count, dtype=np.float64)
-    amounts = np.empty(ret_count, dtype=np.float64)
-    timestamps = np.empty(ret_count, dtype=np.int64)
-    datetimes: List[str] = [""] * ret_count
-    up_counts = np.empty(ret_count, dtype=np.int32) if with_index_counts else None
-    down_counts = np.empty(ret_count, dtype=np.int32) if with_index_counts else None
-
-    pos = 2
-    pre_diff_base = 0
-    for i in range(ret_count):
-        if cat < 4 or cat == 7 or cat == 8:
-            zipday = buf[pos] | (buf[pos + 1] << 8)
-            tminutes = buf[pos + 2] | (buf[pos + 3] << 8)
-            year = (zipday >> 11) + 2004
-            month = int((zipday % 2048) / 100)
-            day = (zipday % 2048) % 100
-            hour = int(tminutes / 60)
-            minute = tminutes % 60
-        else:
-            zipday = (
-                buf[pos]
-                | (buf[pos + 1] << 8)
-                | (buf[pos + 2] << 16)
-                | (buf[pos + 3] << 24)
-            )
-            year = int(zipday / 10000)
-            month = int((zipday % 10000) / 100)
-            day = zipday % 100
-            hour = 15
-            minute = 0
-        pos += 4
-
-        price_open_diff, pos = get_price(buf, pos)
-        price_close_diff, pos = get_price(buf, pos)
-        price_high_diff, pos = get_price(buf, pos)
-        price_low_diff, pos = get_price(buf, pos)
-
-        vol_raw = (
-            buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16) | (buf[pos + 3] << 24)
-        )
-        vol = get_volume(vol_raw)
-        pos += 4
-        dbvol_raw = (
-            buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16) | (buf[pos + 3] << 24)
-        )
-        dbvol = get_volume(dbvol_raw)
-        pos += 4
-
-        if with_index_counts:
-            up_counts[i] = buf[pos] | (buf[pos + 1] << 8)
-            down_counts[i] = buf[pos + 2] | (buf[pos + 3] << 8)
-            pos += 4
-
-        if absolute_ohlc:
-            # 板块指数 0x0523：四价均为绝对整数价，刻度 /1000（抓包 880744 验证）。
-            open_v = price_open_diff / 1000.0
-            close_v = price_close_diff / 1000.0
-            high_v = price_high_diff / 1000.0
-            low_v = price_low_diff / 1000.0
-        else:
-            open_v = (pre_diff_base + price_open_diff) / 1000.0
-            new_base = pre_diff_base + price_open_diff
-            close_v = (new_base + price_close_diff) / 1000.0
-            high_v = (new_base + price_high_diff) / 1000.0
-            low_v = (new_base + price_low_diff) / 1000.0
-            pre_diff_base = new_base + price_close_diff
-
-        opens[i] = open_v
-        closes[i] = close_v
-        highs[i] = high_v
-        lows[i] = low_v
-        volumes[i] = vol
-        amounts[i] = dbvol
-        datetimes[i] = f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:00"
-        timestamps[i] = int(_dt.datetime(year, month, day, hour, minute).timestamp())
-
-    format_socket_kline_page_inplace(
-        opens, closes, highs, lows, volumes, amounts, ret_count
+    page = parse_standard_columns(
+        body_buf,
+        category,
+        with_index_counts=with_index_counts,
+        absolute_ohlc=absolute_ohlc,
     )
-
-    klines: List[Dict[str, Any]] = [None] * ret_count  # type: ignore[list-item]
-    for i in range(ret_count):
-        item: Dict[str, Any] = {
-            "open": float(opens[i]),
-            "close": float(closes[i]),
-            "high": float(highs[i]),
-            "low": float(lows[i]),
-            "vol": int(volumes[i]),
-            "amount": int(amounts[i]),
-            "datetime": datetimes[i],
-            "_ts": int(timestamps[i]),
-        }
-        if with_index_counts:
-            item["up_count"] = int(up_counts[i])
-            item["down_count"] = int(down_counts[i])
-        klines[i] = item
-    return klines
+    return page if columnar_decode.get() else page.raw_rows()

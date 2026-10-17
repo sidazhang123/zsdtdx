@@ -146,6 +146,32 @@ class TrafficStatSocket(socket.socket):
         self.last_api_send_bytes = 0
         self.last_api_recv_bytes = 0
 
+    def _limit_io(self, cap=None):
+        """输入无，输出无；每次 IO 使用累计剩余预算，防止滴流重置超时。"""
+        deadline = getattr(self, "_zsdtdx_deadline", None)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("chunk attempt timeout")
+            self.settimeout(
+                max(0.001, min(remaining, cap) if cap is not None else remaining)
+            )
+
+    def recv(self, size, flags=0):
+        """输入接收长度，输出字节；累计预算到期抛超时。"""
+        self._limit_io()
+        return super().recv(size, flags)
+
+    def sendall(self, data, flags=0):
+        """输入请求字节，输出无；发送同样受累计预算约束。"""
+        self._limit_io()
+        return super().sendall(data, flags)
+
+    def connect(self, address):
+        """输入地址，输出无；首次连接也受当前尝试预算约束。"""
+        self._limit_io(self.gettimeout())
+        return super().connect(address)
+
 
 class BaseSocketClient(object):
     """

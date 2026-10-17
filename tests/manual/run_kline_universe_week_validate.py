@@ -26,7 +26,7 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 import yaml
 
@@ -358,7 +358,7 @@ def _consume_async_job(
     输入：StockKlineJob 与校验/进度参数。
     输出：统计字典。
     用途：消费 async 队列直到 done，边收边校验。
-    边界：超时抛 queue.Empty；destroy_pool=False 时保留进程池供下一批复用。
+    边界：超时抛 queue.Empty；destroy_pool=False 时保留线程运行时供下一批复用。
     """
     from zsdtdx import destroy_parallel_fetcher
 
@@ -480,7 +480,7 @@ def _start_async_with_retry(start_fn: Callable[[], Any], label: str) -> Any:
     """
     输入：启动 async 任务的无参函数与日志标签。
     输出：StockKlineJob。
-    用途：预热不足时强制重启进程池再试一次。
+    用途：预热不足时强制重启线程运行时再试一次。
     边界：第二次仍失败则抛出。
     """
     from zsdtdx import restart_parallel_fetcher

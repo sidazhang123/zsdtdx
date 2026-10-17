@@ -62,32 +62,23 @@ pool:
   probe_timeout: 0.8
 
 parallel:
-  # 并行进程数倍率：推荐进程数 = max(2, int(物理核心数 * 该倍率))。
-  # 取值: 正浮点数（建议 0.5~3.0）
-  # 影响: 倍率越大并发越高，吞吐可能提升，但 CPU/内存占用也会上升。
-  process_count_core_multiplier: 1
-  # 父进程同时提交的 bundle 窗口 = 进程数 × 本值。
-  # 取值: 正整数
-  # 影响: 标准侧地址配额按本值放大，用来把下一批 bundle 放进进程池队列；扩展侧不放大。
+  # 全局抓取线程硬上限；sync/async 与期货、公司信息共享，不按 CPU 核心换算。
+  thread_workers: 44
+  # 已提交但未完成的 chunk 窗口 = 线程数 × 本值，不放大真实连接配额。
   task_chunk_max_inflight_multiplier: 2
-  # 标准行情每个可达地址允许同时摊到的进程数。
-  # 取值: 正整数
-  # 影响: 地址不少于总进程时该侧用满总进程；进程多于地址时该侧上限 = min(总进程数, 地址数 × 本值)。
-  adaptive_processes_per_host_std: 4
-  # 扩展行情每个可达地址允许同时摊到的进程数；与标准侧分开配置。
-  # 取值: 正整数
-  # 影响: 扩展地址很少时把同时在飞进程压在 地址数 × 本值，避免 40 个进程打两个站。
-  adaptive_processes_per_host_ex: 4
-  # 重试耗尽后的连接不可用、超时或 watchdog 后保留的该地址进程配额比例。
+  # 标准/扩展行情单站同时工作连接上限，故障换站同样受此约束。
+  threads_per_host_std: 4
+  threads_per_host_ex: 4
+  # 重试耗尽后的连接不可用、超时或 watchdog 后保留的该地址线程配额比例。
   # 取值: 0~1 浮点数（建议 0.3~0.8）
   # 影响: chunk 重试成功或成功切到其他地址不降配额；只在最终仍失败时退避。
   adaptive_decrease_factor: 0.75
   # host 触发拥塞后的冷却秒数。
   # 取值: 非负浮点数
-  # 影响: 冷却期间不向该 host 分配新 bundle；结束后保持降后的配额，成功时每次 +1 直到回到拥塞前上限。
+  # 影响: 冷却期间不向该 host 分配新连接租约；结束后保持降后的配额，成功时每次 +1 直到回到拥塞前上限。
   adaptive_cooldown_seconds: 1.5
-  # 单次 chunk 抓取尝试墙钟上限（秒）：仅约束每一次 get_*_kline_rows_for_chunk_tasks（含该次建连与网络 IO）。
-  # 不含入口归一化失败；不含 bundle 级预热建连；不含重试累计（重试由 chunk_retry_max_attempts 单独控制，每次尝试各算本上限）。
+  # 单次 chunk 列式抓取尝试墙钟上限（秒），覆盖等待连接配额、建连、网络 IO 和解析。
+  # 不含提交排队、入口归一化与最终 rows/DataFrame 打包；每次重试重新计时。
   # 取值: 正浮点数
   # 影响: 到点关闭本次尝试的 socket，阻塞中的 connect/recv 返回并按失败结束；重连同样受本上限约束。最坏墙钟约 chunk_timeout_seconds × (1 + chunk_retry_max_attempts)。
   # 调优指南（D4）: 5s 适合超低延迟内网；公网/弱网建议 15s+，避免短超时频繁触发重连放大尾延迟。

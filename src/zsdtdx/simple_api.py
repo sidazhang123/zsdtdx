@@ -4,7 +4,7 @@
 1. 对外暴露 get_* 风格 API，隐藏连接池、市场路由、分页与并行调度细节。
 2. 统一 task 输入（StockKlineTask / IndexKlineTask / BlockKlineTask 或等价 dict）并完成时间窗口标准化。
 3. 提供同步/异步两种股票/指数/板块指数 K 线任务获取模式。
-4. 暴露并行进程池生命周期管理入口（prewarm/restart/destroy）。
+4. 暴露并行线程执行器生命周期管理入口（prewarm/restart/destroy）。
 
 数据契约：
 1. 股票/指数/板块任务仅传日期时，start/end 分别补齐为 09:30:00 / 16:00:00；期货为 09:00:00 / 15:00:00。
@@ -15,11 +15,10 @@
    用户 YAML 可为不完整：以包内默认为底深合并覆盖同名键，丢弃未知字段，列表整段替换。
 2. 若未调用 `set_config_path()`，首次调用相关接口会打印提醒并回退到包内默认配置。
 3. `get_stock_kline` / `get_index_kline` / `get_block_kline` 的 sync/async 不要求前置 `with get_client()`；
-   抓取连接由并行层进程内常驻 client 管理，不复用 with 内主进程 client。
-   指数/板块在解析名称路由时若无 with 会临时建连。同流程若还要调码表等主进程 API，可包在 with 内。
-4. `mode="async"` 的 K 线抓取在 worker 子进程内执行；`mode="sync"` 在主进程 inproc 调度，但仍用抓取器常驻 client。
-5. `get_future_kline` 走 DataFrame 批处理：进程数 > 1 时 worker 并行（不占用主进程连接），
-   ≤ 1 时串行并可复用 with 内连接；建议 with 以便同块调用其它主进程 API。
+   抓取连接由共享线程运行时的常驻 client 管理，不复用 with 内上下文 client。
+   指数/板块在解析名称路由时若无 with 会临时建连。同流程若还要调码表等上下文型 API，可包在 with 内。
+4. `mode="async"` 的 K 线抓取在工作线程内执行；`mode="sync"` 阻塞等待同一线程执行器，使用抓取器常驻 client。
+5. `get_future_kline` 走 DataFrame 批处理：统一使用线程调度与列式分页，最终交付 DataFrame，不复用用户 with 内连接；建议 with 以便同块调用其它上下文型 API。
 6. async 模式通过 `job.queue` 消费到 `event="done"`。
 7. 冷启动可手动 `prewarm_parallel_fetcher()`；异常恢复 `restart_parallel_fetcher()`；退出前 `destroy_parallel_fetcher()`。
 """
@@ -61,7 +60,7 @@ from zsdtdx.util.helper import (
 # ---------- 配置与客户端 ----------
 def set_config_path(config_path: str, async_background_probe: bool = True) -> str:
     """
-    设置 simple_api 全局配置路径（主进程与并行 worker 统一生效）。
+    设置 simple_api 全局配置路径（上下文客户端与共享线程运行时统一生效）。
 
     输入:
     - config_path: 配置文件路径（建议在程序启动阶段调用一次）。
@@ -114,9 +113,9 @@ def get_client(
     ```
 
     作用边界:
-    - 该 client 仅管理“当前主进程”上下文中的连接生命周期（进入 with 预连接，退出 with 自动 close）。
+    - 该 client 仅管理当前 `with` 上下文中的连接生命周期（进入 with 预连接，退出 with 自动 close）。
     - `get_stock_kline` / `get_index_kline` / `get_block_kline` 的 sync/async 抓取连接由并行层
-      进程内常驻 client 管理，不与此处 with 返回的主进程 client 共用；with 结束也不会关掉它们。
+      共享线程运行时的常驻 client 管理，不与此处 with 返回的上下文 client 共用；with 结束也不会关掉它们。
     - 市场列表请用 `with get_client() as client: client.get_supported_markets(...)`，不再提供独立 `get_supported_markets` 封装。
 
     边界条件:
@@ -137,7 +136,7 @@ def get_stock_code_name() -> Dict[str, str]:
     """获取统一股票代码名称字典。
 
     调用前置约定:
-    - 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接。
+    - 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接。
 
     输入:
     - 无缓存开关：自动复用有效缓存，缺失或过期时重建。
@@ -170,7 +169,7 @@ def get_stock_concepts() -> Dict[str, Any]:
     """获取股票所属板块（成分归属，不是板块指数名单）。
 
     调用前置约定:
-    - 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接。
+    - 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接。
     - 与 `get_block_names` 共用三份命名文件，但语义不同：本接口回答「股票属于哪些板块」；
       可请求 K 线的板块指数名请用 `get_block_names`。
 
@@ -207,7 +206,7 @@ def get_etf_code_name() -> Dict[str, str]:
     """获取场内 ETF/LOF（本语境统称 etf）代码名称字典。
 
     调用前置约定:
-    - 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接。
+    - 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接。
 
     输入:
     - 无缓存开关：自动复用当日 `catalog_cache/etf_code_name.pkl`，缺失或过期时重建。
@@ -241,7 +240,7 @@ def get_block_names() -> List[str]:
     """获取可请求 K 线的「全部板块」指数名称列表。
 
     调用前置约定:
-    - 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接。
+    - 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接。
     - 与 `get_block_kline` 共用三份命名文件的 6 小时本地缓存。
     - 与 `get_stock_concepts` 文件同源，但本接口是板块指数名单，不是股票归属。
 
@@ -268,7 +267,7 @@ def get_all_future_list(return_df: Optional[bool] = None):
     """获取统一商品期货列表（郑州/大连/上海/广州）。
 
     调用前置约定:
-    - 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接。
+    - 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接。
 
     输入:
     - return_df: 是否返回 DataFrame；None 时跟随 `output.return_df_default`（包内默认 True）。
@@ -304,9 +303,9 @@ def get_stock_kline(
     """获取股票 K 线任务结果（任务化输入，支持同步/异步与队列实时回传）。
 
     调用前置约定:
-    - sync/async 均不要求前置 `with get_client()`；可选 with 以同块调用其它主进程 API。
-    - 抓取连接由并行层进程内常驻 client 管理，不复用 with 内主进程 client。
-    - `mode="async"`：在 worker 子进程内抓取；`mode="sync"`：主进程 inproc 调度。
+    - sync/async 均不要求前置 `with get_client()`；可选 with 以同块调用其它上下文型 API。
+    - 抓取连接由共享线程运行时的常驻 client 管理，不复用 with 内上下文 client。
+    - `mode="async"`：返回后台句柄；`mode="sync"`：阻塞等待同一线程执行器。
     - `preprocessor_operator`：可选钩子 `f(payload)->dict|None`；返回 None 或空 dict 时丢弃该条；
       OHLC/成交额/成交量默认刻度由协议解析层完成。
     - `qfq`：True 前复权（默认），False 不复权；A 股与港股共用。期货请用 `get_future_kline`。
@@ -335,7 +334,7 @@ def get_stock_kline(
         )
     ```
 
-    调用示例（写法二：async + 进程池生命周期）:
+    调用示例（写法二：async + 线程执行器生命周期）:
     ```python
     from zsdtdx import destroy_parallel_fetcher, get_stock_kline, restart_parallel_fetcher
 
@@ -357,13 +356,13 @@ def get_stock_kline(
     ```
 
     连接生命周期:
-    - sync：主进程 inproc 调度，连接为抓取器进程内常驻 client；with 结束只关主进程 with client，不关该常驻连接。
-    - async：worker 子进程内按任务侧懒建连接；进程池生命周期见 prewarm/restart/destroy。
+    - sync：阻塞等待有界线程调度，连接租约由抓取器管理；用户 with client 独立。
+    - async：工作线程按任务侧懒建连接；线程执行器生命周期见 prewarm/restart/destroy。
 
     返回:
     - mode="sync": `list[task_payload]`（传 queue 时同时推送 data/done）。
     - mode="async": `StockKlineJob`（从 `job.queue` 消费到 done）。
-    - task_payload: `{"event":"data","task":{...},"rows":[...],"error":str|None,"worker_pid":int}`。
+    - task_payload: `{"event":"data","task":{...},"rows":[...],"error":str|None}`。
       示例 rows 元素: `{"code":"sh.600000","freq":"d","open":10.07,"close":10.06,"high":10.25,"low":10.03,"volume":105771232,"amount":1072786048,"datetime":"2026-02-02 15:00:00"}`。
     - done: `{"event":"done","total_tasks":...,"success_tasks":...,"failed_tasks":...}`。
     """
@@ -380,7 +379,7 @@ def get_stock_stat() -> pd.DataFrame:
     """获取全市场股票统计宽表。
 
     调用前置约定:
-    - 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接。
+    - 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接。
 
     输入:
     - 无。分页与财务批次由 `config.yaml` 的 `stock_stat` 控制
@@ -423,8 +422,8 @@ def get_company_info(
     """获取股票公司信息（默认并行；可选顺序）。
 
     调用前置约定:
-    - `mode="sync"`：请先进入 `with get_client():`，主进程顺序拉取。
-    - `mode="async"`（默认）：走进程池并行，不依赖主进程 with 连接；
+    - `mode="sync"`：请先进入 `with get_client():`，在调用线程顺序拉取。
+    - `mode="async"`（默认）：走线程执行器并行，不依赖上下文连接；
       退出前建议 `destroy_parallel_fetcher()`。
 
     输入:
@@ -491,8 +490,8 @@ def get_index_kline(
 
     调用前置约定:
     - sync/async 均不要求前置 `with get_client()`；无 with 时名称路由解析会临时建连。
-    - 抓取连接由并行层常驻 client 管理（sync 主进程 inproc；async worker 子进程）。
-    - sync 走主进程 inproc chunk；async 走进程池 worker。
+    - 抓取连接由并行层常驻 client 管理（sync/async 共用常驻线程执行器与连接租约）。
+    - sync 阻塞等待，async 返回句柄；二者共用有界线程调度与列式内核。
 
     输入:
     - task: dict 或 `IndexKlineTask`，字段 `index_name/freq/start_time/end_time`。
@@ -562,8 +561,8 @@ def get_future_kline(
 
     调用前置约定:
     - 与 `get_stock_kline` 的 task 路径不同：走 `fetch_future_kline` DataFrame 批处理。
-    - 进程数 > 1 时 worker 并行（不占用主进程连接）；≤ 1 时串行并可复用 with 内连接。
-    - 建议 `with get_client():` 以便同块调用其它主进程 API。
+    - 使用全局线程执行器及独立连接租约，最终交付 DataFrame；不复用用户 with 内连接。
+    - 建议 `with get_client():` 以便同块调用其它上下文 API。
     - 批处理总超时 300 秒，写死不读 YAML。
 
     输入:
@@ -590,7 +589,7 @@ def get_future_kline(
     - DataFrame 字段: code, freq, open, close, high, low, settlement_price, volume, datetime。
 
     并行提示:
-    - 进程数 = max(2, int(物理核心数 × `parallel.process_count_core_multiplier`))；>1 默认并行。
+    - 线程数由 `parallel.thread_workers` 指定；所有入口共享线程与 host 配额。
     - 大批量任务建议自行分批，避免内存过高；无成交数据可能返回空行。
     """
     return fetch_future_kline(
@@ -642,39 +641,38 @@ def get_future_latest_price(codes: Optional[Any] = None) -> Dict[str, Optional[f
     )
 
 
-# ---------- 并行进程池生命周期 ----------
+# ---------- 并行线程执行器生命周期 ----------
 def prewarm_parallel_fetcher() -> Dict[str, Any]:
     """
-    手动预热 async 并行抓取进程池。
+    手动预热 async 并行抓取线程执行器。
 
-    预热固定开启：默认不要求全部 worker 成功，超时 60 秒，最多 3 轮（写死，不读 YAML）。
+    预热固定开启：默认不要求全部工作线程成功，超时 60 秒，最多 3 轮（写死，不读 YAML）。
 
     输出:
-    - 预热摘要字典：`ready_processes` 表示已启动进程数，
-      `connection_ready_workers` 表示已建立行情连接的进程数；预热阶段通常为 0。
-      `warmed_workers` 为兼容旧调用方保留，等价于 `ready_processes`。
+    - 预热摘要字典：`ready_threads` 表示已就绪线程数，
+      `target_threads` 为目标线程数，`ready_threads` 为实际就绪线程数。
 
     什么时候调用:
     - 服务启动或压测前，希望把 async 冷启动成本前移。
     - 一般不必手动调用：首次 async 任务会自动预热。
 
     边界条件:
-    - 仅拉起 worker 进程，不建立 std/ex 行情连接；业务连接按任务路由懒建。
-    - 仅当 `require_all_workers=True` 且预热不足时抛 RuntimeError；默认 False，不足只记入摘要。
+    - 编译 numba 解码器并拉起工作线程，不建立 std/ex 行情连接；业务连接按任务路由懒建。
+    - 仅当 `require_all_threads=True` 且预热不足时抛 RuntimeError；默认 False，不足只记入摘要。
     """
     _ensure_active_config_ready(caller_name="prewarm_parallel_fetcher")
     fetcher = get_fetcher()
     # 预热超时与轮次是抓取器常数，不是 YAML 项。
-    require_all_workers = getattr(fetcher, "auto_prewarm_require_all_workers", False)
+    require_all_threads = getattr(fetcher, "auto_prewarm_require_all_threads", False)
     timeout_seconds = getattr(fetcher, "auto_prewarm_timeout_seconds", 60.0)
     max_rounds = getattr(fetcher, "auto_prewarm_max_rounds", 3)
-    # target_workers 没有对应的 config 参数，使用 None（让内部决定）
-    target_workers = None
+    # target_threads 没有对应的 config 参数，使用 None（让内部决定）
+    target_threads = None
     return _prewarm_parallel_fetcher(
-        require_all_workers=bool(require_all_workers),
+        require_all_threads=bool(require_all_threads),
         timeout_seconds=float(timeout_seconds),
         max_rounds=int(max_rounds),
-        target_workers=target_workers,
+        target_threads=target_threads,
     )
 
 
@@ -684,7 +682,7 @@ def restart_parallel_fetcher(
     max_rounds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    强制重启 async 并行抓取进程池（终止旧 worker 并按需预热）。
+    强制重启 async 并行抓取线程执行器（中断旧工作、关闭连接并按需预热）。
 
     输入:
     - prewarm: 重启后是否立即预热新池；None 时默认 True。
@@ -692,11 +690,11 @@ def restart_parallel_fetcher(
     - max_rounds: 重启后预热轮次上限；None 时用抓取器常数 3。
 
     输出:
-    - 重启摘要字典（旧 pid、终止结果、预热摘要、耗时等）。
+    - 重启摘要字典（旧线程数、回收结果、预热摘要、耗时等）。
 
     什么时候调用:
-    - 出现连续 timeout/连接异常，怀疑 worker 状态异常时。
-    - 需要快速回收并重建 worker 连接状态时。
+    - 出现连续 timeout/连接异常，怀疑工作线程状态异常时。
+    - 需要快速回收并重建线程连接状态时。
 
     边界条件:
     - 即便旧池不存在也会返回摘要，不抛错。
@@ -724,20 +722,20 @@ def restart_parallel_fetcher(
 
 def destroy_parallel_fetcher() -> Dict[str, Any]:
     """
-    销毁 async 并行抓取进程池并释放 worker 资源。
+    销毁 async 并行抓取线程执行器并释放工作线程资源。
 
     输入:
     - 无显式输入参数。
 
     输出:
-    - 销毁摘要字典（是否存在旧池、旧 worker 数、销毁后版本号、耗时）。
+    - 销毁摘要字典（是否存在旧池、旧线程数、销毁后版本号、耗时）。
 
     什么时候调用:
-    - 长驻服务优雅停机前，主动释放 worker 与连接资源。
-    - 短脚本结束前，避免保留并行进程池到解释器退出阶段。
+    - 长驻服务优雅停机前，主动释放工作线程与连接资源。
+    - 短脚本结束前，避免保留并行线程执行器到解释器退出阶段。
 
     边界条件:
-    - 进程池不存在时安全返回，不抛错。
+    - 线程执行器不存在时安全返回，不抛错。
     """
     return _destroy_parallel_fetcher()
 
@@ -747,7 +745,7 @@ def get_runtime_failures() -> pd.DataFrame:
     """获取运行期失败/无数据明细。
 
     调用前置约定:
-    - 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接。
+    - 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接。
 
     调用示例:
     ```python
@@ -770,7 +768,7 @@ def get_runtime_metadata() -> Dict[str, Any]:
     """获取运行元数据快照。
 
     调用前置约定:
-    - 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接。
+    - 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接。
 
     调用示例:
     ```python

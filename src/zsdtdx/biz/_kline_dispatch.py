@@ -47,7 +47,7 @@ def dispatch_kline_tasks(
     async_method: str,
     extra_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Any:
-    """按 mode 调用抓取器方法；async 未提供队列时创建进程内事件队列。"""
+    """按 mode 调用抓取器方法；async 未提供队列时创建当前解释器内的事件队列。"""
     from zsdtdx.engine.parallel_fetcher import get_fetcher
 
     fetcher = get_fetcher()

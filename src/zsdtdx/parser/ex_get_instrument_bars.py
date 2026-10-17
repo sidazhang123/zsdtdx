@@ -15,13 +15,10 @@
 
 # coding=utf-8
 
-import datetime as _dt
 import struct
 
-import numpy as np
 import six
 
-from zsdtdx.util.helper import format_socket_kline_page_inplace, get_datetime
 from zsdtdx.parser.base import BaseParser
 
 # 首包 cmd=0xD808，翻页 cmd=0xD908；inner 固定 0x2489。
@@ -89,7 +86,6 @@ def pack_extended_kline_request(
 class GetInstrumentBars(BaseParser):
     def setup(self):
         """输入无；输出无；扩展行情 K 线无需额外 setup。"""
-        pass
 
     def setParams(self, category, market, code, start, count, qfq=False):
         """
@@ -104,91 +100,8 @@ class GetInstrumentBars(BaseParser):
         )
 
     def parseResponse(self, body_buf):
-        """
-        输入：body_buf 为 socket 回包体。
-        输出：K 线 dict 列表（含 `_ts`）。
-        用途：按 42 字节前缀 + 32 字节记录解码。
-        边界条件：空页或前缀不足返回 []。
-        """
-        if body_buf is None or len(body_buf) < _KLINE_PREFIX_LEN:
-            return []
+        """输入扩展页，输出行列表或上下文指定的列页；记录截断抛错。"""
+        from zsdtdx.parser.kline_columns import columnar_decode, parse_extended_columns
 
-        ret_count = struct.unpack_from("<H", body_buf, 40)[0]
-        max_n = (len(body_buf) - _KLINE_PREFIX_LEN) // _KLINE_RECORD_LEN
-        if ret_count > max_n:
-            ret_count = max_n
-        if ret_count <= 0:
-            return []
-
-        buf = memoryview(body_buf) if not isinstance(body_buf, memoryview) else body_buf
-        cat = self.category
-        pos = _KLINE_PREFIX_LEN
-
-        opens = np.empty(ret_count, dtype=np.float64)
-        highs = np.empty(ret_count, dtype=np.float64)
-        lows = np.empty(ret_count, dtype=np.float64)
-        closes = np.empty(ret_count, dtype=np.float64)
-        settlements = np.empty(ret_count, dtype=np.float64)
-        trades = np.empty(ret_count, dtype=np.float64)
-        positions = np.empty(ret_count, dtype=np.float64)
-        amounts = np.empty(ret_count, dtype=np.float64)
-        timestamps = np.empty(ret_count, dtype=np.int64)
-        datetimes = [""] * ret_count
-
-        for i in range(ret_count):
-            year, month, day, hour, minute, pos = get_datetime(cat, buf, pos)
-
-            opens[i] = struct.unpack_from("<f", buf, pos)[0]
-            highs[i] = struct.unpack_from("<f", buf, pos + 4)[0]
-            lows[i] = struct.unpack_from("<f", buf, pos + 8)[0]
-            closes[i] = struct.unpack_from("<f", buf, pos + 12)[0]
-            positions[i] = float(
-                buf[pos + 16]
-                | (buf[pos + 17] << 8)
-                | (buf[pos + 18] << 16)
-                | (buf[pos + 19] << 24)
-            )
-            amounts[i] = struct.unpack_from("<f", buf, pos + 16)[0]
-            trades[i] = float(
-                buf[pos + 20]
-                | (buf[pos + 21] << 8)
-                | (buf[pos + 22] << 16)
-                | (buf[pos + 23] << 24)
-            )
-            settlements[i] = struct.unpack_from("<f", buf, pos + 24)[0]
-            pos += 28
-
-            datetimes[i] = (
-                f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:00"
-            )
-            timestamps[i] = int(
-                _dt.datetime(year, month, day, hour, minute).timestamp()
-            )
-
-        format_socket_kline_page_inplace(
-            opens,
-            closes,
-            highs,
-            lows,
-            trades,
-            amounts,
-            ret_count,
-            settlement_prices=settlements,
-            positions=positions,
-        )
-
-        klines = [None] * ret_count
-        for i in range(ret_count):
-            klines[i] = {
-                "open": float(opens[i]),
-                "high": float(highs[i]),
-                "low": float(lows[i]),
-                "close": float(closes[i]),
-                "position": int(positions[i]),
-                "trade": int(trades[i]),
-                "amount": int(amounts[i]),
-                "price": float(settlements[i]),
-                "datetime": datetimes[i],
-                "_ts": int(timestamps[i]),
-            }
-        return klines
+        page = parse_extended_columns(body_buf, self.category)
+        return page if columnar_decode.get() else page.raw_rows()

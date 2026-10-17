@@ -18,10 +18,10 @@ pool:
   probe_timeout: 2.0
 
 parallel:
-  process_count_core_multiplier: 1
+  thread_workers: 44
   task_chunk_max_inflight_multiplier: 2
-  adaptive_processes_per_host_std: 4
-  adaptive_processes_per_host_ex: 4
+  threads_per_host_std: 4
+  threads_per_host_ex: 4
   adaptive_decrease_factor: 0.75
   adaptive_cooldown_seconds: 1.5
   chunk_timeout_seconds: 60

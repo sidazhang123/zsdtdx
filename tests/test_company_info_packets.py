@@ -642,21 +642,22 @@ def test_fetch_company_info_parallel_payload_forwards_category(monkeypatch):
             }
 
     class _FakeExecutor:
-        def submit(self, fn, payload):
+        def submit(self, fn, *args):
+            payload = args[-1]
             captured.append(dict(payload))
             return _FakeFuture(payload)
 
     class _FakeFetcher:
         auto_prewarm_on_async = False
         company_info_codes_per_chunk = 40
-        company_info_stock_inproc_workers = 3
+        company_info_stock_workers = 3
         company_info_category_workers = 3
         company_info_max_inflight_multiplier = 2
-        num_processes = 2
+        num_threads = 2
         config = {"output": {"return_df_default": False}}
 
     monkeypatch.setattr(pf, "get_fetcher", lambda: _FakeFetcher())
-    monkeypatch.setattr(pf, "_get_global_process_pool", lambda n: _FakeExecutor())
+    monkeypatch.setattr(pf, "_get_global_thread_runtime", lambda n: _FakeExecutor())
     monkeypatch.setattr(
         pf,
         "wait",

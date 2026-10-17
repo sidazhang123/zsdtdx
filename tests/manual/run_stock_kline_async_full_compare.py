@@ -6,7 +6,7 @@
 1. 在单一 Python 环境（workspace 或 site_packages）下执行
    `get_stock_kline(task, mode=async)` 全量基准测试。
 2. 采集每个 task 的解析 rows 与错误信息，并写入 artifacts。
-3. 以队列 `event=done` 作为任务完成信号，收到后立即 `destroy_parallel_fetcher()` 释放进程池。
+3. 以队列 `event=done` 作为任务完成信号，收到后立即 `destroy_parallel_fetcher()` 释放线程运行时。
 
 边界：
 1. 必须通过环境变量 ZSDTDX_BENCH_TARGET 指定运行目标（禁止一次命令跑双环境）。
@@ -51,7 +51,9 @@ def _resolve_target() -> str:
     """解析 ZSDTDX_BENCH_TARGET。"""
     target = str(os.environ.get("ZSDTDX_BENCH_TARGET", "")).strip().lower()
     if target not in {"workspace", "site_packages"}:
-        raise ValueError("请设置环境变量 ZSDTDX_BENCH_TARGET=workspace 或 site_packages")
+        raise ValueError(
+            "请设置环境变量 ZSDTDX_BENCH_TARGET=workspace 或 site_packages"
+        )
     return target
 
 
@@ -73,7 +75,9 @@ def _bootstrap_import(target: str) -> str:
     return str(zsdtdx.__file__)
 
 
-def _build_tasks(codes: List[str], freqs: List[str], start_time: str, end_time: str) -> List[Dict[str, str]]:
+def _build_tasks(
+    codes: List[str], freqs: List[str], start_time: str, end_time: str
+) -> List[Dict[str, str]]:
     """生成全量 task 列表（所有 code × 所有 freq 一次放入 task 参数）。"""
     tasks: List[Dict[str, str]] = []
     for code in codes:
@@ -163,7 +167,7 @@ def _consume_async_job(
     flush_every: int,
 ) -> Dict[str, Any]:
     """
-    消费 async job 队列直到 done，并在 done 后立即销毁进程池。
+    消费 async job 队列直到 done，并在 done 后立即销毁线程运行时。
 
     输入：
     1. job: StockKlineJob。
@@ -225,7 +229,6 @@ def _consume_async_job(
             "task": task,
             "rows": _serialize_rows(list(event.get("rows") or [])),
             "error": event.get("error"),
-            "worker_pid": event.get("worker_pid"),
         }
         _append_record(records_path, rec)
         record_count += 1
@@ -242,7 +245,7 @@ def _consume_async_job(
                 },
             )
 
-    # 关键：done 后立即销毁进程池（两版 zsdtdx 均需调用方显式 destroy）
+    # 关键：done 后立即销毁线程运行时（两版 zsdtdx 均需调用方显式 destroy）
     destroy_summary = dict(destroy_parallel_fetcher())
     _write_lifecycle(
         lifecycle_path,
@@ -295,9 +298,13 @@ def main() -> int:
     stock_map = get_stock_code_name()
     codes = sorted(stock_map.keys())
     stock_count = len(codes)
-    tasks = _build_tasks(codes=codes, freqs=freqs, start_time=start_time, end_time=end_time)
+    tasks = _build_tasks(
+        codes=codes, freqs=freqs, start_time=start_time, end_time=end_time
+    )
 
-    artifacts_root = _MANUAL_DIR / str(bench.get("artifacts_root", "artifacts/stock_kline_async_full_compare"))
+    artifacts_root = _MANUAL_DIR / str(
+        bench.get("artifacts_root", "artifacts/stock_kline_async_full_compare")
+    )
     out_dir = artifacts_root / target
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -366,7 +373,9 @@ def main() -> int:
         "destroy_parallel_fetcher": destroy_summary,
         "lifecycle_status": LIFECYCLE_COMPLETED,
     }
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    meta_path.write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     _write_lifecycle(
         lifecycle_path,
         status=LIFECYCLE_COMPLETED,

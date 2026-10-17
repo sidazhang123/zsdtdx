@@ -7,10 +7,10 @@
 `zsdtdx` 是一个面向 A 股/期货行情场景的 Python 封装库，参考 pytdx 生态提供统一 API、连接池、重试和并行抓取能力。部分请求组包与回包解析已按实盘抓包重新实现，并非对 `pytdx` 的直接二次封装或运行时依赖；归属说明见 `THIRD_PARTY_NOTICES.md`。
 
 - **名称**：`zsdtdx`
-- **版本**：`2.3.1`（同时定义在 `pyproject.toml` 与 `src/zsdtdx/__init__.py`）
+- **版本**：`3.0.0`（同时定义在 `pyproject.toml` 与 `src/zsdtdx/__init__.py`）
 - **许可证**：MIT（见 `LICENSE`）
 - **Python 要求**：`>=3.10`
-- **核心依赖**：`numpy`、`pandas`、`PyYAML`、`six`、`psutil`
+- **核心依赖**：`numpy`、`numba`、`pandas`、`PyYAML`、`six`、`psutil`
 
 主要对外能力：
 
@@ -103,7 +103,7 @@ py -m pytest tests/ -q --ignore=tests/test_simple_api_retry_e2e.py --ignore=test
 py -m pytest tests/ -q
 ```
 
-- 当前共有 321 个用例；其中 295 个为纯离线测试，26 个配置/重试验收用例需要真实 TCP 可达。
+- 当前共有 355 个用例；均可在离线或本机回环环境中运行。
 - `pyproject.toml` 已配置 `pythonpath = ["src"]`、`testpaths = ["tests"]`、`norecursedirs = ["manual", ...]`。
 - 不要修改 `tests/` 下现有用例的语义，除非修复接口变更导致的编译/调用错误。
 
@@ -175,13 +175,13 @@ with get_client() as client:
 
 sync/async **都不要求**前置 `with get_client()`。抓取连接由并行层进程内常驻 client 管理，不复用 with 内主进程 client：
 
-- `mode="sync"`：主进程 inproc chunk 调度。
-- `mode="async"`：独立 worker 进程池。
+- `mode="sync"`：在线程执行器中调度，阻塞等待结果。
+- `mode="async"`：全局 worker 线程池。
 
-进程池生命周期：
+线程执行器生命周期：
 
 - `prewarm_parallel_fetcher()`：预热 worker（默认不要求全部成功；业务连接按任务侧懒建）。
-- `restart_parallel_fetcher(...)`：强制重启进程池。
+- `restart_parallel_fetcher(...)`：强制重启线程执行器。
 - `destroy_parallel_fetcher()`：释放资源（建议脚本退出前调用）。
 
 K 线数据契约：
@@ -244,15 +244,15 @@ K 线数据契约：
 ### 7.2 TCP 可用地址探测
 
 - 由 `_ensure_availability_hosts_cache` 统一写入进程内缓存。
-- 主进程探测一次后，通过 snapshot 传递给 spawn 启动的 worker，避免每个 worker 重复探测。
+- 线程间共享探测快照，避免每个 worker 重复探测。
 - 探测结果裁剪逻辑：剔除不可达 → 按延迟升序 → 仅当**配置侧**地址数 > 3 且可达数 ≥ 2 时去掉最慢 1 个；配置侧 ≤ 3 的短池保留全部可达站（阈值写死为 3）。
 
 ### 7.3 并行抓取
 
-- `parallel_fetcher.py` 维护全局进程池与任务调度。
+- `parallel_fetcher.py` 维护全局线程执行器与任务调度。
 - 任务按 `(code, freq)` 或 `(index_name, freq)` 分 chunk。
-- worker 内使用 asyncio + `to_thread` 做 chunk 级并发。
-- 父进程按可达地址数 H 与总进程数 C 计算两侧同时在飞上限：地址不少于进程时用满 C；进程多于地址时上限为 `min(C, H × per_host)`。`adaptive_processes_per_host_std/ex` 分开配置。提交窗口为进程数 × `task_chunk_max_inflight_multiplier`，标准侧配额按该倍率放大，扩展侧不放大。
+- worker 直接执行受限时保护的列式 chunk，不嵌套协程或线程池。
+- 全局线程数由 `thread_workers` 指定；标准/扩展实际连接配额由 `threads_per_host_std/ex` 分开配置。提交窗口倍率只扩大待办容量，不放大连接并发；换站同样必须获取目标站配额。
 - 重试耗尽后的连接不可用、超时或 watchdog 降低对应地址配额并冷却；chunk 重试成功或成功切站不降配额。冷却结束后成功时每次 +1 回到拥塞前上限，不再向外探测更高上限。
 - chunk 级超时与重试由配置驱动；连接不可用时固定在重试前按路由重建连接。
 - 指数路由在使用时从当日 std/ex 码表过滤得到，进程内保留名称映射。

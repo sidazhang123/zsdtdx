@@ -1,0 +1,15 @@
+# 参数统一由此文件读取；任务归档由实施时从用户提供的 ZIP 提取。
+rounds: 5
+child_timeout_seconds: 240
+task_file: artifacts/refactor/demo_tasks_10k.json
+baseline_archive: artifacts/refactor/baseline.zip
+artifact_dir: artifacts/refactor/benchmark_verified
+include_full_market: true
+mixed_code_count: 12
+reuse_snapshot: false
+resume: true
+workloads: [demo_10k, full_market_daily, mixed_periods]
+pin_mixed_hosts: true
+baseline_results_dir: artifacts/refactor/benchmark_final
+benchmark_start: "2026-10-12"
+benchmark_end: "2026-10-15"

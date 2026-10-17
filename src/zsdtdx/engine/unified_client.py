@@ -322,7 +322,7 @@ def _tcp_probe_and_trim_available_hosts(
     输出：
     1. 裁剪后的可用地址列表。
     用途：
-    1. 主进程刷新缓存与 PersistentFailoverPool 首次探测共用。
+    1. 上下文客户端刷新缓存与 PersistentFailoverPool 首次探测共用。
     边界条件：
     1. hosts 为空时返回 fallback 副本。
     2. 短池阈值写死为 3，不提供 YAML 配置。
@@ -391,7 +391,7 @@ def _tcp_probe_and_trim_available_hosts(
 
 
 # ---------------------------------------------------------------------------
-# TCP 延迟探测：进程内可用地址缓存（主进程全量列表；worker 经种子化写入槽位列表）
+# TCP 延迟探测：当前解释器内共享可用地址缓存
 # ---------------------------------------------------------------------------
 _probe_result_cache: Dict[str, List[Tuple[str, int]]] = {}
 _probe_result_cache_lock = threading.Lock()
@@ -710,14 +710,14 @@ def resolve_presorted_hosts_for_connection(
 
     输入：
     1. config_path / cfg: 配置来源。
-    2. presorted_hosts: worker 槽位列表等调用方已有快照。
+    2. presorted_hosts: 调用方已有的地址排序快照。
     3. sync_if_missing: True 时缓存不可用则调用 ensure；False 时不可用则抛错。
     输出：
     1. 含 standard/extended 列表的字典（副本）。
     用途：
-    1. UnifiedTdxClient 与 worker 建连前统一取址。
+    1. UnifiedTdxClient 与共享线程运行时建连前统一取址。
     边界条件：
-    1. worker 应传入有效 presorted_hosts 且 sync_if_missing=False，避免子进程探测。
+    1. 共享线程客户端应传入有效 presorted_hosts 且 sync_if_missing=False，避免重复探测。
     """
     if _presorted_hosts_valid(presorted_hosts):
         presorted_map = dict(presorted_hosts or {})
@@ -741,7 +741,7 @@ def resolve_presorted_hosts_for_connection(
     if not sync_if_missing:
         raise RuntimeError(
             "可用地址缓存不可用且 sync_if_missing=False，"
-            "请先在主进程调用 set_config_path 或 _ensure_availability_hosts_cache"
+            "请先调用 set_config_path 或 _ensure_availability_hosts_cache"
         )
 
     _ensure_availability_hosts_cache(config_path=config_path, cfg=cfg)
@@ -750,33 +750,6 @@ def resolve_presorted_hosts_for_connection(
         "standard": list(cache.get("standard") or []),
         "extended": list(cache.get("extended") or []),
     }
-
-
-def _seed_probe_result_cache_from_snapshot(
-    snapshot: Dict[str, List[Tuple[str, int]]],
-    fingerprint: Tuple[Tuple[Tuple[str, int], ...], Tuple[Tuple[str, int], ...]],
-) -> None:
-    """
-    将快照写入当前进程 `_probe_result_cache`（供 worker 子进程使用）。
-
-    输入：
-    1. snapshot: 槽位旋转后的 standard/extended 列表。
-    2. fingerprint: 与主进程一致的 hosts 指纹。
-    输出：无。
-    边界条件：
-    1. 不触发网络探测；仅内存写入。
-    """
-    global _last_tcp_probe_hosts_fingerprint
-
-    with _probe_result_cache_lock:
-        _probe_result_cache.clear()
-        std_list = snapshot.get("standard")
-        ex_list = snapshot.get("extended")
-        if isinstance(std_list, list) and std_list:
-            _probe_result_cache["standard"] = list(std_list)
-        if isinstance(ex_list, list) and ex_list:
-            _probe_result_cache["extended"] = list(ex_list)
-        _last_tcp_probe_hosts_fingerprint = fingerprint
 
 
 def _tcp_probe_one(
@@ -812,6 +785,7 @@ class AttemptSocketCloser:
         self._lock = threading.Lock()
         self._sockets: List[Any] = []
         self._closed = False
+        self._disarmed = False
 
     def aborted(self) -> bool:
         """输入无，输出本次尝试是否已超时放弃。边界：只反映 close 是否已经调用。"""
@@ -824,7 +798,7 @@ class AttemptSocketCloser:
             return
         reject = False
         with self._lock:
-            if self._closed:
+            if self._closed or self._disarmed:
                 reject = True
             elif all(existing is not sock for existing in self._sockets):
                 self._sockets.append(sock)
@@ -834,11 +808,32 @@ class AttemptSocketCloser:
     def close(self) -> None:
         """输入无，输出无。边界：关掉已登记 socket，并拒绝之后新建的 socket。"""
         with self._lock:
+            if self._disarmed:
+                return
             self._closed = True
             sockets = list(self._sockets)
             self._sockets.clear()
         for sock in sockets:
             _close_socket_quietly(sock)
+
+    def disarm(self) -> bool:
+        """输入无，输出是否成功解除定时关闭；与 close 互斥，禁止旧超时关闭复用连接。"""
+        with self._lock:
+            if self._closed:
+                return False
+            self._disarmed = True
+            self._sockets.clear()
+            return True
+
+    def detach(self, sock) -> bool:
+        """输入待归还 socket，输出是否可安全复用；关闭已开始时必须丢弃连接。"""
+        with self._lock:
+            if self._closed:
+                return False
+            self._sockets = [
+                existing for existing in self._sockets if existing is not sock
+            ]
+            return True
 
 
 _attempt_socket_closer: contextvars.ContextVar[Optional[AttemptSocketCloser]] = (
@@ -869,6 +864,10 @@ def _bind_attempt_socket(sock: Any) -> None:
     closer = _attempt_socket_closer.get()
     if closer is not None:
         closer.bind(sock)
+        from zsdtdx.engine.thread_runtime import attempt_deadline
+
+        if hasattr(sock, "__dict__"):
+            sock._zsdtdx_deadline = attempt_deadline.get()
 
 
 _base_socket_client._socket_created_hook = _bind_attempt_socket
@@ -1029,6 +1028,11 @@ class PersistentFailoverPool:
         1. deadline 已过期时抛 TimeoutError；无活跃 socket 时仅保留线程状态。
         """
         thread_data = data if isinstance(data, dict) else self._get_thread_data()
+        api_obj = thread_data.get("api")
+        sock_client = getattr(api_obj, "client", None)
+        # 每次租用都重新登记；空闲连接已解除上次尝试的截止时间。
+        if sock_client is not None:
+            _bind_attempt_socket(sock_client)
         deadline = thread_data.get("socket_read_deadline")
         override = thread_data.get("socket_read_timeout_override")
         if deadline is None and override is None:
@@ -1042,17 +1046,14 @@ class PersistentFailoverPool:
         else:
             timeout_seconds = max(0.1, float(override))
 
-        api_obj = thread_data.get("api")
         if api_obj is None:
             return
-        sock_client = getattr(api_obj, "client", None)
         if sock_client is None:
             return
         try:
             sock_client.settimeout(timeout_seconds)
         except Exception:
             pass
-        _bind_attempt_socket(sock_client)
 
     def _connect_to_index(self, index: int) -> bool:
         """输入 host 索引，输出连接结果；用于切换连接；连接失败返回 False。"""
@@ -1259,13 +1260,30 @@ class PersistentFailoverPool:
         thread_data = self._get_thread_data()
         api = thread_data.get("api")
         if api is None:
-            return None, RuntimeError(f"{self.name} 无可用连接"), True
+            if (
+                thread_data.get("active_index", -1) < 0
+                or not self._reconnect_active_host()
+            ):
+                return None, RuntimeError(f"{self.name} 无可用连接"), True
+            api = self._get_thread_data().get("api")
+            if api is None:
+                return None, RuntimeError(f"{self.name} 无可用连接"), True
         try:
             self._apply_thread_socket_read_timeout(thread_data)
             result = getattr(api, method_name)(*args, **kwargs)
         except Exception as exc:
+            # 部分收发或解析失败后，不能在残留响应上继续发送请求。
+            if getattr(api, "client", None) is not None:
+                self._disconnect_api(api)
+                thread_data["api"] = None
             return None, exc, True
         if result is None:
+            if (
+                getattr(getattr(api, "client", None), "_zsdtdx_frame_pending", False)
+                is True
+            ):
+                self._disconnect_api(api)
+                thread_data["api"] = None
             if allow_none:
                 return None, None, True
             return None, RuntimeError(f"{self.name}.{method_name} 返回 None"), True
@@ -1510,11 +1528,10 @@ class PersistentFailoverPool:
 
 
 class ChunkLocalRowCache:
-    """单进程内的 chunk 级行缓存：每次 chunk 入口新建分区，chunk 出口释放。
+    """当前解释器内的 chunk 级行缓存：每次 chunk 入口新建分区，chunk 出口释放。
 
     设计要点：
-    1. **无锁**：移除原 `_pool_lock` 与 `threading.local` 租约；同进程同 chunk 内的访问天然串行（async 路径
-       下每个 chunk 在 `asyncio.to_thread` worker 内独立运行；sync 路径单线程顺序执行）。
+    1. **无锁**：每个 chunk 在一个工作线程内串行访问自己的分区，不跨线程共享可变行缓存。
     2. **无 free 池**：移除分区软复用，避免跨 chunk 复用 list 槽位的复杂性；分区由 Python GC 在 chunk 结束后回收。
     3. **接口收敛**：仅保留 `acquire_partition` / `soft_delete`，分别负责获取与释放分区。
     4. **命中率统计**：partition 保留 `_partition_key/_n/oldest_dt/newest_dt/page_start/fetched_pages`，
@@ -1527,7 +1544,7 @@ class ChunkLocalRowCache:
     """
 
     def __init__(self):
-        # 当前 chunk 持有的分区（同进程内最多 1 个；async 路径每个协程独立 to_thread 不会重叠）。
+        # 当前 chunk 持有的分区；每个工作线程一次只处理一个 chunk。
         # 用 dict 表存 (partition_key -> partition) 以支持理论上的并发；实际只会有 1 个 entry。
         self._partitions: Dict[str, Dict[str, Any]] = {}
 
@@ -1632,7 +1649,7 @@ class UnifiedTdxClient:
         self,
         config_path: Optional[str] = None,
         presorted_hosts: Optional[Dict[str, List[Tuple[str, int]]]] = None,
-        worker_client: bool = False,
+        shared_runtime_client: bool = False,
     ):
         """输入配置路径，输出客户端实例；用于统一初始化；路径为空时默认包内配置。"""
         resolved_config_path = self._resolve_config_path(config_path)
@@ -1683,7 +1700,7 @@ class UnifiedTdxClient:
             config_path=str(resolved_config_path),
             cfg=self.config,
             presorted_hosts=presorted_hosts,
-            sync_if_missing=not bool(worker_client),
+            sync_if_missing=not bool(shared_runtime_client),
         )
         std_list = list(resolved_hosts.get("standard") or [])
         ex_list = list(resolved_hosts.get("extended") or [])
@@ -1721,7 +1738,7 @@ class UnifiedTdxClient:
         self._runtime_failures: List[Dict[str, Any]] = []
         self._runtime_failures_lock = threading.Lock()
         self._entered_client = None
-        self._worker_client_flag = bool(worker_client)
+        self._shared_runtime_client_flag = bool(shared_runtime_client)
         self._presorted_hosts_snapshot: Dict[str, List[Tuple[str, int]]] = {
             "standard": list(self.std_pool.hosts),
             "extended": list(self.ex_pool.hosts),
@@ -4924,7 +4941,7 @@ class UnifiedTdxClient:
 
         输入：tasks 含 index_name/freq/start_time/end_time。
         输出：附带 `_index_route_*` 的任务列表。
-        用途：主进程解析指数名称，worker 不再扫目录。
+        用途：集中解析指数名称，工作线程直接复用目录快照。
         边界条件：已带合法路由的任务原样保留；名称未命中时抛 ValueError。
         """
         enriched: List[Dict[str, Any]] = []
@@ -4959,7 +4976,7 @@ class UnifiedTdxClient:
 
         输入：tasks 含 block_name/freq/start_time/end_time。
         输出：带标准行情路由和板块命令标记的任务列表。
-        用途：主进程把名称换成 88xxxx，任务主键保持 block_name。
+        用途：上下文客户端把名称换成 88xxxx，任务主键保持 block_name。
         边界条件：名称不在目录中时抛 ValueError。
         """
         routed: List[Dict[str, Any]] = []
@@ -6678,18 +6695,18 @@ class UnifiedTdxClient:
         """
         输入无，输出上下文客户端；用于 with 管理；退出时仅关闭上下文实例。
 
-        内层客户端复用本实例连接池已确定的地址顺序（含 worker presorted 快照），
-        避免 worker 路径再次触发全池 TCP 探测。
+        内层客户端复用本实例连接池已确定的地址顺序，
+        避免共享线程运行时再次触发全池 TCP 探测。
         """
         context_client = UnifiedTdxClient(
             config_path=self.config_path,
             presorted_hosts=dict(self._presorted_hosts_snapshot),
-            worker_client=self._worker_client_flag,
+            shared_runtime_client=self._shared_runtime_client_flag,
         )
-        # worker 由 route-homogeneous bundle 按实际行情侧懒建连，禁止进入上下文时双边扇出。
+        # 共享线程客户端按实际行情侧懒建连，禁止进入上下文时双边扇出。
         if (
             context_client.preconnect_on_enter
-            and not context_client._worker_client_flag
+            and not context_client._shared_runtime_client_flag
         ):
             context_client._warmup_connections()
         self._entered_client = context_client

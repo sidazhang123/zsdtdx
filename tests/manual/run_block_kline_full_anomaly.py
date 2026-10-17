@@ -11,14 +11,13 @@
 边界：
 1. 需访问真实行情服务器；不由 pytest 收集。
 2. 参数写死本文件，不暴露 CLI。
-3. 结束后销毁并行进程池；不保留全量原始 rows 到磁盘（仅报告与异常抽样）。
+3. 结束后销毁并行线程运行时；不保留全量原始 rows 到磁盘（仅报告与异常抽样）。
 """
 
 from __future__ import annotations
 
 import json
 import math
-import multiprocessing as mp
 import queue as std_queue
 import re
 import sys
@@ -67,37 +66,19 @@ def _force_cleanup_parallel(*, label: str) -> Dict[str, Any]:
     """
     输入段落标签。
     输出清理摘要。
-    用途：async 结束后回收进程池与残留子进程。
-    边界：只处理本进程 multiprocessing 子进程。
+    用途：async 结束后回收线程运行时。
+    边界：重复销毁安全；回收失败写入摘要。
     """
     from zsdtdx import destroy_parallel_fetcher
 
     summary: Dict[str, Any] = {
         "label": label,
         "destroy": {},
-        "terminated": [],
-        "killed": [],
     }
     try:
         summary["destroy"] = dict(destroy_parallel_fetcher())
     except Exception as exc:
         summary["destroy_error"] = str(exc)
-    for child in list(mp.active_children()):
-        try:
-            pid = int(getattr(child, "pid", 0) or 0)
-        except Exception:
-            pid = 0
-        try:
-            if child.is_alive():
-                child.terminate()
-                child.join(timeout=2.0)
-                summary["terminated"].append(pid)
-            if child.is_alive():
-                child.kill()
-                child.join(timeout=2.0)
-                summary["killed"].append(pid)
-        except Exception:
-            pass
     _log(
         f"cleanup[{label}] destroy={summary.get('destroy')} "
         f"term={summary['terminated']} kill={summary['killed']}"

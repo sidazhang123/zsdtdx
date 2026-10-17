@@ -12,7 +12,7 @@ pip install zsdtdx
 
 用户日常只需关注两层对外入口（均可从 `zsdtdx` 直接导入）：
 
-1. **`simple_api`**：`get_*` / `set_config_path` / `get_client` / 进程池生命周期等调用入口。
+1. **`simple_api`**：`get_*` / `set_config_path` / `get_client` / 线程执行器生命周期等调用入口。
 2. **`kline_task`**：构造股票/指数/板块 K 线任务列表的类型入口
    （`StockKlineTask` / `IndexKlineTask` / `BlockKlineTask`）。也可用等价 `dict`，任务类字段校验更明确。
 
@@ -42,7 +42,7 @@ pip install zsdtdx
 ## 运行环境与依赖
 
 - Python: `>=3.10`
-- 依赖：`numpy`、`pandas`、`PyYAML`、`six`、`psutil`
+- 依赖：`numpy`、`numba`、`pandas`、`PyYAML`、`six`、`psutil`
 
 
 
@@ -101,7 +101,7 @@ block_tasks = [
 
 #### set_config_path
 
-设置全局配置路径（主进程与并行 worker 统一生效），如不调用则后续函数使用包内默认配置(见文档最后的示例)。
+设置全局配置路径（上下文客户端与共享线程运行时统一生效），如不调用则后续函数使用包内默认配置(见文档最后的示例)。
 
 用户侧 YAML **允许不完整**：运行时以包内默认 `config.yaml` 为底，对用户文件中与内置**同名的键**做深合并覆盖；内置不存在的键会被丢弃；列表字段（如 `hosts.standard`）整段替换，不做元素并集。
 
@@ -154,9 +154,9 @@ with get_client():
 
 **作用边界:**
 
-- 该 client 仅管理"当前主进程"上下文中的连接生命周期（进入 with 预连接，退出 with 自动 close）。
-- `get_stock_kline` / `get_index_kline` / `get_block_kline` 的 sync/async 抓取连接由并行层进程内常驻 client 管理，
-  不与此处 with 返回的主进程 client 共用；with 结束也不会关掉它们。
+- 该 client 仅管理当前 `with` 上下文中的连接生命周期（进入 with 预连接，退出 with 自动 close）。
+- `get_stock_kline` / `get_index_kline` / `get_block_kline` 的 sync/async 抓取连接由并行层当前解释器内共享 client 管理，
+  不与此处 with 返回的上下文 client 共用；with 结束也不会关掉它们。
 - 市场列表不再有独立 `get_*` 封装；需要时在 with 内调用客户端方法：
   `with get_client() as client: client.get_supported_markets(return_df=True)`。
 
@@ -168,7 +168,7 @@ with get_client():
 
 **调用前置约定:**
 
-- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
+- 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接；
 
 **输入:**
 
@@ -205,7 +205,7 @@ with get_client():
 
 **调用前置约定:**
 
-- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
+- 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接；
 
 **输出:**
 
@@ -235,7 +235,7 @@ with get_client():
 
 **调用前置约定:**
 
-- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
+- 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接；
 
 **输入:**
 
@@ -269,7 +269,7 @@ with get_client():
 
 **调用前置约定:**
 
-- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
+- 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接；
 
 **输入:**
 
@@ -299,9 +299,9 @@ with get_client():
 
 **调用前置约定:**
 
-- sync/async 均不要求前置 `with get_client()`；可选 with 以便同块调用其它主进程 `get_*`。
-- 抓取连接由并行层进程内常驻 client 管理，不复用 with 内主进程 client。
-- `mode="async"`：worker 子进程内抓取；`mode="sync"`：主进程 inproc 调度。
+- sync/async 均不要求前置 `with get_client()`；可选 with 以便同块调用其它上下文型 `get_*`。
+- 抓取连接由共享线程运行时的常驻 client 管理，不复用 with 内上下文 client。
+- `mode="async"`：返回后台句柄；`mode="sync"`：阻塞等待；共用线程与列式内核。
 
 **输入:**
 
@@ -360,8 +360,8 @@ finally:
 
 **连接生命周期:**
 
-- `mode="sync"`：主进程 inproc 调度，连接为抓取器进程内常驻 client；with 结束只关主进程 with client。
-- `mode="async"`：worker 子进程内按任务侧（std/ex）懒建连接；进程池见 prewarm/restart/destroy。
+- `mode="sync"`：阻塞等待线程调度；抓取器连接与用户 with client 独立管理。
+- `mode="async"`：后台协调并返回句柄；与 sync 共用线程和按 std/ex 分离的连接配额。
 - 同时在飞上限、地址配额与冷却等调度细节见下文默认配置 `parallel` 段说明。
 
 **返回:**
@@ -369,14 +369,14 @@ finally:
 - mode="sync": `list[task_payload]`（传 queue 时同时推送 data/done）。
 - mode="async": `StockKlineJob`（从 `job.queue` 消费到 done）。
 - task_payload:
-`{"event":"data","task":{...},"rows":[...],"error":str|None,"worker_pid":int}`。
+`{"event":"data","task":{...},"rows":[...],"error":str|None}`。
   > 示例：
   >
   > ```json
   > {"event": "data",
   >  "task": {"code": "600000", "freq": "d", "start_time": "2026-02-01 09:30:00", "end_time": "2026-02-02 16:00:00"},
   >  "rows": [{"code": "sh.600000", "freq": "d", "open": 10.07, "close": 10.06, "high": 10.25, "low": 10.03, "volume": 105771232, "amount": 1072786048, "datetime": "2026-02-02 15:00:00"}],
-  >  "error": null, "worker_pid": 7200}
+  >  "error": null}
   > ```
 - done: `{"event":"done","total_tasks":...,"success_tasks":...,"failed_tasks":...}`。
 
@@ -389,8 +389,8 @@ finally:
 **调用前置约定:**
 
 - sync/async 均不要求前置 `with get_client()`；无 with 时名称路由解析会临时建连。
-- 抓取连接由并行层常驻 client 管理（sync 主进程 inproc；async worker 子进程）。
-- sync 走主进程 inproc chunk；async 走进程池 worker。
+- 抓取连接由并行层常驻 client 管理（sync/async 共用常驻线程执行器与连接租约）。
+- sync 阻塞等待，async 返回句柄；二者共用有界线程调度与列式内核。
 
 **输入:**
 
@@ -434,7 +434,7 @@ result = get_index_kline(
 
 **调用前置约定:**
 
-- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
+- 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接；
 
 **输出:**
 
@@ -493,11 +493,11 @@ result = get_block_kline(
 
 #### （一般无需手动调用）prewarm_parallel_fetcher
 
-手动预热 async 并行抓取进程池。仅拉起 worker，不建 std/ex 业务连接。默认不要求全部 worker 成功；超时 60 秒、最多 3 轮，不读 YAML。首次 async 任务会自动预热，一般不必手动调用。
+手动预热并行抓取线程执行器。编译解码器并拉起工作线程，不建 std/ex 业务连接。默认不要求全部线程成功；超时 60 秒、最多 3 轮，不读 YAML。未手动预热时，首次 K 线任务按需编译并拉起工作线程。
 
 **输出:**
 
-- 预热摘要字典（目标进程数、已预热进程数、pid 列表、耗时等）。
+- 预热摘要字典（目标线程数、已预热线程数、线程标识、编译状态和耗时）。
 
 **什么时候调用:**
 
@@ -505,14 +505,14 @@ result = get_block_kline(
 
 **边界条件:**
 
-- 只校验目标 worker 是否已启动，不要求 std/ex 同时建连。
-- 仅当 `require_all_workers=True` 且预热不足时抛 RuntimeError；默认 False，不足只记入摘要。
+- 只校验目标工作线程是否已启动，不要求 std/ex 同时建连。
+- 仅当内部 `require_all_threads=True` 且预热不足时抛 RuntimeError；默认 False，不足只记入摘要。
 
 
 
 #### （一般无需手动调用）restart_parallel_fetcher
 
-强制重启 async 并行抓取进程池（终止旧 worker 并按需预热）。
+强制重启 async 并行抓取线程执行器（中断旧工作、关闭连接并按需预热）。
 
 **输入:**
 
@@ -522,12 +522,12 @@ result = get_block_kline(
 
 **输出:**
 
-- 重启摘要字典（旧 pid、终止结果、预热摘要、耗时等）。
+- 重启摘要字典（旧线程数、回收结果、预热摘要、耗时等）。
 
 **什么时候调用:**
 
-- 出现连续 timeout/连接异常，怀疑 worker 状态异常时。
-- 需要快速回收并重建 worker 连接状态时。
+- 出现连续 timeout/连接异常，怀疑工作线程状态异常时。
+- 需要快速回收并重建工作线程连接状态时。
 
 **边界条件:**
 
@@ -537,8 +537,8 @@ result = get_block_kline(
 
 #### （一般无需手动调用）destroy_parallel_fetcher
 
-销毁 async 并行抓取进程池并释放 worker 资源。
-主进程正常退出时进程池会自行销毁。
+销毁 async 并行抓取线程执行器并释放工作线程资源。
+解释器正常退出时线程执行器会自行销毁。
 
 **输入:**
 
@@ -546,16 +546,16 @@ result = get_block_kline(
 
 **输出:**
 
-- 销毁摘要字典（是否存在旧池、旧 worker 数、销毁后版本号、耗时）。
+- 销毁摘要字典（是否存在旧池、旧线程数、销毁后版本号、耗时）。
 
 **什么时候调用:**
 
-- 长驻服务优雅停机前，主动释放 worker 与连接资源。
-- 短脚本结束前，避免保留并行进程池到解释器退出阶段。
+- 长驻服务优雅停机前，主动释放工作线程与连接资源。
+- 短脚本结束前，避免保留并行线程执行器到解释器退出阶段。
 
 **边界条件:**
 
-- 进程池不存在时安全返回，不抛错。
+- 线程执行器不存在时安全返回，不抛错。
 
 
 
@@ -565,8 +565,8 @@ result = get_block_kline(
 
 **调用前置约定:**
 
-- 建议 `with get_client():` 以便同块调用其它主进程 API。
-- 进程数 > 1 时 worker 并行（不占用主进程连接）；≤ 1 时串行并可复用 with 内连接。
+- 建议 `with get_client():` 以便同块调用其它上下文 API。
+- 使用全局线程执行器及独立连接租约，最终交付 DataFrame；不复用用户 with 内连接。
 - 与 `get_stock_kline` 的 task 路径不同。
 
 **输入:**
@@ -605,8 +605,8 @@ with get_client():
 
 **调用前置约定:**
 
-- `mode="sync"`：可直接调用；进入 `with get_client():` 时可复用主进程连接。
-- `mode="async"`（默认）：走进程池并行，不依赖主进程 with 连接；退出前建议 `destroy_parallel_fetcher()`。
+- `mode="sync"`：可直接调用；进入 `with get_client():` 时可复用上下文连接。
+- `mode="async"`（默认）：走线程执行器并行，不依赖上下文连接；退出前建议 `destroy_parallel_fetcher()`。
 
 **输入:**
 
@@ -659,7 +659,7 @@ with get_client():
 
 **调用前置约定:**
 
-- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
+- 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接；
 
 **输入:**
 
@@ -720,7 +720,7 @@ with get_client():
 
 **调用前置约定:**
 
-- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
+- 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接；
 
 **输入:**
 
@@ -768,7 +768,7 @@ with get_client():
 
 **调用前置约定:**
 
-- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
+- 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接；
 
 **调用示例:**
 
@@ -793,7 +793,7 @@ with get_client():
 
 **调用前置约定:**
 
-- 可直接调用；连续调用多个主进程 API 时建议进入 `with get_client():` 复用连接；
+- 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接；
 
 **调用示例:**
 
@@ -881,32 +881,23 @@ pool:
   probe_timeout: 0.8
 
 parallel:
-  # 并行进程数倍率：推荐进程数 = max(2, int(物理核心数 * 该倍率))。
-  # 取值: 正浮点数（建议 0.5~3.0）
-  # 影响: 倍率越大并发越高，吞吐可能提升，但 CPU/内存占用也会上升。
-  process_count_core_multiplier: 1
-  # 父进程同时提交的 bundle 窗口 = 进程数 × 本值。
-  # 取值: 正整数
-  # 影响: 标准侧地址配额按本值放大，用来把下一批 bundle 放进进程池队列；扩展侧不放大。
+  # 全局抓取线程硬上限；sync/async 与期货、公司信息共享，不按 CPU 核心换算。
+  thread_workers: 44
+  # 已提交但未完成的 chunk 窗口 = 线程数 × 本值，不放大真实连接配额。
   task_chunk_max_inflight_multiplier: 2
-  # 标准行情每个可达地址允许同时摊到的进程数。
-  # 取值: 正整数
-  # 影响: 地址不少于总进程时该侧用满总进程；进程多于地址时该侧上限 = min(总进程数, 地址数 × 本值)。
-  adaptive_processes_per_host_std: 4
-  # 扩展行情每个可达地址允许同时摊到的进程数；与标准侧分开配置。
-  # 取值: 正整数
-  # 影响: 扩展地址很少时把同时在飞进程压在 地址数 × 本值，避免 40 个进程打两个站。
-  adaptive_processes_per_host_ex: 4
-  # 重试耗尽后的连接不可用、超时或 watchdog 后保留的该地址进程配额比例。
+  # 标准/扩展行情单站同时工作连接上限，故障换站同样受此约束。
+  threads_per_host_std: 4
+  threads_per_host_ex: 4
+  # 重试耗尽后的连接不可用、超时或 watchdog 后保留的该地址线程配额比例。
   # 取值: 0~1 浮点数（建议 0.3~0.8）
   # 影响: chunk 重试成功或成功切到其他地址不降配额；只在最终仍失败时退避。
   adaptive_decrease_factor: 0.75
   # host 触发拥塞后的冷却秒数。
   # 取值: 非负浮点数
-  # 影响: 冷却期间不向该 host 分配新 bundle；结束后保持降后的配额，成功时每次 +1 直到回到拥塞前上限。
+  # 影响: 冷却期间不向该 host 分配新 chunk；结束后保持降后的配额，成功时每次 +1 直到回到拥塞前上限。
   adaptive_cooldown_seconds: 1.5
-  # 单次 chunk 抓取尝试墙钟上限（秒）：仅约束每一次 get_*_kline_rows_for_chunk_tasks（含该次建连与网络 IO）。
-  # 不含入口归一化失败；不含 bundle 级预热建连；不含重试累计（重试由 chunk_retry_max_attempts 单独控制，每次尝试各算本上限）。
+  # 单次 chunk 列式抓取尝试墙钟上限（秒），覆盖等待连接配额、建连、网络 IO 和解析。
+  # 不含提交排队、入口归一化与最终 rows/DataFrame 打包；每次重试重新计时。
   # 取值: 正浮点数
   # 影响: 到点关闭本次尝试的 socket，阻塞中的 connect/recv 返回并按失败结束；重连同样受本上限约束。最坏墙钟约 chunk_timeout_seconds × (1 + chunk_retry_max_attempts)。
   # 调优指南（D4）: 5s 适合超低延迟内网；公网/弱网建议 15s+，避免短超时频繁触发重连放大尾延迟。
@@ -1006,12 +997,23 @@ index_kline:
   - 过程日志固定为 `INFO`，异常固定为 `ERROR`，逐 chunk 派发/完成与重试细节固定为 `DEBUG`；配置不能改变单条日志所属级别。
   - `OFF` 仅关闭日志输出，不会删除 `get_runtime_failures()` 中的结构化失败。
 - 常用并行配置位于 `parallel` 段：
-  - `process_count_core_multiplier`
+  - `thread_workers`
   - `task_chunk_max_inflight_multiplier`
-  - `adaptive_processes_per_host_std`
-  - `adaptive_processes_per_host_ex`
+  - `threads_per_host_std`
+  - `threads_per_host_ex`
   - `adaptive_decrease_factor`
   - `adaptive_cooldown_seconds`
   - `chunk_timeout_seconds`
   - `chunk_retry_max_attempts`
 
+
+
+### 线程执行与列式交付边界
+
+- 并行抓取只使用线程；默认 `thread_workers: 44`，标准/扩展单站上限由 `threads_per_host_std/ex` 分别控制，默认均为 4。
+- K 线内核采用 numba（释放 GIL、关闭 fastmath）及只读 NumPy 列。分页、过滤、去重、排序和窗口切片不创建行字典或 DataFrame；现有 rows / 期货 DataFrame 在交付适配层构造。
+- 行情事件使用 `data` / `done` 契约。预热摘要使用 `target_threads`、`ready_threads`、`thread_ids`、`decoder_ready`；重启/销毁报告 `old_threads`、`pending_tasks` 和代际编号。
+- 列式切片持有数组引用，缓存释放不使结果失效；目前未新增对外列式输出模式，未来可在交付边界直接返回列式结果，由用户侧打包。
+- 尝试截止时间覆盖建连、握手及分段收发；半包、未完成传输的连接先废弃再重试。换站仍需申请目标站配额。
+- 重启或销毁关闭正在使用的 socket 并等待受控工作退出；残留工作未退出时明确报错，禁止不断新建线程池扩容。原生扩展死锁需要外部重启整个进程。
+- numba 是必需依赖，首次编译或加载缓存会增加冷启动开销；预热可将此开销前移，行情连接仍按实际路由懒建。

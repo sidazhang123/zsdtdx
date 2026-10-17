@@ -3,13 +3,13 @@
 
 职责：
 1. 为 std/ex 行情任务提供跨 async job 共享的线程安全准入控制。
-2. 按可达地址数与总进程数计算两侧同时在飞进程上限，并按地址摊开。
-3. 连接拥塞时降低对应地址的进程配额并冷却；冷却结束后靠成功逐步回到拥塞前上限。
+2. 按可达地址数与共享工作预算计算两侧上限，并按地址摊开。
+3. 连接拥塞时降低对应地址配额并冷却；冷却结束后靠成功逐步回到拥塞前上限。
 
 边界：
-1. 本模块只管理父进程内的调度状态，不创建进程、线程或网络连接。
-2. 配额是同时在飞 bundle 数；实际连接仍由 worker 内连接池建立。
-3. 配置切换、进程池重启时由调用方显式 reset。
+1. 本模块只管理当前解释器内共享的调度状态，不创建工作线程或网络连接。
+2. 每个准入对应独占工作租约，实际连接由工作线程内连接池建立。
+3. 配置切换、执行器重启时由调用方显式 reset。
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 
 HostTuple = Tuple[str, int]
-_DEFAULT_PROCESSES_PER_HOST = 4
+_DEFAULT_THREADS_PER_HOST = 4
 
 
 def _normalize_source(source: str) -> str:
@@ -50,23 +50,23 @@ def _normalize_host(raw_host: Any) -> HostTuple:
     return host, port
 
 
-def compute_side_process_budget(
-    max_processes: int, host_count: int, processes_per_host: int
+def compute_side_thread_budget(
+    max_threads: int, host_count: int, threads_per_host: int
 ) -> int:
     """
-    按总进程数与可达地址数计算某一侧同时在飞进程上限。
+    按总线程数与可达地址数计算某一侧同时在飞线程上限。
 
     输入：
-    1. max_processes: 全局进程硬顶 C。
+    1. max_threads: 全局工作线程硬顶 C。
     2. host_count: 该侧可达地址数 H。
-    3. processes_per_host: 每个地址允许同时摊到的进程数。
-    输出：该侧进程预算。
-    用途：地址比进程多时用满 C；进程比地址多时按 H × per_host 封顶。
+    3. threads_per_host: 每个地址允许同时占用的线程数。
+    输出：该侧线程预算。
+    用途：地址比线程多时用满 C；线程比地址多时按 H × per_host 封顶。
     边界：无可达地址返回 0；结果不会超过 C。
     """
-    total = max(1, int(max_processes))
+    total = max(1, int(max_threads))
     hosts = max(0, int(host_count))
-    per_host = max(1, int(processes_per_host))
+    per_host = max(1, int(threads_per_host))
     if hosts <= 0:
         return 0
     if total <= hosts:
@@ -97,11 +97,11 @@ class AdaptivePermit:
 
 @dataclass
 class _HostWindow:
-    """单 host 进程配额内部状态。"""
+    """单 host 线程配额内部状态。"""
 
     host: HostTuple
-    process_cap: int = 1
-    process_inflight: int = 0
+    thread_cap: int = 1
+    thread_inflight: int = 0
     cooldown_until: float = 0.0
     failed_ceiling: Optional[int] = None
     selectable: bool = True
@@ -109,12 +109,12 @@ class _HostWindow:
 
 class AdaptiveConcurrencyController:
     """
-    按地址数与总进程数计算配额的并发控制器。
+    按地址数与总线程数计算配额的并发控制器。
 
     输入：
-    1. max_processes: 全局同时在飞 bundle 的硬上限。
-    2. inproc_limit: 单 bundle 最多包含的 chunk 数。
-    3. processes_per_host_std/ex: 两侧每个地址允许同时摊到的进程数。
+    1. max_threads: 全局同时在飞工作线程的硬上限。
+    2. chunks_per_lease: 单个准入租约允许承载的 chunk 数。
+    3. threads_per_host_std/ex: 两侧每个地址允许同时占用的线程数。
     4. decrease_factor/cooldown_seconds: 拥塞保险丝参数；冷却后成功时每次配额 +1，直到拥塞前上限。
     输出：
     1. 通过 acquire/release 管理准入凭证。
@@ -126,19 +126,19 @@ class AdaptiveConcurrencyController:
     def __init__(
         self,
         *,
-        max_processes: int,
-        inproc_limit: int,
-        processes_per_host_std: int = _DEFAULT_PROCESSES_PER_HOST,
-        processes_per_host_ex: int = _DEFAULT_PROCESSES_PER_HOST,
+        max_threads: int,
+        chunks_per_lease: int,
+        threads_per_host_std: int = _DEFAULT_THREADS_PER_HOST,
+        threads_per_host_ex: int = _DEFAULT_THREADS_PER_HOST,
         decrease_factor: float = 0.75,
         cooldown_seconds: float = 1.5,
     ) -> None:
         self._condition = threading.Condition(threading.RLock())
-        self._max_processes = max(1, int(max_processes))
-        self._inproc_limit = max(1, int(inproc_limit))
-        self._processes_per_host = {
-            "std": max(1, int(processes_per_host_std)),
-            "ex": max(1, int(processes_per_host_ex)),
+        self._max_threads = max(1, int(max_threads))
+        self._chunks_per_lease = max(1, int(chunks_per_lease))
+        self._threads_per_host = {
+            "std": max(1, int(threads_per_host_std)),
+            "ex": max(1, int(threads_per_host_ex)),
         }
         self._decrease_factor = min(0.95, max(0.1, float(decrease_factor)))
         self._cooldown_seconds = max(0.0, float(cooldown_seconds))
@@ -146,61 +146,61 @@ class AdaptiveConcurrencyController:
             "std": {},
             "ex": {},
         }
-        self._side_process_budget = {"std": 0, "ex": 0}
+        self._side_thread_budget = {"std": 0, "ex": 0}
         self._side_inflight = {"std": 0, "ex": 0}
         self._next_ticket = 1
         self._waiting_tickets: Dict[str, list[int]] = {"std": [], "ex": []}
         self._active_permits: Dict[int, AdaptivePermit] = {}
-        self._inflight_processes = 0
+        self._inflight_threads = 0
         self._round_robin_cursor = {"std": 0, "ex": 0}
 
     @property
-    def max_processes(self) -> int:
-        """输入无，输出当前全局进程硬上限。"""
+    def max_threads(self) -> int:
+        """输入无，输出当前全局工作线程硬上限。"""
         with self._condition:
-            return int(self._max_processes)
+            return int(self._max_threads)
 
     @property
-    def inproc_limit(self) -> int:
-        """输入无，输出单 bundle 的 chunk 上限。"""
+    def chunks_per_lease(self) -> int:
+        """输入无，输出单个准入租约的 chunk 上限。"""
         with self._condition:
-            return int(self._inproc_limit)
+            return int(self._chunks_per_lease)
 
     def configure(
         self,
         *,
-        max_processes: int,
-        inproc_limit: int,
-        processes_per_host_std: Optional[int] = None,
-        processes_per_host_ex: Optional[int] = None,
+        max_threads: int,
+        chunks_per_lease: int,
+        threads_per_host_std: Optional[int] = None,
+        threads_per_host_ex: Optional[int] = None,
         decrease_factor: Optional[float] = None,
         cooldown_seconds: Optional[float] = None,
     ) -> None:
         """
         更新控制器运行参数。
 
-        输入：进程/进程内并发上限及可选每地址进程数、拥塞参数。
+        输入：线程/租约 chunk 上限及可选每地址线程数、拥塞参数。
         输出：无。
         边界：不会撤销已发放凭证；新限制仅影响后续 acquire。
         """
         with self._condition:
-            self._max_processes = max(1, int(max_processes))
-            self._inproc_limit = max(1, int(inproc_limit))
-            if processes_per_host_std is not None:
-                self._processes_per_host["std"] = max(1, int(processes_per_host_std))
-            if processes_per_host_ex is not None:
-                self._processes_per_host["ex"] = max(1, int(processes_per_host_ex))
+            self._max_threads = max(1, int(max_threads))
+            self._chunks_per_lease = max(1, int(chunks_per_lease))
+            if threads_per_host_std is not None:
+                self._threads_per_host["std"] = max(1, int(threads_per_host_std))
+            if threads_per_host_ex is not None:
+                self._threads_per_host["ex"] = max(1, int(threads_per_host_ex))
             if decrease_factor is not None:
                 self._decrease_factor = min(0.95, max(0.1, float(decrease_factor)))
             if cooldown_seconds is not None:
                 self._cooldown_seconds = max(0.0, float(cooldown_seconds))
             for source, mapping in self._hosts.items():
-                formula = int(self._processes_per_host[source])
+                formula = int(self._threads_per_host[source])
                 for state in mapping.values():
                     if state.cooldown_until <= 0 and state.failed_ceiling is None:
-                        state.process_cap = formula
+                        state.thread_cap = formula
                     else:
-                        state.process_cap = max(1, min(int(state.process_cap), formula))
+                        state.thread_cap = max(1, min(int(state.thread_cap), formula))
             self._recompute_side_budgets_locked()
             self._condition.notify_all()
 
@@ -227,19 +227,19 @@ class AdaptiveConcurrencyController:
 
         with self._condition:
             previous = self._hosts[source_key]
-            formula = int(self._processes_per_host[source_key])
+            formula = int(self._threads_per_host[source_key])
             replacement: Dict[HostTuple, _HostWindow] = {}
             for item in normalized:
                 existing = previous.get(item)
                 if existing is None:
                     replacement[item] = _HostWindow(
-                        host=item, process_cap=formula, selectable=True
+                        host=item, thread_cap=formula, selectable=True
                     )
                 else:
                     existing.selectable = True
                     replacement[item] = existing
             for item, state in previous.items():
-                if item not in replacement and int(state.process_inflight) > 0:
+                if item not in replacement and int(state.thread_inflight) > 0:
                     state.selectable = False
                     replacement[item] = state
             self._hosts[source_key] = replacement
@@ -248,15 +248,15 @@ class AdaptiveConcurrencyController:
             self._condition.notify_all()
 
     def _recompute_side_budgets_locked(self) -> None:
-        """输入无，按当前地址快照重算两侧进程预算。"""
+        """输入无，按当前地址快照重算两侧线程预算。"""
         for source in ("std", "ex"):
             live_hosts = sum(
                 1 for state in self._hosts[source].values() if bool(state.selectable)
             )
-            self._side_process_budget[source] = compute_side_process_budget(
-                self._max_processes,
+            self._side_thread_budget[source] = compute_side_thread_budget(
+                self._max_threads,
                 live_hosts,
-                self._processes_per_host[source],
+                self._threads_per_host[source],
             )
 
     def _refresh_cooldown(self, source: str, state: _HostWindow, now: float) -> None:
@@ -264,13 +264,13 @@ class AdaptiveConcurrencyController:
         输入侧名、host 状态与当前时间。
         输出：无。
         用途：冷却结束后重新允许派发；配额保持降后的值，由后续成功逐步抬回。
-        边界：不在此处抬高 process_cap；failed_ceiling 继续作为回升目标保留。
+        边界：不在此处抬高 thread_cap；failed_ceiling 继续作为回升目标保留。
         """
         if state.cooldown_until > 0 and now >= state.cooldown_until:
             state.cooldown_until = 0.0
 
     def _select_host_with_capacity(
-        self, source: str, max_units: int, now: float
+        self, source: str, max_units: int, now: float, preferred_host=None
     ) -> Optional[Tuple[_HostWindow, int]]:
         """输入路由、需求和时间，输出可分配 host 及槽位数；无容量返回 None。"""
         states = list(self._hosts[source].values())
@@ -279,14 +279,16 @@ class AdaptiveConcurrencyController:
         start = int(self._round_robin_cursor[source]) % len(states)
         ordered = states[start:] + states[:start]
         for offset, state in enumerate(ordered):
+            if preferred_host is not None and state.host != preferred_host:
+                continue
             if not bool(state.selectable):
                 continue
             self._refresh_cooldown(source, state, now)
             if state.cooldown_until > now:
                 continue
-            if int(state.process_inflight) >= max(1, int(state.process_cap)):
+            if int(state.thread_inflight) >= max(1, int(state.thread_cap)):
                 continue
-            units = min(max(1, int(max_units)), self._inproc_limit)
+            units = min(max(1, int(max_units)), self._chunks_per_lease)
             self._round_robin_cursor[source] = (start + offset + 1) % len(states)
             return state, units
         return None
@@ -299,7 +301,7 @@ class AdaptiveConcurrencyController:
         边界：调用方必须已持有控制器锁。
         """
         for state in self._hosts[source].values():
-            if bool(state.selectable) or int(state.process_inflight) > 0:
+            if bool(state.selectable) or int(state.thread_inflight) > 0:
                 return True
         return False
 
@@ -309,16 +311,17 @@ class AdaptiveConcurrencyController:
         *,
         max_units: int,
         timeout: Optional[float] = None,
+        preferred_host=None,
     ) -> AdaptivePermit:
         """
-        按本侧 FIFO 获取一个 bundle 准入凭证。
+        按本侧 FIFO 获取一个线程准入凭证。
 
         输入：
         1. source: std/ex。
         2. max_units: 当前最多希望打包的 chunk 数。
         3. timeout: 等待秒数；None 表示一直等待。
         输出：AdaptivePermit。
-        边界：超时抛 TimeoutError。无可达 host，或等待期间该侧已没有可选地址且没有在飞 bundle 时，
+        边界：超时抛 TimeoutError。无可达 host，或等待期间该侧已没有可选地址且没有在飞线程时，
         timeout 为 None 抛 RuntimeError，有限超时抛 TimeoutError。
         """
         source_key = _normalize_source(source)
@@ -343,21 +346,21 @@ class AdaptiveConcurrencyController:
                     waiting = self._waiting_tickets[source_key]
                     is_head = bool(waiting and int(waiting[0]) == ticket)
                     selected = None
-                    side_budget = int(self._side_process_budget[source_key])
+                    side_budget = int(self._side_thread_budget[source_key])
                     if (
                         is_head
-                        and self._inflight_processes < self._max_processes
+                        and self._inflight_threads < self._max_threads
                         and self._side_inflight[source_key] < side_budget
                     ):
                         selected = self._select_host_with_capacity(
-                            source_key, max_units, now
+                            source_key, max_units, now, preferred_host
                         )
                     if selected is not None:
                         state, units = selected
                         waiting.pop(0)
-                        state.process_inflight += 1
+                        state.thread_inflight += 1
                         self._side_inflight[source_key] += 1
-                        self._inflight_processes += 1
+                        self._inflight_threads += 1
                         permit = AdaptivePermit(
                             source=source_key,
                             host=state.host,
@@ -409,25 +412,25 @@ class AdaptiveConcurrencyController:
             active = self._active_permits.pop(int(permit.ticket), None)
             if active is None:
                 return
-            self._inflight_processes = max(0, self._inflight_processes - 1)
+            self._inflight_threads = max(0, self._inflight_threads - 1)
             self._side_inflight[active.source] = max(
                 0, int(self._side_inflight[active.source]) - 1
             )
             state = self._hosts[active.source].get(active.host)
             if state is not None:
-                state.process_inflight = max(0, int(state.process_inflight) - 1)
+                state.thread_inflight = max(0, int(state.thread_inflight) - 1)
                 now = time.monotonic()
                 if bool(congested):
-                    failed_level = max(1, int(state.process_cap))
+                    failed_level = max(1, int(state.thread_cap))
                     previous_ceiling = state.failed_ceiling
                     if previous_ceiling is not None:
                         state.failed_ceiling = max(int(previous_ceiling), failed_level)
                     else:
                         state.failed_ceiling = failed_level
-                    state.process_cap = max(
+                    state.thread_cap = max(
                         1,
                         int(
-                            math.floor(float(state.process_cap) * self._decrease_factor)
+                            math.floor(float(state.thread_cap) * self._decrease_factor)
                         ),
                     )
                     state.cooldown_until = now + self._cooldown_seconds
@@ -436,13 +439,13 @@ class AdaptiveConcurrencyController:
                     and state.cooldown_until <= now
                     and state.failed_ceiling is not None
                 ):
-                    formula = int(self._processes_per_host[active.source])
+                    formula = int(self._threads_per_host[active.source])
                     target = max(1, min(formula, int(state.failed_ceiling)))
-                    if int(state.process_cap) < target:
-                        state.process_cap = min(target, int(state.process_cap) + 1)
-                    if int(state.process_cap) >= target:
+                    if int(state.thread_cap) < target:
+                        state.thread_cap = min(target, int(state.thread_cap) + 1)
+                    if int(state.thread_cap) >= target:
                         state.failed_ceiling = None
-                if int(state.process_inflight) == 0 and not bool(state.selectable):
+                if int(state.thread_inflight) == 0 and not bool(state.selectable):
                     self._hosts[active.source].pop(active.host, None)
                     self._recompute_side_budgets_locked()
             self._condition.notify_all()
@@ -452,16 +455,29 @@ class AdaptiveConcurrencyController:
         清空学习状态与等待队列。
 
         输入/输出：无。
-        边界：仅应在无业务或进程池生命周期切换时调用；已发凭证会失效。
+        边界：仅应在无业务或线程执行器生命周期切换时调用；已发凭证会失效。
         """
         with self._condition:
             self._hosts = {"std": {}, "ex": {}}
-            self._side_process_budget = {"std": 0, "ex": 0}
+            self._side_thread_budget = {"std": 0, "ex": 0}
             self._side_inflight = {"std": 0, "ex": 0}
             self._waiting_tickets = {"std": [], "ex": []}
             self._active_permits.clear()
-            self._inflight_processes = 0
+            self._inflight_threads = 0
             self._round_robin_cursor = {"std": 0, "ex": 0}
+            self._condition.notify_all()
+
+    def penalize_host(self, source, host):
+        """输入最终失败侧与地址，输出无；连接已丢弃时仍对真实失败站降配额。"""
+        with self._condition:
+            state = self._hosts[_normalize_source(source)].get(host)
+            if state is None:
+                return
+            state.failed_ceiling = max(state.failed_ceiling or 1, state.thread_cap)
+            state.thread_cap = max(
+                1, int(math.floor(state.thread_cap * self._decrease_factor))
+            )
+            state.cooldown_until = time.monotonic() + self._cooldown_seconds
             self._condition.notify_all()
 
     def snapshot(self) -> Dict[str, Any]:
@@ -471,27 +487,27 @@ class AdaptiveConcurrencyController:
             for source, mapping in self._hosts.items():
                 sides[source] = {
                     f"{host[0]}:{host[1]}": {
-                        "process_cap": int(state.process_cap),
-                        "process_inflight": int(state.process_inflight),
+                        "thread_cap": int(state.thread_cap),
+                        "thread_inflight": int(state.thread_inflight),
                         "cooldown_until": float(state.cooldown_until),
                         "failed_ceiling": state.failed_ceiling,
                     }
                     for host, state in mapping.items()
                 }
             return {
-                "max_processes": int(self._max_processes),
-                "inproc_limit": int(self._inproc_limit),
-                "inflight_processes": int(self._inflight_processes),
-                "inflight_processes_by_source": {
+                "max_threads": int(self._max_threads),
+                "chunks_per_lease": int(self._chunks_per_lease),
+                "inflight_threads": int(self._inflight_threads),
+                "inflight_threads_by_source": {
                     source: int(count) for source, count in self._side_inflight.items()
                 },
-                "side_process_budget": {
+                "side_thread_budget": {
                     source: int(count)
-                    for source, count in self._side_process_budget.items()
+                    for source, count in self._side_thread_budget.items()
                 },
-                "processes_per_host": {
+                "threads_per_host": {
                     source: int(count)
-                    for source, count in self._processes_per_host.items()
+                    for source, count in self._threads_per_host.items()
                 },
                 "waiting_count": int(
                     sum(len(items) for items in self._waiting_tickets.values())

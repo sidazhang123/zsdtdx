@@ -130,7 +130,6 @@ def _consume_async_job(
             "task": task,
             "rows": _serialize_rows(list(event.get("rows") or [])),
             "error": event.get("error"),
-            "worker_pid": event.get("worker_pid"),
         }
         _append_record(records_path, rec)
         record_count += 1
