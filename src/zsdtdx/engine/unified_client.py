@@ -1986,29 +1986,37 @@ class UnifiedTdxClient:
         pool: PersistentFailoverPool,
         method_name: str,
         *args: Any,
+        _host_group: str = "all",
         **kwargs: Any,
     ) -> Any:
         """
-        K 线/最新价专用 pool 调用：allow_none=True，语义与 pool.call 相同。
+        标准/扩展协议的可空返回调用：allow_none=True，语义与 pool.call 相同。
 
         输入：
         1. pool: 标准或扩展连接池。
         2. method_name: API 方法名。
         3. *args/**kwargs: 透传参数。
+        4. _host_group: 标准行情能力组；默认由带 market 的 K 线方法自动路由。
         输出：
         1. API 返回值；重试耗尽后仍为 None 则返回 None。
         用途：
         1. 集中 K 线/报价等 allow_none 调用点，避免漏写 allow_none=True。
         边界条件：
         1. 固定 allow_none=True；重试逻辑仅在 pool.call 内实现一次。
+        2. 扩展行情池忽略 _host_group；显式分组参数不会传入协议方法。
         """
         std_pool = getattr(self, "std_pool", None)
-        host_group = "all"
-        if pool is std_pool and method_name in {
-            "get_security_bars",
-            "get_index_bars",
-            "get_block_bars",
-        }:
+        host_group = str(_host_group or "all")
+        if (
+            pool is std_pool
+            and host_group == "all"
+            and method_name
+            in {
+                "get_security_bars",
+                "get_index_bars",
+                "get_block_bars",
+            }
+        ):
             market = int(args[1]) if len(args) > 1 else -1
             host_group = "szshbj" if market == 2 else "szsh"
         scope = pool.host_scope(host_group) if pool is std_pool else nullcontext()
@@ -5742,6 +5750,7 @@ class UnifiedTdxClient:
                     "get_board_quote_page",
                     start,
                     page_size,
+                    _host_group="szshbj",
                 )
             except Exception as exc:
                 self._record_failure(
@@ -5840,6 +5849,7 @@ class UnifiedTdxClient:
                 self.std_pool,
                 "get_finance_info_batch",
                 chunk,
+                _host_group="szshbj",
             )
             if result is None:
                 raise RuntimeError(f"0010 批次返回 None: offset={offset}")

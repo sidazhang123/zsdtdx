@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import struct
 from collections import OrderedDict
+from contextlib import contextmanager
 
 import pytest
 
@@ -56,7 +57,8 @@ def test_stock_stat_short_board_page_is_terminal():
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
     board_starts: list[int] = []
 
-    def pool_call(_pool, method, *args):
+    def pool_call(_pool, method, *args, **kwargs):
+        assert kwargs == {"_host_group": "szshbj"}
         if method == "get_board_quote_page":
             start = int(args[0])
             board_starts.append(start)
@@ -73,16 +75,68 @@ def test_stock_stat_short_board_page_is_terminal():
     assert len(result) == 1
 
 
+def test_stock_stat_explicit_host_group_is_applied_inside_pool_call():
+    """
+    输入：054B/0010 共用调用层的显式 szshbj 分组。
+    输出：协议方法在该分组作用域内执行，内部参数不会泄漏给协议方法。
+    用途：固化全市场协议的能力组路由。
+    边界：仅验证标准行情池，不发网络请求。
+    """
+
+    class RoutingPool:
+        def __init__(self):
+            self.active_group = "all"
+            self.called_kwargs = None
+
+        @contextmanager
+        def host_scope(self, group_name):
+            previous = self.active_group
+            self.active_group = group_name
+            try:
+                yield
+            finally:
+                self.active_group = previous
+
+        def call(self, method_name, *args, **kwargs):
+            assert method_name == "get_board_quote_page"
+            assert args == (0, 80)
+            assert self.active_group == "szshbj"
+            self.called_kwargs = kwargs
+            return []
+
+    pool = RoutingPool()
+    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+    client.std_pool = pool
+    result = client._pool_call_allow_none(
+        pool,
+        "get_board_quote_page",
+        0,
+        80,
+        _host_group="szshbj",
+    )
+    assert result == []
+    assert pool.called_kwargs == {"allow_none": True}
+    assert pool.active_group == "all"
+
+
 def test_stock_stat_board_none_is_failure_but_empty_page_is_normal():
     """输入 None 与空页。输出前者报错、后者正常结束，避免静默残缺。"""
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
     client.std_pool = object()
     client._record_failure = lambda *args: None
-    client._pool_call_allow_none = lambda *_args: None
+
+    def empty_or_none_call(result):
+        def call(*_args, **kwargs):
+            assert kwargs == {"_host_group": "szshbj"}
+            return result
+
+        return call
+
+    client._pool_call_allow_none = empty_or_none_call(None)
     with pytest.raises(RuntimeError, match="None"):
         client.get_board_quote_rows(80)
 
-    client._pool_call_allow_none = lambda *_args: []
+    client._pool_call_allow_none = empty_or_none_call([])
     assert client.get_board_quote_rows(80) == []
 
 
@@ -91,15 +145,20 @@ def test_stock_stat_suspended_quote_is_normal_row():
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
     client.std_pool = object()
     client._record_failure = lambda *args: None
-    client._pool_call_allow_none = lambda *_args: [
-        {
-            "market": 0,
-            "code": "002667",
-            "price": 0.0,
-            "last_close": 22.19,
-            "vol": 0,
-        }
-    ]
+
+    def suspended_call(*_args, **kwargs):
+        assert kwargs == {"_host_group": "szshbj"}
+        return [
+            {
+                "market": 0,
+                "code": "002667",
+                "price": 0.0,
+                "last_close": 22.19,
+                "vol": 0,
+            }
+        ]
+
+    client._pool_call_allow_none = suspended_call
     rows = client.get_board_quote_rows(80)
     assert [row["code"] for row in rows] == ["002667"]
 
@@ -119,18 +178,25 @@ def test_stock_stat_finance_map_requires_complete_code_set():
     client.std_pool = DummyPool()
     client._record_failure = lambda *args: None
 
-    def complete_call(_pool, method, chunk):
+    selected_groups: list[str] = []
+
+    def complete_call(_pool, method, chunk, **kwargs):
         assert method == "get_finance_info_batch"
+        selected_groups.append(kwargs.pop("_host_group"))
+        assert kwargs == {}
         return [{"code": code} for _, code in chunk]
 
     client._pool_call_allow_none = complete_call
     result = client.get_finance_info_batch_map(codes, 100, 4)
     assert set(result) == {code for _, code in codes}
+    assert selected_groups == ["szshbj"] * 3
     assert client.std_pool.cleaned == 1
 
-    client._pool_call_allow_none = lambda _pool, _method, chunk: [
-        {"code": code} for _, code in chunk[:-1]
-    ]
+    def incomplete_call(_pool, _method, chunk, **kwargs):
+        assert kwargs == {"_host_group": "szshbj"}
+        return [{"code": code} for _, code in chunk[:-1]]
+
+    client._pool_call_allow_none = incomplete_call
     with pytest.raises(RuntimeError, match="不完整"):
         client.get_finance_info_batch_map(codes[:2], 100, 1)
 

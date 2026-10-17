@@ -4,7 +4,7 @@
 - K 线采用 numba 解码和只读列式内核，标准差分、指数、板块绝对价及扩展格式统一覆盖，交付层保留 rows / DataFrame。
 - 新增 thread_workers、threads_per_host_std/ex，移除旧进程配置；行情事件移除 worker_pid，预热和回收改报线程状态。
 - 将列式内核与交付打包分离，为后续用户侧格式转换保留明确边界。
-- 标准行情地址按 `szshbj` / `szsh_only` 静态能力分组；北交所行情、码表和 F10 只在支持北交所的站内重连换站，合法空页不触发换站。
+- 标准行情地址按 `szshbj` / `szsh_only` 静态能力分组；北交所行情、码表、F10 及 `get_stock_stat` 的 054B/0010 只在支持北交所的站内重连换站，合法空页不触发换站。
 - 版本号：`pyproject.toml` 与 `__init__.__version__` 对齐为 `3.0.0`。
 
 # Changelog
