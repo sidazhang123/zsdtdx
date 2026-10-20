@@ -65,6 +65,7 @@ from zsdtdx.parser.infoharbor_block import (
     read_zip_entry,
 )
 from zsdtdx.util.helper import parse_future_symbol
+from zsdtdx.util.errors import CompanyInfoFetchError
 from zsdtdx.util.log import log
 
 _PACKAGE_DIR = Path(__file__).resolve().parent.parent
@@ -963,6 +964,21 @@ def _attempt_aborted() -> bool:
     return closer is not None and closer.aborted()
 
 
+def _check_company_info_attempt():
+    """输入无，输出无；公司信息预算耗尽或取消时抛明确失败，不继续协议请求。"""
+    from zsdtdx.engine.thread_runtime import attempt_deadline
+
+    deadline = attempt_deadline.get()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise CompanyInfoFetchError(
+            "公司信息尝试预算耗尽", reason="attempt_timeout", retryable=True
+        )
+    if _attempt_aborted():
+        raise CompanyInfoFetchError(
+            "公司信息尝试已取消", reason="cancelled", retryable=False
+        )
+
+
 def _bind_attempt_socket(sock: Any) -> None:
     """输入新建或正在使用的 socket，输出无。边界：当前线程没有尝试登记器时不做任何事。"""
     closer = _attempt_socket_closer.get()
@@ -1553,6 +1569,34 @@ class PersistentFailoverPool:
                 self._global_stats["none_as_end"] += 1
             return None
         raise RuntimeError(f"{self.name}.{method_name} 调用失败: {last_exception}")
+
+    def finish_company_info_attempt(self, *, success=True):
+        """输入整股尝试结果，输出无；普通池保留成功连接，失败连接立即关闭。"""
+        if not success:
+            self.reset_thread_connection(reconnect=False)
+
+    def release_company_info_thread(self, *, success=True):
+        """输入正文执行状态，输出无；普通池关闭当前线程连接，重复回收安全。"""
+        self.reset_thread_connection(reconnect=False)
+
+    def connect_company_info_host(self, candidates):
+        """输入 F10 能力候选站，输出成功绑定站；普通池逐站尝试，全部失败抛错。"""
+        attempted = []
+        started = time.monotonic()
+        for host in candidates:
+            _check_company_info_attempt()
+            attempted.append(host)
+            if self.connect_thread_to_host(*host):
+                _check_company_info_attempt()
+                return host
+        raise CompanyInfoFetchError(
+            "公司信息候选站全部连接失败",
+            reason="connect_failed",
+            detail={
+                "candidates": attempted,
+                "elapsed_seconds": time.monotonic() - started,
+            },
+        )
 
     def connect_thread_to_host(self, host: str, port: int) -> bool:
         """
@@ -6551,21 +6595,21 @@ class UnifiedTdxClient:
         1. 单页上限为 `TDXParams.COMPANY_INFO_CHUNK_SIZE`（30720）。
         2. 请求走 `call_current_host`，页与页之间不换站。
         3. 某一页返回 None、空 bytes 或不足预期字节时停止后续页。
-        4. 严格 GBK 失败时 ignore 兜底，并由调用方记入运行态失败。
+        4. 严格 GBK 失败时按 ignore 保留其余正文和诊断状态；字节长度完整时不据此换站。
         """
+        _check_company_info_attempt()
         if bind_host is not None:
-            bound = self.std_pool.connect_thread_to_host(
-                str(bind_host[0]), int(bind_host[1])
-            )
-            if not bound:
-                return "", "host_bind_failed"
+            self.std_pool.connect_company_info_host([bind_host])
 
         chunk_size = int(TDXParams.COMPANY_INFO_CHUNK_SIZE)
+        if int(length) <= 0:
+            return "", "empty_terminated"
         offset = 0
         chunks: List[bytes] = []
         status = "success"
 
         while offset < int(length):
+            _check_company_info_attempt()
             remaining = int(length) - offset
             expected_page_size = min(chunk_size, remaining)
             try:
@@ -6580,8 +6624,10 @@ class UnifiedTdxClient:
                     allow_none=True,
                 )
             except Exception:
+                _check_company_info_attempt()
                 status = "host_call_failed"
                 break
+            _check_company_info_attempt()
             if part is None:
                 status = "none_terminated"
                 break
@@ -6651,6 +6697,24 @@ class UnifiedTdxClient:
         return_df: Optional[bool] = None,
         category_workers: int = 1,
     ):
+        """输入代码及候选栏目，输出完整正文；整股结束始终归还租约，失败抛明确异常。"""
+        success = False
+        try:
+            result = self._get_company_info_content(
+                code, category, return_df, category_workers
+            )
+            success = True
+            return result
+        finally:
+            self.std_pool.finish_company_info_attempt(success=success)
+
+    def _get_company_info_content(
+        self,
+        code: str,
+        category: Optional[Any] = None,
+        return_df: Optional[bool] = None,
+        category_workers: int = 1,
+    ):
         """
         输入股票代码与中文分类列表，输出分类正文；用于单股抓取。
 
@@ -6665,8 +6729,10 @@ class UnifiedTdxClient:
         1. 非标准市场返回空表并记录失败。
         2. 目录与全部分类、全部分页钉在同一台行情站；正文线程会连到目录那台站。
         3. 某一页换不了站：正文中断时丢掉本次结果，换下一台站后从目录重新拉取。
-        4. 目录为空列表时直接返回空结果；全部站点都失败时才记运行态失败。
+        4. 真实空目录或无候选栏目返回空结果；短页或正文中断抛明确失败；
+           长度完整但含非法 GBK 字节时 ignore 后返回其余正文。
         """
+        _check_company_info_attempt()
         normalized_code = self._normalize_stock_query_code(code)
         route = self._lookup_stock_route(normalized_code)
         if route is None:
@@ -6695,21 +6761,42 @@ class UnifiedTdxClient:
             eligible_hosts = list(getattr(self.std_pool, "hosts", []) or [])
         eligible_hosts.sort(key=lambda item: self.std_pool.hosts.index(item))
         if not eligible_hosts:
-            raise RuntimeError(f"standard host 能力组不可用: {host_group}")
+            raise CompanyInfoFetchError(
+                f"standard host 能力组不可用: {host_group}", reason="connect_failed"
+            )
         # 这些状态说明当前站的文件没有按目录读完，换站后必须重拉目录。
+        # GBK ignore 只丢弃源端非法字节，不代表正文传输截断，因此不纳入重试。
         retry_status = {
             "none_terminated",
             "empty_terminated",
             "short_page_terminated",
             "host_bind_failed",
             "host_call_failed",
+            "quota_timeout",
+            "connect_failed",
         }
-        last_attempt: Optional[Tuple[List[Dict[str, Any]], List[str], set]] = None
+        complete_status = {"success", "gbk_ignore_fallback"}
+        last_attempt: Optional[Tuple[List[Dict[str, Any]], List[str]]] = None
         last_error: Optional[Exception] = None
 
-        for bind_target in eligible_hosts:
-            if not self.std_pool.connect_thread_to_host(*bind_target):
-                continue
+        pending_hosts = list(eligible_hosts)
+        attempted_hosts = []
+        attempt_started = time.monotonic()
+        while pending_hosts:
+            _check_company_info_attempt()
+            try:
+                bind_target = self.std_pool.connect_company_info_host(pending_hosts)
+            except CompanyInfoFetchError as exc:
+                last_error = exc
+                break
+            if bind_target not in pending_hosts:
+                raise CompanyInfoFetchError(
+                    "公司信息选站不在能力候选集中",
+                    reason="connect_failed",
+                    detail={"host": bind_target, "candidates": eligible_hosts},
+                )
+            pending_hosts.remove(bind_target)
+            attempted_hosts.append(bind_target)
             try:
                 categories = self.std_pool.call_current_host(
                     "get_company_info_category",
@@ -6718,28 +6805,29 @@ class UnifiedTdxClient:
                     allow_none=True,
                 )
             except Exception as exc:
+                _check_company_info_attempt()
                 last_error = exc
                 categories = None
+            _check_company_info_attempt()
             if categories is None:
+                if last_error is None:
+                    last_error = CompanyInfoFetchError(
+                        "公司信息目录请求无响应", reason="directory_failed"
+                    )
                 continue
             if not categories:
                 if self._default_return_df(return_df):
                     return pd.DataFrame(columns=["code", "category", "content"])
                 return []
 
-            bind_host = self._split_pool_host_label(self.std_pool.get_active_host())
-            if bind_host is None:
-                continue
+            bind_host = bind_target
 
-            missing_category = set(category_filter) if category_filter else set()
             selected: List[Tuple[int, Dict[str, Any], str]] = []
             for seq, cat in enumerate(categories):
                 cat_name = str(cat.get("name", "")).strip()
                 cat_name_key = self._normalize_category_name(cat_name)
                 if category_filter and cat_name_key not in category_filter:
                     continue
-                if cat_name_key in missing_category:
-                    missing_category.discard(cat_name_key)
                 selected.append((seq, cat, cat_name))
 
             def _fetch_one(
@@ -6754,6 +6842,7 @@ class UnifiedTdxClient:
                 边界：不在这里写运行态失败；换站重试前的失败会丢掉。
                 """
                 seq, cat, cat_name = item
+                status = "host_call_failed"
                 try:
                     content, status = self._fetch_company_content(
                         market=market,
@@ -6764,55 +6853,73 @@ class UnifiedTdxClient:
                         category_index=int(cat.get("index", seq)),
                         bind_host=host_pin,
                     )
+                except CompanyInfoFetchError as exc:
+                    if exc.reason not in {"quota_timeout", "connect_failed"}:
+                        raise
+                    content, status = "", exc.reason
                 except Exception:
+                    _check_company_info_attempt()
                     content, status = "", "host_call_failed"
+                finally:
+                    if threading.get_ident() != directory_thread:
+                        self.std_pool.release_company_info_thread(
+                            success=status in complete_status
+                        )
                 return (
                     {"code": str(code), "category": cat_name, "content": content},
                     status,
                 )
 
             workers = max(1, int(category_workers or 1))
+            directory_thread = threading.get_ident()
             if workers <= 1 or len(selected) <= 1:
                 pairs = [_fetch_one(item) for item in selected]
             else:
                 pairs = []
+                self.std_pool.release_company_info_thread(success=True)
                 with _ThreadPoolExecutor(
                     max_workers=min(workers, len(selected))
                 ) as pool:
-                    futures = [pool.submit(_fetch_one, item) for item in selected]
+                    futures = [
+                        pool.submit(contextvars.copy_context().run, _fetch_one, item)
+                        for item in selected
+                    ]
                     for fut in futures:
                         pairs.append(fut.result())
 
             records = [row for row, _status in pairs]
             statuses = [status for _row, status in pairs]
-            last_attempt = (records, statuses, missing_category)
+            last_attempt = (records, statuses)
             if any(status in retry_status for status in statuses):
                 continue
             break
 
         if last_attempt is None:
-            if last_error is not None:
+            if isinstance(last_error, CompanyInfoFetchError):
                 raise last_error
-            if self._default_return_df(return_df):
-                return pd.DataFrame(columns=["code", "category", "content"])
-            return []
+            raise CompanyInfoFetchError(
+                f"公司信息目录全部请求失败: {last_error}",
+                reason="directory_failed",
+                detail={
+                    "candidates": eligible_hosts,
+                    "attempted": attempted_hosts,
+                    "elapsed_seconds": time.monotonic() - attempt_started,
+                },
+            ) from last_error
 
-        records, statuses, missing_category = last_attempt
-        for row, status in zip(records, statuses):
-            if status == "success":
-                continue
-            detail = f"category={row.get('category', '')}"
-            if status == "gbk_ignore_fallback":
-                detail = f"{detail}; strict_gbk_failed_used_ignore"
-            self._record_failure("company_info", str(code), status, detail)
-        for miss_name in sorted(missing_category):
-            self._record_failure(
-                "company_info",
-                str(code),
-                "category_not_found",
-                miss_name,
+        records, statuses = last_attempt
+        _check_company_info_attempt()
+        if any(status not in complete_status for status in statuses):
+            raise CompanyInfoFetchError(
+                "公司信息所有候选站均未返回完整正文",
+                reason="content_failed",
+                detail={
+                    "candidates": eligible_hosts,
+                    "attempted": attempted_hosts,
+                    "statuses": statuses,
+                    "elapsed_seconds": time.monotonic() - attempt_started,
+                },
             )
-
         if self._default_return_df(return_df):
             return pd.DataFrame(records, columns=["code", "category", "content"])
         return records

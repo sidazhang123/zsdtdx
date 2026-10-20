@@ -324,6 +324,7 @@ class AdaptiveConcurrencyController:
         timeout: Optional[float] = None,
         preferred_host=None,
         allowed_hosts: Optional[Iterable[Any]] = None,
+        check_cancelled=None,
     ) -> AdaptivePermit:
         """
         按本侧同一候选地址集合 FIFO 获取一个线程准入凭证。
@@ -332,6 +333,7 @@ class AdaptiveConcurrencyController:
         1. source: std/ex。
         2. max_units: 当前最多希望打包的 chunk 数。
         3. timeout: 等待秒数；None 表示一直等待。
+        4. check_cancelled: 可选取消检查；等待及授予前调用，抛错时清理排队票据。
         输出：AdaptivePermit。
         边界：超时抛 TimeoutError。无可达 host，或等待期间该侧已没有可选地址且没有在飞线程时，
         timeout 为 None 抛 RuntimeError，有限超时抛 TimeoutError。
@@ -358,6 +360,8 @@ class AdaptiveConcurrencyController:
             waiting.append(ticket)
             try:
                 while True:
+                    if check_cancelled is not None:
+                        check_cancelled()
                     now = time.monotonic()
                     if not self._hosts[
                         source_key
@@ -411,7 +415,9 @@ class AdaptiveConcurrencyController:
                             if state.cooldown_until > now
                         ]
                         wait_for = max(0.05, min(cooldowns) - now) if cooldowns else 0.5
-                    self._condition.wait(timeout=wait_for)
+                    self._condition.wait(
+                        timeout=min(wait_for, 0.05) if check_cancelled else wait_for
+                    )
             except Exception:
                 if ticket in waiting:
                     waiting.remove(ticket)

@@ -422,7 +422,7 @@ def get_company_info(
     """获取股票公司信息（默认并行；可选顺序）。
 
     调用前置约定:
-    - `mode="sync"`：请先进入 `with get_client():`，在调用线程顺序拉取。
+    - `mode="sync"`：在调用线程顺序拉取；进入 `with get_client():` 可复用连接。
     - `mode="async"`（默认）：走线程执行器并行，不依赖上下文连接；
       退出前建议 `destroy_parallel_fetcher()`。
 
@@ -443,6 +443,10 @@ def get_company_info(
     队列事件:
     - data: `{"event":"data","code":"...","rows":[...],"error":str|None}`
     - done: `{"event":"done","total_codes":N,"success_codes":N,"failed_codes":N}`
+    - 失败 data 另含 status/reason，可含 detail；空结果以 no_data 纳入失败计数，
+      不据此判证券无效。代码归一化去重后，每股恰有一终态且 success+failed=total。
+    - 每股复用 parallel 的限时/重试配置；成功股不随同批失败重复请求。
+      category 仍为候选过滤器，未要求存在的栏目不改变候选语义。
 
     调用示例:
     ```python
