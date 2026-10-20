@@ -17,7 +17,9 @@ from zsdtdx.engine.unified_client import (
     PersistentFailoverPool,
     _attempt_aborted,
     _attempt_socket_closer,
+    _check_company_info_attempt,
 )
+from zsdtdx.util.errors import CompanyInfoFetchError
 
 attempt_deadline = contextvars.ContextVar("zsdtdx_attempt_deadline", default=None)
 
@@ -120,6 +122,84 @@ class LeasedFailoverPool(PersistentFailoverPool):
         except TimeoutError:
             return False
         return self._install_connection(permit)
+
+    def finish_company_info_attempt(self, *, success=True):
+        """输入整股尝试结果，输出无；所有结束路径归还租约，失败连接不复用。"""
+        self.release_thread(success=success, discard=not success)
+
+    def release_company_info_thread(self, *, success=True):
+        """输入正文执行状态，输出无；归还当前许可，失败连接不进入空闲池。"""
+        self.release_thread(success=success, discard=not success)
+
+    def connect_company_info_host(self, candidates):
+        """输入 F10 能力候选站，输出实际租到的站；无固定首站，失败不返回空成功。"""
+        started = time.monotonic()
+        eligible = set(candidates) & self._eligible_host_set()
+        attempted = []
+        data = self._get_thread_data()
+        active = int(data.get("active_index", -1))
+        if data.get("api") is not None and 0 <= active < len(self.hosts):
+            if self.hosts[active] in eligible:
+                _check_company_info_attempt()
+                return self.hosts[active]
+        self.release_thread(success=False, discard=True)
+        if self.peer is not None:
+            self.peer.release_thread()
+        while eligible:
+            try:
+                permit = self.controller.acquire(
+                    self.source,
+                    max_units=1,
+                    timeout=remaining(),
+                    allowed_hosts=eligible,
+                    check_cancelled=_check_company_info_attempt,
+                )
+            except CompanyInfoFetchError as exc:
+                exc.detail = {
+                    "candidates": list(candidates),
+                    "attempted": attempted,
+                    "elapsed_seconds": time.monotonic() - started,
+                }
+                raise
+            except TimeoutError as exc:
+                _check_company_info_attempt()
+                raise CompanyInfoFetchError(
+                    f"公司信息准入失败: {exc}",
+                    reason="quota_timeout",
+                    detail={
+                        "candidates": list(candidates),
+                        "attempted": attempted,
+                        "elapsed_seconds": time.monotonic() - started,
+                    },
+                ) from exc
+            except RuntimeError as exc:
+                raise CompanyInfoFetchError(
+                    f"公司信息无可用站: {exc}",
+                    reason="connect_failed",
+                    detail={"candidates": list(candidates), "attempted": attempted},
+                ) from exc
+            attempted.append(permit.host)
+            eligible.discard(permit.host)
+            try:
+                connected = self._install_connection(permit)
+            except TimeoutError as exc:
+                _check_company_info_attempt()
+                raise CompanyInfoFetchError(
+                    str(exc),
+                    reason="attempt_timeout",
+                    detail={"host": permit.host, "attempted": attempted},
+                ) from exc
+            if connected:
+                return permit.host
+        raise CompanyInfoFetchError(
+            "公司信息候选站全部连接失败",
+            reason="connect_failed",
+            detail={
+                "candidates": list(candidates),
+                "attempted": attempted,
+                "elapsed_seconds": time.monotonic() - started,
+            },
+        )
 
     def _install_connection(self, permit):
         """输入独占准入，输出连接结果；失败关闭 API 并归还准入，不泄漏创建中的 socket。"""

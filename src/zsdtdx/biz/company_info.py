@@ -14,15 +14,92 @@
 from __future__ import annotations
 
 import queue as std_queue
+import time
+from concurrent.futures import CancelledError
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import pandas as pd
 
 from zsdtdx.biz._client_context import call_with_main_client
+from zsdtdx.util.company_info_state import (
+    company_info_outcome,
+    normalize_company_info_codes,
+    publish_company_info_outcome,
+    record_company_info_outcome,
+)
 from zsdtdx.util.helper import _ensure_active_config_ready
 
 if TYPE_CHECKING:
     from zsdtdx.engine.unified_client import UnifiedTdxClient
+
+
+def _sync_company_info_attempt(client, code, category, timeout):
+    """输入主上下文客户端和预算，输出正文；异常清当前连接，始终还原调用前预算。"""
+    from zsdtdx.engine.thread_runtime import attempt_deadline, check_deadline
+
+    previous_deadline = attempt_deadline.get()
+    deadline = time.monotonic() + timeout
+    if previous_deadline is not None:
+        deadline = min(deadline, previous_deadline)
+    pool = getattr(client, "std_pool", None)
+    get_data = getattr(pool, "_get_thread_data", None)
+    prior = {}
+    if callable(get_data):
+        data = get_data()
+        prior = {
+            key: data.get(key)
+            for key in ("socket_read_deadline", "socket_read_timeout_override")
+        }
+    set_timeout = getattr(pool, "set_thread_socket_read_timeout", None)
+    restore_timeout = getattr(pool, "restore_thread_socket_read_timeout", None)
+    token = attempt_deadline.set(deadline)
+    try:
+        check_deadline()
+        if callable(set_timeout):
+            set_timeout(max(0.001, deadline - time.monotonic()))
+        rows = client.get_company_info_content(
+            code=code, category=category, return_df=False
+        )
+        check_deadline()
+        return rows
+    except Exception:
+        reset = getattr(pool, "reset_thread_connection", None)
+        if callable(reset):
+            reset(reconnect=False)
+        raise
+    finally:
+        attempt_deadline.reset(token)
+        if callable(restore_timeout):
+            restore_timeout()
+        if prior:
+            data = get_data()
+            data.update(prior)
+            apply_timeout = getattr(pool, "_apply_thread_socket_read_timeout", None)
+            prior_deadline = prior["socket_read_deadline"]
+            if callable(apply_timeout) and (
+                prior_deadline is None or prior_deadline > time.monotonic()
+            ):
+                apply_timeout(data)
+
+
+def _fetch_company_info_sync_stock(client, code, category):
+    """输入单股和主客户端，输出最终状态；复用配置有限重试，不创建工作线程。"""
+    config = getattr(client, "config", {}).get("parallel", {})
+    retries = max(0, int(config.get("chunk_retry_max_attempts", 2)))
+    timeout = max(0.001, float(config.get("chunk_timeout_seconds", 15.0)))
+    for attempt in range(retries + 1):
+        try:
+            rows = _sync_company_info_attempt(client, code, category, timeout)
+            return company_info_outcome(code, rows=rows)
+        except Exception as exc:
+            cancelled = (
+                isinstance(exc, CancelledError)
+                or getattr(exc, "reason", None) == "cancelled"
+                or str(exc) == "fetcher restarted or destroyed"
+            )
+            retryable = getattr(exc, "retryable", not isinstance(exc, ValueError))
+            if cancelled or not retryable or attempt == retries:
+                return company_info_outcome(code, error=exc)
 
 
 def fetch_company_info(
@@ -47,7 +124,7 @@ def fetch_company_info(
         raise TypeError('get_company_info 的 codes 须为 list，单票请传 ["600000"]')
     if codes is None:
         raise ValueError("get_company_info 需要提供非空 codes 列表")
-    code_list = [str(item).strip() for item in codes if str(item).strip()]
+    code_list = normalize_company_info_codes(codes)
     if not code_list:
         raise ValueError("get_company_info 需要提供非空 codes 列表")
     if queue is not None and not hasattr(queue, "put"):
@@ -75,39 +152,20 @@ def fetch_company_info(
         输入：client 为统一客户端。
         输出：list[dict] 或 DataFrame。
         用途：sync 模式逐票取正文并可选写入队列。
-        边界条件：单票失败记入 error 事件，不中断其余代码。
+        边界条件：逐股有限重试，空结果不重试；每个去重代码恰有一个最终事件。
         """
         all_rows: List[Dict[str, Any]] = []
         success_codes = 0
         failed_codes = 0
         for item in code_list:
-            try:
-                part = client.get_company_info_content(
-                    code=item, category=category, return_df=False
-                )
-                part_rows = list(part or [])
-                all_rows.extend(part_rows)
+            outcome = _fetch_company_info_sync_stock(client, item, category)
+            all_rows.extend(outcome["rows"])
+            if outcome["status"] == "success":
                 success_codes += 1
-                if queue is not None:
-                    queue.put(
-                        {
-                            "event": "data",
-                            "code": str(item),
-                            "rows": part_rows,
-                            "error": None,
-                        }
-                    )
-            except Exception as exc:
+            else:
                 failed_codes += 1
-                if queue is not None:
-                    queue.put(
-                        {
-                            "event": "data",
-                            "code": str(item),
-                            "rows": [],
-                            "error": str(exc),
-                        }
-                    )
+            record_company_info_outcome(client, outcome)
+            publish_company_info_outcome(outcome, queue)
         if queue is not None:
             queue.put(
                 {

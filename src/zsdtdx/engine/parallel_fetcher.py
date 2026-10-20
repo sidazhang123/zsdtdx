@@ -20,6 +20,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from concurrent.futures import (
+    CancelledError,
     FIRST_COMPLETED,
     Future,
     ThreadPoolExecutor,
@@ -32,10 +33,17 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from zsdtdx.util.company_info_state import (
+    company_info_outcome,
+    normalize_company_info_codes,
+    publish_company_info_outcome,
+    record_company_info_outcome,
+)
 from zsdtdx.engine.adaptive_scheduler import (
     AdaptiveConcurrencyController,
 )
 from zsdtdx.engine.unified_client import UnifiedTdxClient
+from zsdtdx.util.errors import CompanyInfoFetchError
 from zsdtdx.util.log import emit_log, event_level_name, is_event_enabled
 
 
@@ -290,6 +298,8 @@ def _run_business_call(runtime, fn, payload):
     fetcher = get_fetcher()
     client = _ensure_shared_client_context()
     for attempt in range(fetcher.chunk_retry_max_attempts + 1):
+        if runtime.stopped.is_set():
+            raise RuntimeError("fetcher restarted or destroyed")
         success = False
         error_text = ""
         for pool in (client.std_pool, client.ex_pool):
@@ -302,7 +312,16 @@ def _run_business_call(runtime, fn, payload):
             return result
         except Exception as exc:
             error_text = str(exc) or type(exc).__name__
-            if attempt == fetcher.chunk_retry_max_attempts or runtime.stopped.is_set():
+            # stop 会主动关闭尝试中的 socket；由此冒出的 TimeoutError 属于取消，
+            # 不能混入真实网络超时统计，否则同一次停机会产生两种终态原因。
+            if runtime.stopped.is_set():
+                raise RuntimeError("fetcher restarted or destroyed") from exc
+            if (
+                attempt == fetcher.chunk_retry_max_attempts
+                or isinstance(exc, CancelledError)
+                or getattr(exc, "reason", None) == "cancelled"
+                or not getattr(exc, "retryable", True)
+            ):
                 raise
         finally:
             contacted = max(
@@ -2437,73 +2456,43 @@ def get_fetcher() -> ParallelKlineFetcher:
     return _fetcher
 
 
-def _fetch_company_info_chunk(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    在线程运行时中处理一批股票公司信息。
-
-    输入：
-    1. payload.codes: 股票代码列表。
-    2. payload.category: 可选分类过滤。
-    3. payload.stock_workers: 当前公司信息 chunk 的股票并发线程数。
-    4. payload.category_workers: 单股标签并发线程数。
-    输出：
-    1. {"rows": list[dict], "errors": list[dict], "pid": int}。
-    用途：
-    1. 作为全局线程运行时的 chunk 执行体；内部用有界线程并发处理股票。
-    边界条件：
-    1. 单股异常不中断同 chunk 其它股票；异常写入 errors。
-    2. 结束后清理已退出线程遗留连接。
-    """
-    codes = [str(c).strip() for c in (payload.get("codes") or []) if str(c).strip()]
-    category = payload.get("category")
-    stock_workers = max(1, int(payload.get("stock_workers") or 1))
-    category_workers = max(1, int(payload.get("category_workers") or 1))
+def _fetch_one_company_info(payload: Dict[str, Any]):
+    """输入单股 payload，输出原始正文；异常交给运行时重试，禁止在此吞异常。"""
     client = _ensure_shared_client_context()
-    # 预热码表，避免每只股票首次查找都触发刷新。
     try:
-        client.get_all_stock_list(return_df=True, refresh=False)
-    except Exception:
-        pass
+        return client.get_company_info_content(
+            code=payload["code"],
+            category=payload.get("category"),
+            return_df=False,
+            category_workers=1,
+        )
+    except ValueError as exc:
+        raise CompanyInfoFetchError(
+            str(exc), reason="invalid_code", retryable=False
+        ) from exc
 
-    rows: List[Dict[str, Any]] = []
-    errors: List[Dict[str, Any]] = []
-    rows_lock = threading.Lock()
 
-    def _one_stock(code: str) -> None:
-        """
-        输入股票代码，拉取该公司信息并写入 rows/errors。
+def _fetch_company_info_chunk(runtime, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """输入代码分片和运行时，输出逐股终态；逐股预算与重试，不重复已完成股票。
 
-        边界：异常时写入 errors，不抛到线程池外。
-        """
+    边界：股票与栏目均串行，不创建嵌套线程；空目录正常结束且不网络重试。
+    """
+    outcomes = []
+    for code in normalize_company_info_codes(payload.get("codes")):
         try:
-            part = client.get_company_info_content(
-                code=code,
-                category=category,
-                return_df=False,
-                category_workers=category_workers,
+            rows = _run_business_call(
+                runtime,
+                _fetch_one_company_info,
+                {"code": code, "category": payload.get("category")},
             )
-            part_rows = list(part or [])
-            with rows_lock:
-                rows.extend(part_rows)
+            outcome = company_info_outcome(code, rows=rows)
         except Exception as exc:
-            with rows_lock:
-                errors.append({"code": str(code), "error": str(exc)})
-
-    if not codes:
-        return {"rows": [], "errors": []}
-
-    workers = min(stock_workers, len(codes))
-    if workers <= 1:
-        for code in codes:
-            _one_stock(code)
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(_one_stock, codes))
-
-    _cleanup_dead_thread_connections()
+            outcome = company_info_outcome(code, error=exc)
+        outcomes.append(outcome)
     return {
-        "rows": rows,
-        "errors": errors,
+        "rows": [row for outcome in outcomes for row in outcome["rows"]],
+        "errors": [outcome for outcome in outcomes if outcome["status"] != "success"],
+        "outcomes": outcomes,
     }
 
 
@@ -2526,7 +2515,7 @@ def _iter_company_info_chunk_results(
     边界条件：
     1. codes 为空时不产出任何元素。
     """
-    normalized_codes = [str(c).strip() for c in (codes or []) if str(c).strip()]
+    normalized_codes = normalize_company_info_codes(codes)
     if not normalized_codes:
         return
 
@@ -2566,8 +2555,8 @@ def _iter_company_info_chunk_results(
         normalized_codes[i : i + chunk_size]
         for i in range(0, len(normalized_codes), chunk_size)
     ]
-    stock_workers = max(1, int(fetcher.company_info_stock_workers))
-    category_workers = max(1, int(fetcher.company_info_category_workers))
+    stock_workers = 1
+    category_workers = 1
     max_inflight = max(
         1,
         int(fetcher.num_threads) * int(fetcher.company_info_max_inflight_multiplier),
@@ -2598,11 +2587,7 @@ def _iter_company_info_chunk_results(
             "stock_workers": stock_workers,
             "category_workers": category_workers,
         }
-        pending[
-            executor.submit(
-                _run_business_call, executor, _fetch_company_info_chunk, payload
-            )
-        ] = idx
+        pending[executor.submit(_fetch_company_info_chunk, executor, payload)] = idx
 
     while pending or next_idx < len(chunks):
         while next_idx < len(chunks) and len(pending) < max_inflight:
@@ -2614,13 +2599,18 @@ def _iter_company_info_chunk_results(
         for fut in done_set:
             idx = pending.pop(fut)
             try:
-                yield fut.result()
+                result = dict(fut.result())
+                result["requested_codes"] = chunks[idx]
+                yield result
             except Exception as exc:
+                outcomes = [
+                    company_info_outcome(code, error=exc) for code in chunks[idx]
+                ]
                 yield {
                     "rows": [],
-                    "errors": [
-                        {"code": code, "error": str(exc)} for code in chunks[idx]
-                    ],
+                    "errors": outcomes,
+                    "outcomes": outcomes,
+                    "requested_codes": chunks[idx],
                 }
 
 
@@ -2641,65 +2631,91 @@ def fetch_company_info_parallel(
     输出：
     1. [{"code","category","content"}, ...]；不含 DataFrame。
     """
+    normalized = normalize_company_info_codes(codes)
+    requested = set(normalized)
+    terminal: Dict[str, Dict[str, Any]] = {}
     all_rows: List[Dict[str, Any]] = []
-    all_errors: List[Dict[str, Any]] = []
-    success_codes: set[str] = set()
-    failed_codes: set[str] = set()
-    total_codes = len([str(c).strip() for c in (codes or []) if str(c).strip()])
 
-    for result in _iter_company_info_chunk_results(
-        codes=codes, category=category, auto_prewarm=auto_prewarm
-    ):
-        rows = list(result.get("rows") or [])
-        errors = list(result.get("errors") or [])
-        all_rows.extend(rows)
-        all_errors.extend(errors)
-        for row in rows:
-            code = str(row.get("code", "")).strip()
-            if code:
-                success_codes.add(code)
-        for err in errors:
-            code = str(err.get("code", "")).strip()
-            if code:
-                failed_codes.add(code)
-            if queue is not None:
-                queue.put(
-                    {
-                        "event": "data",
-                        "code": code,
-                        "rows": [],
-                        "error": str(err.get("error") or ""),
-                    }
-                )
-        if queue is not None and rows:
-            # 按 code 拆条推送，便于消费方边写边释放。
-            by_code: Dict[str, List[Dict[str, Any]]] = {}
-            for row in rows:
-                code = str(row.get("code", "")).strip()
-                by_code.setdefault(code, []).append(row)
-            for code, part_rows in by_code.items():
-                queue.put(
-                    {
-                        "event": "data",
-                        "code": code,
-                        "rows": part_rows,
-                        "error": None,
-                    }
-                )
+    def _accept(outcome):
+        """输入一股终态，输出无；仅首次接受请求集合内代码，避免重复聚合和事件。"""
+        code = outcome["code"]
+        if code not in requested or code in terminal:
+            return
+        terminal[code] = outcome
+        all_rows.extend(outcome["rows"])
+        record_company_info_outcome(_shared_client_context, outcome)
+        publish_company_info_outcome(outcome, queue)
 
-    if all_errors:
+    iterator_error = None
+    try:
+        for result in _iter_company_info_chunk_results(
+            codes=normalized, category=category, auto_prewarm=auto_prewarm
+        ):
+            outcomes = result.get("outcomes")
+            if outcomes is None:
+                # 接受仅含 rows/errors 的内部结果，同时对已知请求分片补齐空终态。
+                by_code: Dict[str, List[Dict[str, Any]]] = {}
+                for row in result.get("rows") or []:
+                    code = str(row.get("code", "")).strip()
+                    by_code.setdefault(code, []).append(row)
+                errors = {
+                    str(error.get("code", "")).strip(): error
+                    for error in result.get("errors") or []
+                }
+                outcomes = []
+                for code in result.get(
+                    "requested_codes", by_code.keys() | errors.keys()
+                ):
+                    if code in errors:
+                        outcome = company_info_outcome(
+                            code,
+                            error=RuntimeError(
+                                str(errors[code].get("error") or "fetch_failed")
+                            ),
+                        )
+                        for key in ("reason", "status", "detail"):
+                            if key in errors[code]:
+                                outcome[key] = errors[code][key]
+                    else:
+                        outcome = company_info_outcome(code, rows=by_code.get(code))
+                    outcomes.append(outcome)
+            for outcome in outcomes:
+                _accept(outcome)
+    except Exception as exc:
+        iterator_error = exc
+
+    for code in normalized:
+        if code not in terminal:
+            outcome = company_info_outcome(
+                code,
+                error=iterator_error
+                or RuntimeError("missing_result: 未收到该代码最终结果"),
+            )
+            if iterator_error is None:
+                outcome["reason"] = "missing_result"
+            _accept(outcome)
+    failed = [
+        outcome for outcome in terminal.values() if outcome["status"] != "success"
+    ]
+    if failed:
         _emit_log(
             "error",
             "[CompanyInfo Parallel] 部分股票失败",
-            {"error_count": len(all_errors), "sample": all_errors[:5]},
+            {
+                "error_count": len(failed),
+                "sample": [
+                    {"code": item["code"], "reason": item["reason"]}
+                    for item in failed[:5]
+                ],
+            },
         )
     if queue is not None:
         queue.put(
             {
                 "event": "done",
-                "total_codes": int(total_codes),
-                "success_codes": int(len(success_codes)),
-                "failed_codes": int(len(failed_codes)),
+                "total_codes": len(normalized),
+                "success_codes": len(terminal) - len(failed),
+                "failed_codes": len(failed),
             }
         )
     return all_rows

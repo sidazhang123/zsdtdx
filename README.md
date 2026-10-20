@@ -623,6 +623,16 @@ with get_client():
 - `mode="sync"`: `list[dict]` 或 DataFrame。
 - `mode="async"`: `StockKlineJob`；从 `job.queue` 消费至 `event="done"`；`job.result()` 为全部行 list[dict]。
 
+**调度与结果对账:**
+
+- codes 去前缀、去空白并保序去重；每个归一化代码恰有一个最终 `data` 事件，`done` 始终满足 `success_codes + failed_codes = total_codes`。
+- 每股单独使用 `parallel.chunk_timeout_seconds` 尝试预算和 `parallel.chunk_retry_max_attempts` 额外重试次数；成功股票不因同批其它股票失败而重新抓取。同步模式使用主上下文连接、协作预算与 socket 超时，异步模式还由线程运行时中断超时 socket。
+- 在该股票市场能力允许的候选站中取得可用准入；北交所只用 `szshbj`。取得目录后，正文及全部分页固定该站；换站时重取目录。
+- 准入、连接、目录和正文失败可进入有限重试。全部尝试仍短页或正文中断时，不把部分正文作为完整成功交付；目录长度完整但夹有源端非法 GBK 字节时按 `errors="ignore"` 保留其余正文，不把源数据坏字节误判为传输截断。
+- 真实空目录或目录中没有匹配候选栏目时，单股底层仍可返回空列表；批量结果发出 `status="no_data"`、`reason="no_data"`、非空 `error` 的终态，并纳入 `failed_codes`，不进行无意义的网络重试。这仅表示本次无数据，不判定证券上市或存续资格。
+- 成功 `data` 事件仍含 `event/code/rows/error`；失败事件另带 `status/reason`，有取证摘要时带 `detail`。取消也归入失败计数并给出明确状态。运行态只记录最终取数失败，重试后成功不会保留中间网络失败为最终失败。
+- category 仍是候选过滤器，不强制每个候选栏目都存在，也不硬编码栏目数量；缺少部分候选栏目不写运行态失败，需要必需栏目验收的调用方应按业务要求逐项核对。
+
 **调用示例:**
 
 ```python

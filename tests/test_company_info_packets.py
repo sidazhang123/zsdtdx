@@ -10,7 +10,7 @@ import pytest
 
 from zsdtdx.parser.get_company_info_category import GetCompanyInfoCategory
 from zsdtdx.parser.get_company_info_content import GetCompanyInfoContent
-from zsdtdx.engine.unified_client import UnifiedTdxClient
+from zsdtdx.engine.unified_client import PersistentFailoverPool, UnifiedTdxClient
 from zsdtdx.params import TDXParams
 
 
@@ -29,6 +29,9 @@ def _attach_pinned_pool(client, fake_call, hosts=None):
     }
     pool.get_active_host.return_value = f"{pool.hosts[0][0]}:{pool.hosts[0][1]}"
     pool.connect_thread_to_host.return_value = True
+    pool.connect_company_info_host.side_effect = lambda candidates: (
+        PersistentFailoverPool.connect_company_info_host(pool, candidates)
+    )
     pool.rotate_thread_host.return_value = False
     pool.call_current_host.side_effect = fake_call
     pool.call.side_effect = AssertionError("公司信息不应再走会换站的 call")
@@ -227,9 +230,9 @@ def test_decode_company_info_bytes_ignore_fallback():
     assert text == "OK"
 
 
-def test_get_company_info_content_records_gbk_ignore_fallback():
-    """输入：正文含非法 GBK 字节；输出：仍返回正文，并记入运行态失败。"""
-    bad = b"\xff"
+def test_get_company_info_content_accepts_gbk_ignore_fallback():
+    """输入长度完整但含非法 GBK 的正文，输出忽略坏字节后的其余文本。"""
+    bad = "正文".encode("gbk") + b"\xff"
 
     def fake_call(method_name, *args, allow_none=False, **kwargs):
         """
@@ -270,12 +273,7 @@ def test_get_company_info_content_records_gbk_ignore_fallback():
     rows = UnifiedTdxClient.get_company_info_content(
         client, code="600000", return_df=False
     )
-    assert len(rows) == 1
-    assert rows[0]["content"] == ""
-    assert any(
-        f["reason"] == "gbk_ignore_fallback" and f["task"] == "company_info"
-        for f in client._runtime_failures
-    )
+    assert rows == [{"code": "600000", "category": "公司概况", "content": "正文"}]
 
 
 def test_company_info_protocol_market_beijing_uses_zero():
@@ -328,7 +326,7 @@ def test_get_company_info_content_beijing_queries_market_zero():
                     "name": "公司概况",
                     "filename": "920002.V04",
                     "start": 0,
-                    "length": 100,
+                    "length": len("正文".encode("gbk")),
                 }
             ]
         return "正文".encode("gbk")

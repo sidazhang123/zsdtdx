@@ -12,6 +12,17 @@
 # coding=utf-8
 
 
+class CompanyInfoFetchError(RuntimeError):
+    """公司信息取数失败；携带原因、可重试标记与有限诊断，不保存正文。"""
+
+    def __init__(self, message, *, reason="fetch_failed", retryable=True, detail=None):
+        """输入摘要及失败属性，输出异常；detail 可为空，重试策略由调用层决定。"""
+        super().__init__(message)
+        self.reason = str(reason)
+        self.retryable = bool(retryable)
+        self.detail = detail
+
+
 class TdxConnectionError(Exception):
     """
     当连接服务器出错的时候，会抛出的异常
