@@ -3,6 +3,8 @@
 import struct
 from unittest.mock import MagicMock
 
+import pytest
+
 from zsdtdx.params import TDXParams
 from zsdtdx.parser.get_security_list import (
     GetSecurityList,
@@ -31,6 +33,20 @@ _SH_510050_RECORD = bytes.fromhex(
 _SH_510300_RECORD = bytes.fromhex(
     "3531303330306400bba6c9ee333030455446bbaacca9b0d81a79df4603be9f92408d322425"
 )
+
+
+def _security_list_record(code: str, pre_close_raw: bytes) -> bytes:
+    """输入代码和四字节昨收原码，输出用于协议级验证的 37 字节目录记录。"""
+    return struct.pack(
+        "<6sH16s4sB4s4s",
+        code.encode("ascii"),
+        100,
+        b"test".ljust(16, b"\x00"),
+        bytes(4),
+        2,
+        pre_close_raw,
+        bytes(4),
+    )
 
 
 def test_pack_security_list_request_matches_official_layout():
@@ -99,6 +115,22 @@ def test_parse_security_list_empty_and_truncated():
     body = struct.pack("<H", 2) + _BJ_FIRST_RECORD + b"\x00\x01"
     rows = cmd.parseResponse(body)
     assert [row["code"] for row in rows] == ["899050"]
+
+
+def test_parse_security_list_pre_close_is_little_endian_float32():
+    """输入全量核验中的 920176 原码；输出 52.19，而非旧量能算法的 352.19。"""
+    body = struct.pack("<H", 1) + _security_list_record(
+        "920176", bytes.fromhex("8fc25042")
+    )
+    row = GetSecurityList(None).parseResponse(body)[0]
+    assert row["pre_close"] == pytest.approx(52.19, abs=0.00001)
+
+
+def test_parse_security_list_zero_pre_close_stays_zero():
+    """输入全零昨收原码；输出严格为零，不产生旧解码器的极小正数。"""
+    body = struct.pack("<H", 1) + _security_list_record("920177", bytes(4))
+    row = GetSecurityList(None).parseResponse(body)[0]
+    assert row["pre_close"] == 0.0
 
 
 def test_is_std_index_item_covers_sz_sh_bj():

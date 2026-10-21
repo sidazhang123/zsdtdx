@@ -107,6 +107,22 @@ def test_numba_volume_bit_parity_random():
         )
 
 
+def test_standard_decoder_fixes_real_hleax_0x80_volume_boundary():
+    """输入 511920.SH 实盘量能原码 0000803f；输出 1，避免旧算法误解成 32768。"""
+    from zsdtdx.parser._kline_numba import volume_value
+
+    raw = int.from_bytes(bytes.fromhex("0000803f"), "little")
+    assert raw == 0x3F800000
+    assert get_volume(raw) == 1.0
+    assert volume_value(raw) == 1.0
+    body = bytearray(struct.pack("<HI", 1, 20261014))
+    for price in (99998, 0, 0, 0):
+        body += encode_price(price)
+    body += struct.pack("<II", raw, 0x42C80000)
+    row = parse_standard_columns(bytes(body), 4).raw_rows()[0]
+    assert row["vol"] == 1
+
+
 @pytest.mark.parametrize(
     "body", [b"", b"\x01", b"\x01\x00", b"\xff\xff", b"\x01\x00" + b"\x80" * 100]
 )

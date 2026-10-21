@@ -54,7 +54,7 @@ def test_catalog_cache_rejects_wrong_date_and_kind(tmp_path: Path):
 def test_validate_catalog_payload_requires_kind_and_records():
     assert validate_catalog_payload({"format_version": 1}, KIND_STD) is None
     payload = {
-        "format_version": 3,
+        "format_version": 4,
         "kind": "std",
         "cache_date": "2026-09-17",
         "records": [{"market": 0, "code": "000001", "name": "平安银行"}],
@@ -63,6 +63,18 @@ def test_validate_catalog_payload_requires_kind_and_records():
     validated = validate_catalog_payload(payload, KIND_STD)
     assert validated is not None
     assert validated[1][0]["code"] == "000001"
+
+
+def test_catalog_cache_rejects_pre_float32_std_cache():
+    """输入 v3 标准码表缓存；输出拒绝，避免继续使用旧量能算法产生的昨收。"""
+    payload = {
+        "format_version": 3,
+        "kind": "std",
+        "cache_date": "2026-10-21",
+        "records": [{"market": 2, "code": "920176", "pre_close": 352.19}],
+        "market_names": {},
+    }
+    assert validate_catalog_payload(payload, KIND_STD) is None
 
 
 def test_etf_catalog_cache_roundtrip(tmp_path: Path):

@@ -100,10 +100,10 @@ def get_volume(ivol):
     1. K 线 vol 与 amount 的协议出口解码；输出会被 `format_socket_kline_page_inplace`
        做 `np.rint` 整数化（项目内 schema 设计）。
     边界条件：
-    1. **行为必须与 pytdx 原版按位等价**——包括 pytdx 在 `dwEdx < 0` 时
-       `1 / pow(2.0, dwEdx) = pow(2.0, -dwEdx)`（与"取倒数"惯例方向相反）这一历史保留特性，
-       否则会让量价偏差几百倍。
-    2. `if hleax > 0x80` 是严格大于；`hleax == 0x80` 必须走 else 分支。
+    1. 除已由真实数据证明错误的 `hleax == 0x80` 边界外，保留 pytdx 原版算法；
+       包括 `dwEdx < 0` 时的历史负指数行为，避免扩大修复范围。
+    2. `hleax == 0x80` 必须与 `hleax > 0x80` 一样进入指数分支。全市场原码影子
+       验收中，该修正只改变 511920.SH 的一条成交量，且与 TdxQuant 和本地日线一致。
     """
     logpoint = ivol >> 24
     hleax = (ivol >> 16) & 0xFF
@@ -121,8 +121,8 @@ def get_volume(ivol):
     if ecx < 0:
         dbl_xmm6 = 1.0 / dbl_xmm6
 
-    # hleax 分支：严格 > 0x80 走大分支（pytdx 行为，hleax == 0x80 走 else）。
-    if hleax > 0x80:
+    # hleax 分支：真实原码 0x3f800000 应解为 1；因此 0x80 也进入指数分支。
+    if hleax >= 0x80:
         # pytdx: pow(2, edx) * 128 + (hleax&0x7f) * pow(2, edx+1)；edx 可正可负，缓存覆盖。
         dbl_xmm0 = _POW2_CACHE[edx] * 128.0 + (hleax & 0x7F) * _POW2_CACHE[edx + 1]
     else:
@@ -136,7 +136,7 @@ def get_volume(ivol):
     # 末两段 pow 累加：pytdx 在所有分支都直接 pow(2.0, esi)/pow(2.0, eax)，不取倒数。
     dbl_xmm3 = _POW2_CACHE[esi] * lheax
     dbl_xmm1 = _POW2_CACHE[eax] * lleax
-    # `if hleax & 0x80`：包含 0x80-0xFF（与 pytdx 一致，与上方 `> 0x80` 不冲突）。
+    # `if hleax & 0x80`：包含 0x80-0xFF，与上方指数分支范围一致。
     if hleax & 0x80:
         dbl_xmm3 *= 2.0
         dbl_xmm1 *= 2.0

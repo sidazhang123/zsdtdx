@@ -24,7 +24,8 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 # 与 0x044D 16 字节 GBK 名称记录对应；版本不符的磁盘缓存直接丢弃。
 # v3：ETF 名称合并 zhb.zip/ilong.dat（同码覆盖 infoharbor）。
-_CATALOG_CACHE_FORMAT_VERSION = 3
+# v4：标准 0x044D 目录昨收改按小端 float32 解析，拒绝含旧错误值的缓存。
+_CATALOG_CACHE_FORMAT_VERSION = 4
 KIND_STD = "std"
 KIND_EX = "ex"
 KIND_ETF = "etf"

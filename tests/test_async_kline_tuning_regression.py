@@ -336,19 +336,19 @@ class TestLogDetailOptionsRCU:
 
 
 # =============================================================================
-# F8: get_volume 与 pytdx 原版 fuzz 等价（覆盖 hleax=0x80 / dwEdx<0 边界）
+# F8: get_volume 除已证伪的 hleax=0x80 外与 pytdx 原版 fuzz 等价
 # =============================================================================
 
 
 class TestGetVolumeParityFuzz:
     """
-    阶段一 A2 关键 bug 修复：当前工程 helper.get_volume 必须与 pytdx 原版按位等价。
+    当前工程 helper.get_volume 保留 pytdx 的主体算法，只修正真实行情证明错误的 0x80 边界。
 
     历史 bug：
-    1. `if hleax > 0x80` 曾被写成 `if hleax & 0x80`，让 hleax==0x80 错误走大分支；
+    1. pytdx 的 `if hleax > 0x80` 会把实盘原码 0000803f 的 1 手误解成 32768；
     2. `else` 中 `dwEdx<0` 时 pytdx 是 `1/pow(2,dwEdx)=pow(2,-dwEdx)`（方向反向但要保持等价）。
 
-    本测试用大量随机 ivol 做 fuzz，再加显式覆盖 hleax=0x80 / dwEdx 边界。
+    本测试在 0x80 以外做随机等价 fuzz，并单独锁定已验证的 0x80 正确值。
     """
 
     def _pytdx_get_volume(self):
@@ -362,12 +362,12 @@ class TestGetVolumeParityFuzz:
         return zs_get_volume
 
     def test_explicit_boundary_hleax_eq_0x80(self):
-        """hleax==0x80 必须走 else 分支（与 pytdx 完全一致）。"""
-        # 构造 ivol：logpoint=0x42, hleax=0x80, lheax=0x00, lleax=0x00
-        ivol = (0x42 << 24) | (0x80 << 16) | (0x00 << 8) | 0x00
+        """真实 511920.SH 原码必须解为 1，并明确偏离 pytdx 的错误边界结果。"""
+        ivol = 0x3F800000
         z = self._zs_get_volume()(ivol)
         p = self._pytdx_get_volume()(ivol)
-        assert z == p, f"hleax=0x80 边界不等: zs={z} pytdx={p}"
+        assert z == 1.0
+        assert p != z
 
     def test_explicit_boundary_hleax_gt_0x80(self):
         """hleax>0x80 走大分支。"""
@@ -400,6 +400,8 @@ class TestGetVolumeParityFuzz:
         mismatches: List[tuple] = []
         for _ in range(2000):
             ivol = rng.randint(0, (1 << 32) - 1)
+            if ((ivol >> 16) & 0xFF) == 0x80:
+                continue
             z = zs(ivol)
             p = pt(ivol)
             if z != p:

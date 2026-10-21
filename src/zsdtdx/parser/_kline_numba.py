@@ -44,7 +44,7 @@ def read_u32(body, pos):
 
 @njit(nogil=True, cache=True, fastmath=False)
 def volume_value(value):
-    """输入协议量能整数，输出浮点数；保留历史负指数和 0x80 分支。"""
+    """输入协议量能整数，输出浮点数；0x80 边界按真实量能值进入指数分支。"""
     point = value >> 24
     hi, mid, low = (value >> 16) & 255, (value >> 8) & 255, value & 255
     ecx, edx, esi, eax = (
@@ -56,7 +56,7 @@ def volume_value(value):
     base = math.ldexp(1.0, abs(ecx))
     if ecx < 0:
         base = 1.0 / base
-    if hi > 128:
+    if hi >= 128:
         first = math.ldexp(1.0, edx) * 128.0 + (hi & 127) * math.ldexp(1.0, edx + 1)
     else:
         first = math.ldexp(1.0, abs(edx)) * hi

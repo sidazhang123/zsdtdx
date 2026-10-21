@@ -15,15 +15,15 @@
 import struct
 from collections import OrderedDict
 
-from zsdtdx.util.helper import get_volume
 from zsdtdx.params import TDXParams
 from zsdtdx.parser.base import BaseParser
 
 # 12 字节头：cmd=0x044D，声明后续 16 字节体（含 2 字节命令号）。
 _SECURITY_LIST_HEADER = bytes.fromhex("0c 01 18 6e 00 01 10 00 10 00 4d 04")
 _SECURITY_LIST_TAIL_PAD = bytes(6)
-# 银河 0x044D：名称 16 字节 GBK，其后 4 字节保留，decimal_point 在偏移 28。
-_RECORD_STRUCT = struct.Struct("<6sH16s4sBI4s")
+# 银河 0x044D：名称 16 字节 GBK，其后 4 字节保留，decimal_point 在偏移 28；
+# pre_close 是偏移 29 的非对齐小端 IEEE float32，不使用量能解码器。
+_RECORD_STRUCT = struct.Struct("<6sH16s4sBf4s")
 
 
 def pack_security_list_request(market, start, count=None) -> bytearray:
@@ -97,7 +97,7 @@ class GetSecurityList(BaseParser):
                 name_bytes,
                 _reversed_bytes1,
                 decimal_point,
-                pre_close_raw,
+                pre_close,
                 _reversed_bytes2,
             ) = _RECORD_STRUCT.unpack(one_bytes)
             stocks.append(
@@ -107,7 +107,7 @@ class GetSecurityList(BaseParser):
                         ("volunit", volunit),
                         ("decimal_point", decimal_point),
                         ("name", name_bytes.decode("gbk", "ignore").rstrip("\x00")),
-                        ("pre_close", get_volume(pre_close_raw)),
+                        ("pre_close", float(pre_close)),
                     ]
                 )
             )
