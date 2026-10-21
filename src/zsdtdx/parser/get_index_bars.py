@@ -14,7 +14,10 @@
 # coding=utf-8
 
 from zsdtdx.parser.base import BaseParser
-from zsdtdx.parser.diff_kline_page import parse_diff_encoded_kline_page
+from zsdtdx.parser.diff_kline_page import (
+    parse_diff_encoded_kline_page,
+    standard_kline_volume_scale,
+)
 from zsdtdx.parser.get_security_bars import pack_standard_kline_request
 
 
@@ -39,5 +42,11 @@ class GetIndexBarsCmd(BaseParser):
         边界条件：空页返回 []。
         """
         return parse_diff_encoded_kline_page(
-            body_buf, self.category, with_index_counts=True
+            body_buf,
+            self.category,
+            with_index_counts=True,
+            volume_scale=standard_kline_volume_scale(
+                self.category,
+                is_index=True,
+            ),
         )

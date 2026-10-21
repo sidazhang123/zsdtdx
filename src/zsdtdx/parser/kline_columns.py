@@ -118,9 +118,11 @@ class KlineColumns:
         return result
 
 
-def _finish(values, clocks, extra=None, extended=False):
+def _finish(values, clocks, extra=None, extended=False, volume_scale=1.0):
     """输入解码数组，输出刻度后的列页；价格和量能按既有 numpy 规则处理。"""
     np.round(values[:4], 2, out=values[:4])
+    if float(volume_scale) != 1.0:
+        values[4] *= float(volume_scale)
     np.rint(
         values[4:7] if extended else values[4:6],
         out=values[4:7] if extended else values[4:6],
@@ -137,7 +139,13 @@ def _finish(values, clocks, extra=None, extended=False):
 
 
 def parse_standard_columns(
-    body, category, *, with_index_counts=False, absolute_ohlc=False
+    body,
+    category,
+    *,
+    with_index_counts=False,
+    absolute_ohlc=False,
+    volume_scale=1.0,
+    ieee_volume=True,
 ):
     """输入标准回包和周期，输出只读列页；格式错误抛 ValueError。"""
     from zsdtdx.parser._kline_numba import decode_standard
@@ -147,13 +155,14 @@ def parse_standard_columns(
         int(category),
         bool(with_index_counts),
         bool(absolute_ohlc),
+        bool(ieee_volume),
     )
     extra = (
         {"up_count": breadth[0], "down_count": breadth[1]}
         if with_index_counts
         else None
     )
-    return _finish(values, clocks, extra)
+    return _finish(values, clocks, extra, volume_scale=volume_scale)
 
 
 def parse_extended_columns(body, category):
@@ -199,8 +208,16 @@ def merge_pages(pages):
 
 def warmup_kline_decoders():
     """输入无，输出无；编译全部格式签名，不建立行情连接。"""
-    for counts, absolute in ((False, False), (True, False), (True, True)):
+    for counts, absolute, ieee_volume in (
+        (False, False, True),
+        (True, False, True),
+        (True, True, False),
+    ):
         parse_standard_columns(
-            b"\x00\x00", 4, with_index_counts=counts, absolute_ohlc=absolute
+            b"\x00\x00",
+            4,
+            with_index_counts=counts,
+            absolute_ohlc=absolute,
+            ieee_volume=ieee_volume,
         )
     parse_extended_columns(bytes(42), 4)

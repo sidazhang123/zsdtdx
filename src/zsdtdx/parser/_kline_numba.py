@@ -44,7 +44,24 @@ def read_u32(body, pos):
 
 @njit(nogil=True, cache=True, fastmath=False)
 def volume_value(value):
-    """输入协议量能整数，输出浮点数；0x80 边界按真实量能值进入指数分支。"""
+    """输入 0x052D 量额原码，按小端 IEEE ``float32`` 位型输出数值。
+
+    全市场逐日与周/月自行聚合取证确认该字段是标准单精度浮点数。pytdx
+    的手工公式在指数较小时会把 12、50、59 分别误解为 1032、320、464。
+    """
+    sign = -1.0 if value & 0x80000000 else 1.0
+    exponent = (value >> 23) & 0xFF
+    fraction = value & 0x7FFFFF
+    if exponent == 0:
+        return sign * math.ldexp(float(fraction), -149)
+    if exponent == 0xFF:
+        raise ValueError("K线量额出现非有限 float32")
+    return sign * math.ldexp(float(0x800000 | fraction), exponent - 150)
+
+
+@njit(nogil=True, cache=True, fastmath=False)
+def legacy_volume_value(value):
+    """输入未独立验收协议的量额原码，保持既有 pytdx 兼容解码。"""
     point = value >> 24
     hi, mid, low = (value >> 16) & 255, (value >> 8) & 255, value & 255
     ecx, edx, esi, eax = (
@@ -83,7 +100,7 @@ def wall_clock(value, category):
 
 
 @njit(nogil=True, cache=True, fastmath=False)
-def decode_standard(body, category, counts, absolute):
+def decode_standard(body, category, counts, absolute, ieee_volume):
     """输入标准页及格式标记，输出数值矩阵、时间列、家数列；坏页抛错。"""
     if len(body) < 2:
         raise ValueError("K线记录数截断")
@@ -111,10 +128,17 @@ def decode_standard(body, category, counts, absolute):
             or abs(previous) > 4503599627370496
         ):
             raise ValueError("K线差分价链溢出")
-        values[4, i], values[5, i] = (
-            volume_value(read_u32(body, pos)),
-            volume_value(read_u32(body, pos + 4)),
-        )
+        raw_volume, raw_amount = read_u32(body, pos), read_u32(body, pos + 4)
+        if ieee_volume:
+            values[4, i], values[5, i] = (
+                volume_value(raw_volume),
+                volume_value(raw_amount),
+            )
+        else:
+            values[4, i], values[5, i] = (
+                legacy_volume_value(raw_volume),
+                legacy_volume_value(raw_amount),
+            )
         pos += 8
         if absolute:
             values[0, i], values[1, i], values[2, i], values[3, i] = (

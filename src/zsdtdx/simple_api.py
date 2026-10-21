@@ -315,6 +315,7 @@ def get_stock_kline(
 
     K 线 datetime 输出:
     - rows 中 `datetime` 为 `YYYY-MM-DD HH:MM:SS`，秒位固定 `:00`。
+    - 标准行情 `volume` 统一为与日线相同的最小成交单位；周/月线不会返回“手”。
 
     调用示例（写法一：with + sync + 其它接口）:
     ```python
@@ -507,6 +508,7 @@ def get_index_kline(
 
     时间窗口 / datetime:
     - 与 get_stock_kline 相同（仅日期补齐 09:30:00 / 16:00:00；秒位 `:00`）。
+    - 标准行情 `volume` 统一为最小成交单位；5/15/30/60 分钟及周/月线已在 parser 层归一化。
 
     返回:
     - sync: `list[task_payload]`；async: `StockKlineJob`。

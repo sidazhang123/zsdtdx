@@ -90,15 +90,16 @@ for _e in range(_POW2_CACHE_MIN, _POW2_CACHE_MAX + 1):
 
 def get_volume(ivol):
     """
-    通达信量能/成交额 IEEE-754-like 解码。
+    通达信部分旧协议使用的 pytdx 兼容量能/成交额解码。
 
     输入：
     1. ivol: 4 字节无符号整数（从协议体直接 unpack 出）。
     输出：
     1. float，量能/成交额数值。
     用途：
-    1. K 线 vol 与 amount 的协议出口解码；输出会被 `format_socket_kline_page_inplace`
-       做 `np.rint` 整数化（项目内 schema 设计）。
+    1. 当前用于 0x053E 实时报价成交额及低层除权协议等兼容路径。
+    2. 标准 0x052D K 线已由 `_kline_numba.volume_value` 按真实 IEEE `float32`
+       独立解码，不再调用本函数。
     边界条件：
     1. 除已由真实数据证明错误的 `hleax == 0x80` 边界外，保留 pytdx 原版算法；
        包括 `dwEdx < 0` 时的历史负指数行为，避免扩大修复范围。

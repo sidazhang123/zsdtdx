@@ -381,6 +381,7 @@ finally:
   >  "error": null}
   > ```
 - done: `{"event":"done","total_tasks":...,"success_tasks":...,"failed_tasks":...}`。
+- 标准行情 `volume` 统一为与日线相同的最小成交单位；周/月线不会返回“手”。
 
 
 
@@ -405,6 +406,7 @@ finally:
 **K 线** `datetime` **输出契约:**
 
 - 与 `get_stock_kline` 相同。
+- 标准行情 `volume` 统一为最小成交单位；5/15/30/60 分钟及周/月线已在 parser 层归一化。
 
 **调用示例:**
 

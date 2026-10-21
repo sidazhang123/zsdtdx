@@ -17,7 +17,10 @@ import struct
 import six
 
 from zsdtdx.parser.base import BaseParser
-from zsdtdx.parser.diff_kline_page import parse_diff_encoded_kline_page
+from zsdtdx.parser.diff_kline_page import (
+    parse_diff_encoded_kline_page,
+    standard_kline_volume_scale,
+)
 
 # 首包 inner=0x0101D208，翻页 inner=0x0101D308。
 _KLINE_INNER_FIRST = 0x0101D208
@@ -90,5 +93,11 @@ class GetSecurityBarsCmd(BaseParser):
     def parseResponse(self, body_buf):
         """输入 body_buf；输出已格式化的 K 线 dict 列表。"""
         return parse_diff_encoded_kline_page(
-            body_buf, self.category, with_index_counts=False
+            body_buf,
+            self.category,
+            with_index_counts=False,
+            volume_scale=standard_kline_volume_scale(
+                self.category,
+                is_index=False,
+            ),
         )

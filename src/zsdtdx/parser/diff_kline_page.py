@@ -23,8 +23,14 @@ def parse_diff_encoded_kline_page(
     *,
     with_index_counts: bool = False,
     absolute_ohlc: bool = False,
+    volume_scale: float = 1.0,
+    ieee_volume: bool = True,
 ):
-    """输入标准页及格式，输出行列表或上下文指定的列页；坏包抛错。"""
+    """输入标准页及格式，输出行列表或上下文指定的列页；坏包抛错。
+
+    ``volume_scale`` 只用于 0x052D 已取证的服务端周期单位归一化；
+    0x0523 板块等未验收协议保持默认 1，不在共用解码器内猜测业务类型。
+    """
     from zsdtdx.parser.kline_columns import columnar_decode, parse_standard_columns
 
     page = parse_standard_columns(
@@ -32,5 +38,20 @@ def parse_diff_encoded_kline_page(
         category,
         with_index_counts=with_index_counts,
         absolute_ohlc=absolute_ohlc,
+        volume_scale=volume_scale,
+        ieee_volume=ieee_volume,
     )
     return page if columnar_decode.get() else page.raw_rows()
+
+
+def standard_kline_volume_scale(category: int, *, is_index: bool) -> float:
+    """返回标准 0x052D 成交量到最小成交单位的倍率。"""
+
+    period = int(category)
+    if period in {5, 6}:
+        # 银河周/月线成交量以手返回；公开 K 线统一还原为日线相同的最小单位。
+        return 100.0
+    if is_index and period in {0, 1, 2, 3}:
+        # 标准指数 5/15/30/60 分钟量比最小单位放大 100 倍。
+        return 0.01
+    return 1.0

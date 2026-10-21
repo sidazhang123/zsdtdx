@@ -52,4 +52,6 @@ class GetBlockBarsCmd(BaseParser):
             self.category,
             with_index_counts=True,
             absolute_ohlc=True,
+            # 0x0523 尚无独立数值基准，不沿用 0x052D 的 float32 结论。
+            ieee_volume=False,
         )

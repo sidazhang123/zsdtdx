@@ -96,15 +96,36 @@ def test_standard_decoder_matches_reference(category, counts, absolute):
             assert (row["up_count"], row["down_count"]) == (19 + i, 7 + i)
 
 
-def test_numba_volume_bit_parity_random():
-    """包含完整指数和高字节分支的随机输入必须保持浮点位级一致。"""
+def test_numba_volume_matches_ieee_float32_random():
+    """0x052D 量额按 IEEE float32 位型解码，覆盖普通数、零与次正规数。"""
     from zsdtdx.parser._kline_numba import volume_value
 
     rng = np.random.default_rng(42)
-    for value in list(rng.integers(0, 2**32, 10003, dtype=np.uint64)) + [0, 0x40800000]:
-        assert struct.pack("d", volume_value(int(value))) == struct.pack(
-            "d", get_volume(int(value))
-        )
+    values = list(rng.integers(0, 0x7F800000, 10003, dtype=np.uint64))
+    values += [0, 1, 0x3F800000, 0x41400000, 0x42480000, 0x426C0000]
+    for value in values:
+        raw = int(value).to_bytes(4, "little")
+        expected = struct.unpack("<f", raw)[0]
+        assert struct.pack("d", volume_value(int(value))) == struct.pack("d", expected)
+
+
+@pytest.mark.parametrize(
+    "raw_hex, expected, pytdx_style_wrong",
+    [
+        ("00004041", 12.0, 1032.0),
+        ("00004842", 50.0, 320.0),
+        ("00006c42", 59.0, 464.0),
+    ],
+)
+def test_standard_decoder_fixes_real_low_weekly_volume(
+    raw_hex, expected, pytdx_style_wrong
+):
+    """真实低量周线原码必须按 float32 解码，不能进入 pytdx 负指数旧分支。"""
+    from zsdtdx.parser._kline_numba import volume_value
+
+    raw = int.from_bytes(bytes.fromhex(raw_hex), "little")
+    assert volume_value(raw) == expected
+    assert get_volume(raw) == pytdx_style_wrong
 
 
 def test_standard_decoder_fixes_real_hleax_0x80_volume_boundary():
