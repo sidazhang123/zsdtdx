@@ -93,6 +93,21 @@ normalized_last_close = parsed_quote_last_close / 10 ** max(decimal_point - 2, 0
 
 当前公开 `simple_api` 没有标准股票五档报价入口；该 parser 仍可由底层 `TdxHq_API.get_security_quotes()` 使用。`get_stock_stat` 主要走另一条 0x054B 宽表路径，因此不能据本次结果直接宣称股票统计价格被放大。
 
+## 开盘时刻 TdxQuant 并行反推（2026-10-21）
+
+为避免只用目录昨收自洽证明目录精度，追加在交易时段并行取得 TdxQuant 全市场 snapshot 和银河 0x053E 报价，以双方昨收数量级反推每个标的的原始整数小数位。盘中现价会变化，昨收不受一两分钟取数时差影响。
+
+- TdxQuant 列表标的：7,777；snapshot 返回 7,777；银河报价返回 7,777；两侧请求错误均为 0。
+- 正昨收且身份可连接的记录：7,710；另有 48 条非正昨收和 19 条目录连接缺失，不强行推断。
+- A 股 `decimal_point=2`：5,576/5,576 的反推量级一致。
+- 基金 `decimal_point=3`：1,720/1,720 一致。
+- 可转债 `decimal_point=4`：320/320 一致。
+- 指数 `decimal_point=2`：94/94 的反推精度一致。其中 399001.SZ 两侧昨收为 11801.28 与 11801.29，相差 0.01，但候选除数仍唯一指向两位精度，不构成数量级例外。
+
+TdxQuant 的 `XsFlag` 不能直接作为协议除数：目录精度 2、3 的记录分别对应 `XsFlag=2`、`XsFlag=3`，但 320 条可转债全部是目录 `decimal_point=4`、TdxQuant `XsFlag=3`。这说明 `XsFlag` 表示展示位数；0x053E 原始整数的协议缩放仍必须使用 0x044D `decimal_point`。
+
+因此精度规律已经找到，不需要按代码前缀试探，也不应依赖 TdxQuant 运行时。剩余工程问题是把已加载的 0x044D `(market, code) -> decimal_point` 映射可靠地传给 0x053E parser，并为直接使用低层 `TdxHq_API`、尚未加载目录的调用定义兼容行为。
+
 ## 对修改范围的建议
 
 1. 0x044D 目录昨收可以独立改为明确的小端 `float32`，并提升或拆分 std 目录缓存版本。
@@ -117,5 +132,6 @@ normalized_last_close = parsed_quote_last_close / 10 ** max(decimal_point - 2, 0
 - `C:\Users\pkwccheng\Desktop\f10\f10_probe\validation\2026-10-20_numeric_parser\quotes\`
 - `C:\Users\pkwccheng\Desktop\f10\f10_probe\validation\2026-10-20_numeric_parser\analysis.json`
 - `C:\Users\pkwccheng\Desktop\f10\f10_probe\validation\2026-10-20_numeric_parser\audit_security_list_numeric.py`
+- `C:\Users\pkwccheng\Desktop\f10\f10_probe\validation\2026-10-20_numeric_parser\tdxquant_kline\decimal_point_tdxquant_live.json`
 
 原始证据体积较大，不进入安装包或普通测试。仓库保留本报告的覆盖口径、统计结果和修改边界。
