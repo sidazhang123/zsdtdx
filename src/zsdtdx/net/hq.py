@@ -157,14 +157,27 @@ class TdxHq_API(BaseSocketClient):
         return cmd.call_api()
 
     @update_last_ack_time
-    def get_security_quotes(self, all_stock, code=None):
+    def get_security_quotes(
+        self,
+        all_stock,
+        code=None,
+        *,
+        security_type=None,
+        decimal_point=None,
+    ):
         """
-        支持三种形式的参数
+        支持 market/code 兼容调用，也支持手工指定稳定的品种价格精度。
+
         get_security_quotes(market, code )
         get_security_quotes((market, code))
         get_security_quotes([(market1, code1), (market2, code2)] )
+        get_security_quotes([(market, code)], security_type="fund")
+        get_security_quotes([(market, code, 4)])
+
         :param all_stock （market, code) 的数组
         :param code{optional} code to query
+        :param security_type{optional} stock/index/fund/convertible_bond
+        :param decimal_point{optional} 同精度批次的显式小数位
         :return:
         """
 
@@ -178,7 +191,11 @@ class TdxHq_API(BaseSocketClient):
             all_stock = [all_stock]
 
         cmd = GetSecurityQuotesCmd(self.client, lock=self.lock)
-        cmd.setParams(all_stock)
+        cmd.setParams(
+            all_stock,
+            security_type=security_type,
+            decimal_point=decimal_point,
+        )
         return cmd.call_api()
 
     @update_last_ack_time

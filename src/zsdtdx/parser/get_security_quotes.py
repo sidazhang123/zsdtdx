@@ -21,10 +21,43 @@ from zsdtdx.parser.base import BaseParser
 from zsdtdx.util.helper import get_price, get_volume
 
 
+# 2026-10-21 使用 TdxQuant 与银河 0x053E 对 7,710 条正昨收做全市场并行反推：
+# 股票/指数为 2 位、基金为 3 位、可转债为 4 位。该值是品种价格刻度，不随盘中行情变化；
+# 新增证券品种或交易所修改报价规则时，应先重跑数值验收再更新本表。
+QUOTE_PRICE_DECIMAL_POINTS = {
+    "stock": 2,
+    "index": 2,
+    "fund": 3,
+    "convertible_bond": 4,
+}
+
+
+def resolve_quote_decimal_point(security_type=None, decimal_point=None):
+    """输入品种或显式精度，输出 0x053E 价格整数的小数位。"""
+
+    if decimal_point is not None:
+        value = int(decimal_point)
+        if value < 0 or value > 8:
+            raise ValueError("decimal_point 必须在 0..8 范围内")
+        return value
+    if security_type is None:
+        # pytdx 兼容调用只传 market/code；历史默认适用于股票和指数。
+        return QUOTE_PRICE_DECIMAL_POINTS["stock"]
+    key = str(security_type).strip().lower()
+    if key not in QUOTE_PRICE_DECIMAL_POINTS:
+        supported = ", ".join(sorted(QUOTE_PRICE_DECIMAL_POINTS))
+        raise ValueError(
+            f"不支持的 security_type={security_type!r}；可选值: {supported}"
+        )
+    return QUOTE_PRICE_DECIMAL_POINTS[key]
+
+
 class GetSecurityQuotesCmd(BaseParser):
-    def setParams(self, all_stock):
+    def setParams(self, all_stock, *, security_type=None, decimal_point=None):
         """
-        :param all_stock: 一个包含 (market, code) 元组的列表， 如 [ (0, '000001'), (1, '600001') ]
+        :param all_stock: 包含 (market, code) 或 (market, code, decimal_point) 的列表。
+        :param security_type: 同品种批次可传 stock/index/fund/convertible_bond。
+        :param decimal_point: 同精度批次可直接传小数位；逐项三元组优先。
         :return:
         """
         stock_len = len(all_stock)
@@ -46,8 +79,24 @@ class GetSecurityQuotesCmd(BaseParser):
 
         pkg_header = struct.pack("<HIHHIIHH", *values)
         pkg = bytearray(pkg_header)
+        self._decimal_points = {}
         for stock in all_stock:
-            market, code = stock
+            if len(stock) == 3:
+                market, code, item_decimal_point = stock
+            else:
+                market, code = stock
+                item_decimal_point = decimal_point
+            resolved_decimal_point = resolve_quote_decimal_point(
+                security_type=security_type,
+                decimal_point=item_decimal_point,
+            )
+            code_text = (
+                code
+                if type(code) is six.text_type
+                else bytes(code).decode("utf-8", errors="replace")
+            )
+            code_text = code_text.rstrip("\x00").strip()
+            self._decimal_points[(int(market), code_text)] = resolved_decimal_point
             if type(code) is six.text_type:
                 code = code.encode("utf-8")
             one_stock_pkg = struct.pack("<B6s", market, code)
@@ -79,6 +128,10 @@ class GetSecurityQuotesCmd(BaseParser):
             (market, code, active1) = struct.unpack("<B6sH", body_buf[pos : pos + 9])
             pos += 9
             code_text = code.decode("utf-8", errors="replace").rstrip("\x00").strip()
+            decimal_point = getattr(self, "_decimal_points", {}).get(
+                (int(market), code_text),
+                QUOTE_PRICE_DECIMAL_POINTS["stock"],
+            )
             price, pos = get_price(body_buf, pos)
             last_close_diff, pos = get_price(body_buf, pos)
             open_diff, pos = get_price(body_buf, pos)
@@ -154,11 +207,14 @@ class GetSecurityQuotesCmd(BaseParser):
                         ("market", market),
                         ("code", code_text),
                         ("active1", active1),
-                        ("price", self._cal_price(price, 0)),
-                        ("last_close", self._cal_price(price, last_close_diff)),
-                        ("open", self._cal_price(price, open_diff)),
-                        ("high", self._cal_price(price, high_diff)),
-                        ("low", self._cal_price(price, low_diff)),
+                        ("price", self._cal_price(price, 0, decimal_point)),
+                        (
+                            "last_close",
+                            self._cal_price(price, last_close_diff, decimal_point),
+                        ),
+                        ("open", self._cal_price(price, open_diff, decimal_point)),
+                        ("high", self._cal_price(price, high_diff, decimal_point)),
+                        ("low", self._cal_price(price, low_diff, decimal_point)),
                         ("servertime", self._format_time("%s" % reversed_bytes0)),
                         ("reversed_bytes0", reversed_bytes0),
                         ("reversed_bytes1", reversed_bytes1),
@@ -169,24 +225,24 @@ class GetSecurityQuotesCmd(BaseParser):
                         ("b_vol", b_vol),
                         ("reversed_bytes2", reversed_bytes2),
                         ("reversed_bytes3", reversed_bytes3),
-                        ("bid1", self._cal_price(price, bid1)),
-                        ("ask1", self._cal_price(price, ask1)),
+                        ("bid1", self._cal_price(price, bid1, decimal_point)),
+                        ("ask1", self._cal_price(price, ask1, decimal_point)),
                         ("bid_vol1", bid_vol1),
                         ("ask_vol1", ask_vol1),
-                        ("bid2", self._cal_price(price, bid2)),
-                        ("ask2", self._cal_price(price, ask2)),
+                        ("bid2", self._cal_price(price, bid2, decimal_point)),
+                        ("ask2", self._cal_price(price, ask2, decimal_point)),
                         ("bid_vol2", bid_vol2),
                         ("ask_vol2", ask_vol2),
-                        ("bid3", self._cal_price(price, bid3)),
-                        ("ask3", self._cal_price(price, ask3)),
+                        ("bid3", self._cal_price(price, bid3, decimal_point)),
+                        ("ask3", self._cal_price(price, ask3, decimal_point)),
                         ("bid_vol3", bid_vol3),
                         ("ask_vol3", ask_vol3),
-                        ("bid4", self._cal_price(price, bid4)),
-                        ("ask4", self._cal_price(price, ask4)),
+                        ("bid4", self._cal_price(price, bid4, decimal_point)),
+                        ("ask4", self._cal_price(price, ask4, decimal_point)),
                         ("bid_vol4", bid_vol4),
                         ("ask_vol4", ask_vol4),
-                        ("bid5", self._cal_price(price, bid5)),
-                        ("ask5", self._cal_price(price, ask5)),
+                        ("bid5", self._cal_price(price, bid5, decimal_point)),
+                        ("ask5", self._cal_price(price, ask5, decimal_point)),
                         ("bid_vol5", bid_vol5),
                         ("ask_vol5", ask_vol5),
                         ("reversed_bytes4", reversed_bytes4),
@@ -204,7 +260,7 @@ class GetSecurityQuotesCmd(BaseParser):
             stocks.append(one_stock)
         return stocks
 
-    def _cal_price(self, base_p, diff):
+    def _cal_price(self, base_p, diff, decimal_point=2):
         """
         输入：
         1. base_p: 输入参数，约束以协议定义与函数实现为准。
@@ -216,7 +272,7 @@ class GetSecurityQuotesCmd(BaseParser):
         边界条件：
         1. 连接与重试由上层客户端负责；本函数只处理当前协议数据。
         """
-        return float(base_p + diff) / 100
+        return float(base_p + diff) / (10 ** int(decimal_point))
 
     def _format_time(self, time_stamp):
         """
