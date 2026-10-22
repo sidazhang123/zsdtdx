@@ -27,6 +27,11 @@ HOST_A = ("offline-a", 7709)
 HOST_B = ("offline-b", 7709)
 
 
+def titled_content(code="600000", index=0, tail="OK"):
+    """测试正文带真实起始标题，避免新身份合同把占位符视为错位正文。"""
+    return f"☆栏目{index}☆ ◇{code} 测试◇\r\n{tail}"
+
+
 def make_client(*, leased=True, hosts=None, mode="ok", bad_connect=(), categories=1):
     """输入替身故障参数，输出真实客户端空壳、池、配额和调用记录；不联网。"""
     hosts = list(hosts or [HOST_A, HOST_B])
@@ -59,7 +64,9 @@ def make_client(*, leased=True, hosts=None, mode="ok", bad_connect=(), categorie
                     "name": f"栏目{index}",
                     "filename": f"{code}.txt",
                     "start": index * 100,
-                    "length": 2,
+                    "length": len(titled_content(code, index).encode("gbk"))
+                    if mode != "bad_gbk"
+                    else len(titled_content(code, index, "x").encode("gbk")) + 1,
                 }
                 for index in range(categories)
             ]
@@ -72,13 +79,13 @@ def make_client(*, leased=True, hosts=None, mode="ok", bad_connect=(), categorie
             if mode == "short":
                 return b"x"
             if mode == "bad_gbk":
-                return b"x\xff"
+                return titled_content(code, index, "x").encode("gbk") + b"\xff"
             if mode == "cancel_body":
                 closer = _attempt_socket_closer.get()
                 assert closer is not None
                 closer.close()
                 return b"OK"
-            return b"OK"
+            return titled_content(code, index).encode("gbk")
 
     original = PersistentFailoverPool("std", Api, hosts, 0.1)
     controller = AdaptiveConcurrencyController(
@@ -142,7 +149,7 @@ def test_available_second_host_is_used_without_waiting_for_first():
     held = controller.acquire("std", max_units=1, timeout=0, allowed_hosts={HOST_A})
     try:
         rows = client.get_company_info_content("600000", return_df=False)
-        assert rows[0]["content"] == "OK"
+        assert rows[0]["content"] == titled_content()
         assert {item[1] for item in calls if item[0] in {"directory", "content"}} == {
             HOST_B
         }
@@ -164,7 +171,7 @@ def test_single_host_waits_for_delayed_quota_release():
     try:
         assert (
             client.get_company_info_content("600000", return_df=False)[0]["content"]
-            == "OK"
+            == titled_content()
         )
     finally:
         timer.join(2)
@@ -250,7 +257,7 @@ def test_lossy_gbk_text_is_accepted_without_retry():
     client, pool, controller, calls = make_client(mode="bad_gbk")
     try:
         assert client.get_company_info_content("600000", return_df=False) == [
-            {"code": "600000", "category": "栏目0", "content": "x"}
+            {"code": "600000", "category": "栏目0", "content": titled_content(tail="x")}
         ]
         assert len([item for item in calls if item[0] == "directory"]) == 1
         assert client._runtime_failures == []
@@ -287,7 +294,9 @@ def test_concurrent_categories_with_single_permit_complete_and_release():
         rows = client.get_company_info_content(
             "600000", category_workers=2, return_df=False
         )
-        assert [row["content"] for row in rows] == ["OK", "OK"]
+        assert [row["content"] for row in rows] == [
+            titled_content(index=i) for i in range(2)
+        ]
         assert {item[1] for item in calls if item[0] in {"directory", "content"}} == {
             HOST_A
         }
@@ -337,7 +346,9 @@ def test_body_reconnect_failure_reloads_directory_on_next_host(monkeypatch):
         rows = client.get_company_info_content(
             "600000", category_workers=2, return_df=False
         )
-        assert [row["content"] for row in rows] == ["OK", "OK"]
+        assert [row["content"] for row in rows] == [
+            titled_content(index=i) for i in range(2)
+        ]
         assert [item[1] for item in calls if item[0] == "directory"] == [HOST_A, HOST_B]
         assert {item[1] for item in calls if item[0] == "content"} == {HOST_B}
         assert controller.snapshot()["inflight_threads"] == 0

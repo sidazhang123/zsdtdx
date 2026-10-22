@@ -90,6 +90,9 @@ class FakeClient:
             }
         }
 
+    def prepare_company_info_routes(self):
+        """本替身不解析路由；批次准备不应消费单股重试或占用工作线程。"""
+
     def get_company_info_content(self, code, **kwargs):
         """输入代码和栏目，输出受控正文或抛错；动作调用始终在当前工作线程。"""
         with self.lock:

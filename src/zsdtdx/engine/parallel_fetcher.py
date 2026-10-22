@@ -2530,6 +2530,8 @@ def _iter_company_info_chunk_results(
         },
     )
     _refresh_thread_hosts(sources)
+    # 协调线程统一准备一次，避免 60 个单股任务从空路由各自刷新全市场。
+    _ensure_shared_client_context().prepare_company_info_routes()
     do_prewarm = (
         bool(fetcher.auto_prewarm_on_async)
         if auto_prewarm is None

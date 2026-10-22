@@ -33,7 +33,23 @@ def _attach_pinned_pool(client, fake_call, hosts=None):
         PersistentFailoverPool.connect_company_info_host(pool, candidates)
     )
     pool.rotate_thread_host.return_value = False
-    pool.call_current_host.side_effect = fake_call
+    titles = {}
+
+    def titled_call(method_name, *args, **kwargs):
+        """给协议替身的正文夹具补上真实标题；短包仍保留原来的缺字节语义。"""
+        result = fake_call(method_name, *args, **kwargs)
+        if method_name == "get_company_info_category" and result:
+            rows = [dict(row) for row in result]
+            for row in rows:
+                title = f"☆{row['name']}☆ ◇{args[1]} 测试◇\r\n".encode("gbk")
+                titles[row["index"]] = title
+                row["length"] += len(title)
+            return rows
+        if method_name == "get_company_info_content" and result is not None:
+            return titles[int(args[5])] + result
+        return result
+
+    pool.call_current_host.side_effect = titled_call
     pool.call.side_effect = AssertionError("公司信息不应再走会换站的 call")
     client.std_pool = pool
     return pool
@@ -273,7 +289,13 @@ def test_get_company_info_content_accepts_gbk_ignore_fallback():
     rows = UnifiedTdxClient.get_company_info_content(
         client, code="600000", return_df=False
     )
-    assert rows == [{"code": "600000", "category": "公司概况", "content": "正文"}]
+    assert rows == [
+        {
+            "code": "600000",
+            "category": "公司概况",
+            "content": "☆公司概况☆ ◇600000 测试◇\r\n正文",
+        }
+    ]
 
 
 def test_company_info_protocol_market_beijing_uses_zero():
@@ -353,7 +375,7 @@ def test_get_company_info_content_beijing_queries_market_zero():
     )
     assert len(rows) == 1
     assert rows[0]["category"] == "公司概况"
-    assert rows[0]["content"] == "正文"
+    assert rows[0]["content"] == "☆公司概况☆ ◇920002 测试◇\r\n正文"
     assert calls[0][0] == "get_company_info_category"
     assert calls[0][1][0] == 0
     assert calls[0][1][1] == "920002"
@@ -417,7 +439,10 @@ def test_get_company_info_content_category_workers_preserves_order():
         category_workers=2,
     )
     assert [r["category"] for r in rows] == ["最新提示", "公司概况"]
-    assert [r["content"] for r in rows] == ["A", "B"]
+    assert [r["content"] for r in rows] == [
+        f"☆{category}☆ ◇600000 测试◇\r\n{tail}"
+        for category, tail in [("最新提示", "A"), ("公司概况", "B")]
+    ]
 
 
 def _client_for_stock(code: str, market: int) -> UnifiedTdxClient:
@@ -501,7 +526,9 @@ def test_company_info_content_threads_bind_category_host():
         return_df=False,
         category_workers=2,
     )
-    assert [row["content"] for row in rows] == ["OK", "OK"]
+    assert [row["content"] for row in rows] == [
+        f"☆{category}☆ ◇000559 测试◇\r\nOK" for category in ["股东研究", "财务分析"]
+    ]
     assert binds
     assert {(host, port) for host, port, _ident in binds} == {("10.1.1.1", 7709)}
     assert any(ident != caller for _host, _port, ident in binds)
@@ -591,7 +618,7 @@ def test_company_info_retries_whole_stock_when_content_host_fails(first_response
         client, code="000559", return_df=False
     )
     assert rows[0]["category"] == "股东研究"
-    assert rows[0]["content"] == "正文"
+    assert rows[0]["content"] == "☆股东研究☆ ◇000559 测试◇\r\n正文"
     assert content_starts == [("10.0.0.1", 66477), ("10.0.0.2", 52879)]
     assert client._runtime_failures == []
     pool.call.assert_not_called()
@@ -676,6 +703,7 @@ def test_fetch_company_info_parallel_payload_forwards_category(monkeypatch):
         config = {"output": {"return_df_default": False}}
 
     monkeypatch.setattr(pf, "get_fetcher", lambda: _FakeFetcher())
+    monkeypatch.setattr(pf, "_ensure_shared_client_context", lambda: MagicMock())
     monkeypatch.setattr(pf, "_get_global_thread_runtime", lambda n: _FakeExecutor())
     monkeypatch.setattr(
         pf,

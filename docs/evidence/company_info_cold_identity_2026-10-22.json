@@ -1,0 +1,199 @@
+{
+  "cross_layout_reconstruction.json": [
+    {
+      "code": "601319",
+      "category": "主力追踪",
+      "directory_host": "123.125.108.101:7709",
+      "file_layout_host": "27.151.2.90:7709",
+      "supplied_start": 332371,
+      "actual_section_start": 895476,
+      "offset_error": -563105,
+      "length": 27293,
+      "covered": true,
+      "full_hash_equal": true,
+      "sha256": "e05e4f8cd81abd35e31243b914d9190245c34f8fb11464d523d26b0691f4fb8e"
+    },
+    {
+      "code": "601718",
+      "category": "主力追踪",
+      "directory_host": "123.125.108.101:7709",
+      "file_layout_host": "27.151.2.90:7709",
+      "supplied_start": 578685,
+      "actual_section_start": 613510,
+      "offset_error": -34825,
+      "length": 19603,
+      "covered": true,
+      "full_hash_equal": true,
+      "sha256": "4f4401190ff4ddc67420199bb188a60a8f0a6938f79431d432b5415dccda3362"
+    },
+    {
+      "code": "601718",
+      "category": "经营分析",
+      "directory_host": "123.125.108.101:7709",
+      "file_layout_host": "27.151.2.90:7709",
+      "supplied_start": 557218,
+      "actual_section_start": 592043,
+      "offset_error": -34825,
+      "length": 21467,
+      "covered": true,
+      "full_hash_equal": true,
+      "sha256": "fc267115e2d3a4aa554ed89a630500bb15b8a0829cdbae6aef765bf0bc73535e"
+    },
+    {
+      "code": "601718",
+      "category": "股东研究",
+      "directory_host": "123.125.108.101:7709",
+      "file_layout_host": "27.151.2.90:7709",
+      "supplied_start": 85009,
+      "actual_section_start": 63653,
+      "offset_error": 21356,
+      "length": 27684,
+      "covered": true,
+      "full_hash_equal": true,
+      "sha256": "f6ac4c57431fa0bed63fade1a372c804094dae2e30a5cfdb2ba886826f5bfb0f"
+    },
+    {
+      "code": "601718",
+      "category": "财务分析",
+      "directory_host": "123.125.108.101:7709",
+      "file_layout_host": "27.151.2.90:7709",
+      "supplied_start": 43690,
+      "actual_section_start": 22334,
+      "offset_error": 21356,
+      "length": 41319,
+      "covered": true,
+      "full_hash_equal": true,
+      "sha256": "f7ebdb66d24997021308fbd522769c53d40685862410916647fff8e2db51f7a4"
+    }
+  ],
+  "final_cold400/report.json": [
+    {
+      "warm_routes": false,
+      "source_file": "/home/ubuntu/f10_diagnostics/20261022_fix_trace/src/zsdtdx/engine/unified_client.py",
+      "source_sha256": "4bb411181a4a1019266f88fa2bb866502daf94b39070374d06a6fc46ffd65c9f",
+      "round": 0,
+      "seconds": 11.95844130218029,
+      "requested": 400,
+      "rows": 2000,
+      "done": {
+        "event": "done",
+        "total_codes": 400,
+        "success_codes": 400,
+        "failed_codes": 0
+      },
+      "errors": [],
+      "bad_rows": [],
+      "peak_rss_mib": 200.75,
+      "trace": {
+        "frames": 3052,
+        "socket_overlap": 0,
+        "parser_mismatch": 0,
+        "directory_parse_mismatch": 0,
+        "request_directory_mismatch": 0,
+        "assembly_mismatch": 0,
+        "host_mismatch": 0,
+        "bad_heads": 0,
+        "directory_loads": 1,
+        "response_identity_mismatch": 0,
+        "wire_body_mismatch": 0
+      }
+    },
+    {
+      "warm_routes": false,
+      "source_file": "/home/ubuntu/f10_diagnostics/20261022_fix_trace/src/zsdtdx/engine/unified_client.py",
+      "source_sha256": "4bb411181a4a1019266f88fa2bb866502daf94b39070374d06a6fc46ffd65c9f",
+      "round": 1,
+      "seconds": 8.572318512946367,
+      "requested": 400,
+      "rows": 2000,
+      "done": {
+        "event": "done",
+        "total_codes": 400,
+        "success_codes": 400,
+        "failed_codes": 0
+      },
+      "errors": [],
+      "bad_rows": [],
+      "peak_rss_mib": 232.15625,
+      "trace": {
+        "frames": 6104,
+        "socket_overlap": 0,
+        "parser_mismatch": 0,
+        "directory_parse_mismatch": 0,
+        "request_directory_mismatch": 0,
+        "assembly_mismatch": 0,
+        "host_mismatch": 0,
+        "bad_heads": 0,
+        "directory_loads": 1,
+        "response_identity_mismatch": 0,
+        "wire_body_mismatch": 0
+      }
+    }
+  ],
+  "final_full5579/report.json": [
+    {
+      "warm_routes": false,
+      "source_file": "/home/ubuntu/f10_diagnostics/20261022_fix_trace/src/zsdtdx/engine/unified_client.py",
+      "source_sha256": "4bb411181a4a1019266f88fa2bb866502daf94b39070374d06a6fc46ffd65c9f",
+      "round": 0,
+      "seconds": 122.00673413649201,
+      "requested": 5579,
+      "rows": 27895,
+      "done": {
+        "event": "done",
+        "total_codes": 5579,
+        "success_codes": 5579,
+        "failed_codes": 0
+      },
+      "errors": [],
+      "bad_rows": [],
+      "peak_rss_mib": 1240.62890625,
+      "trace": {
+        "frames": 42816,
+        "socket_overlap": 0,
+        "parser_mismatch": 0,
+        "directory_parse_mismatch": 0,
+        "request_directory_mismatch": 0,
+        "assembly_mismatch": 0,
+        "host_mismatch": 0,
+        "bad_heads": 0,
+        "directory_loads": 1,
+        "response_identity_mismatch": 0,
+        "wire_body_mismatch": 0
+      }
+    }
+  ],
+  "final_txt_single5579/report.json": [
+    {
+      "warm_routes": false,
+      "source_file": "/home/ubuntu/f10_diagnostics/20261022_fix_trace/src/zsdtdx/engine/unified_client.py",
+      "source_sha256": "4bb411181a4a1019266f88fa2bb866502daf94b39070374d06a6fc46ffd65c9f",
+      "round": 0,
+      "seconds": 122.22436728328466,
+      "requested": 5579,
+      "rows": 27895,
+      "done": {
+        "event": "done",
+        "total_codes": 5579,
+        "success_codes": 5579,
+        "failed_codes": 0
+      },
+      "errors": [],
+      "bad_rows": [],
+      "peak_rss_mib": 1239.48046875,
+      "trace": {
+        "frames": 42805,
+        "socket_overlap": 0,
+        "parser_mismatch": 0,
+        "directory_parse_mismatch": 0,
+        "request_directory_mismatch": 0,
+        "assembly_mismatch": 0,
+        "host_mismatch": 0,
+        "bad_heads": 0,
+        "directory_loads": 1,
+        "response_identity_mismatch": 0,
+        "wire_body_mismatch": 0
+      }
+    }
+  ]
+}

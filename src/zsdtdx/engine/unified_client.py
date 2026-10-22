@@ -1091,6 +1091,24 @@ class PersistentFailoverPool:
         finally:
             data["eligible_hosts"] = previous
 
+    @contextmanager
+    def pin_host(self, host: Tuple[str, int]):
+        """将当前请求的所有取租约/重连限定到一站；连接回收后也不得重新选其它站。"""
+        target = (str(host[0]), int(host[1]))
+        if target not in self._eligible_host_set():
+            raise CompanyInfoFetchError(
+                "钉住的站点不在当前能力范围内",
+                reason="connect_failed",
+                detail={"host": target},
+            )
+        data = self._get_thread_data()
+        previous = data.get("eligible_hosts")
+        data["eligible_hosts"] = {target}
+        try:
+            yield self
+        finally:
+            data["eligible_hosts"] = previous
+
     def _prune_dead_thread_data(self):
         """
         清理已退出线程的连接数据并关闭残留连接。
@@ -1810,6 +1828,8 @@ class UnifiedTdxClient:
 
     # 板块三文件缓存的进程内互斥，避免名称与 K 线同时触发下载。
     _block_catalog_lock = threading.Lock()
+    # F10 路由建立与二次检查共用 single-flight；只读已发布路由不持锁。
+    _company_info_route_lock = threading.Lock()
     # std/ex/ETF 冷启动的进程内 single-flight；跨进程由同目录 lockfile 兜底。
     _catalog_refresh_locks = {
         KIND_STD: threading.Lock(),
@@ -6598,9 +6618,21 @@ class UnifiedTdxClient:
         4. 严格 GBK 失败时按 ignore 保留其余正文和诊断状态；字节长度完整时不据此换站。
         """
         _check_company_info_attempt()
-        if bind_host is not None:
-            self.std_pool.connect_company_info_host([bind_host])
+        with (
+            self.std_pool.pin_host(bind_host)
+            if bind_host is not None
+            else nullcontext()
+        ):
+            if bind_host is not None:
+                self.std_pool.connect_company_info_host([bind_host])
+            return self._read_company_content_pages(
+                market, code, filename, start, length, category_index
+            )
 
+    def _read_company_content_pages(
+        self, market, code, filename, start, length, category_index
+    ):
+        """按目录给出的绝对偏移读取全部页；取租约范围由调用方 pin_host 保持。"""
         chunk_size = int(TDXParams.COMPANY_INFO_CHUNK_SIZE)
         if int(length) <= 0:
             return "", "empty_terminated"
@@ -6708,6 +6740,53 @@ class UnifiedTdxClient:
         finally:
             self.std_pool.finish_company_info_attempt(success=success)
 
+    @contextmanager
+    def _company_info_route_guard(self):
+        """等待同一份路由初始化结果；等待者也遵守单股截止时间和取消。"""
+        while not self._company_info_route_lock.acquire(timeout=0.05):
+            _check_company_info_attempt()
+        try:
+            _check_company_info_attempt()
+            yield
+        finally:
+            self._company_info_route_lock.release()
+
+    def prepare_company_info_routes(self):
+        """整批提交前准备标准股票路由；复用当日磁盘缓存，归还协调线程的许可。"""
+        success = False
+        try:
+            with self._company_info_route_guard():
+                self._ensure_stock_route_cache_no_df(route_source="std")
+            success = True
+        finally:
+            self.std_pool.finish_company_info_attempt(success=success)
+
+    def _company_info_route(self, normalized_code):
+        """解析 F10 路由；冷启动双重检查，不因单码未命中强制刷新全市场。"""
+        route = self._lookup_stock_route(normalized_code)
+        if route is not None:
+            return route
+        with self._company_info_route_guard():
+            route = self._lookup_stock_route(normalized_code)
+            if route is None:
+                self._ensure_stock_route_cache_no_df(
+                    refresh=False,
+                    route_source="ex" if len(normalized_code) == 5 else "std",
+                )
+                route = self._lookup_stock_route(normalized_code)
+        return route
+
+    @staticmethod
+    def _company_info_identity_matches(content, code, category):
+        """只认正文起始标题的栏目和精确代码；GBK ignore 后仍保留其余正文。"""
+        head = str(content).lstrip("\ufeff\x00 \t\r\n")[:240]
+        title = re.match(r"☆([^☆\r\n]+)☆\s*◇\s*([0-9]{6})(?![0-9])", head)
+        return bool(
+            title
+            and "".join(title.group(1).split()) == "".join(str(category).split())
+            and title.group(2) == str(code)
+        )
+
     def _get_company_info_content(
         self,
         code: str,
@@ -6734,10 +6813,7 @@ class UnifiedTdxClient:
         """
         _check_company_info_attempt()
         normalized_code = self._normalize_stock_query_code(code)
-        route = self._lookup_stock_route(normalized_code)
-        if route is None:
-            self.get_all_stock_list(return_df=True, refresh=True)
-            route = self._lookup_stock_route(normalized_code)
+        route = self._company_info_route(normalized_code)
         if route is None:
             raise ValueError(f"股票代码未找到: {code}")
 
@@ -6774,6 +6850,7 @@ class UnifiedTdxClient:
             "host_call_failed",
             "quota_timeout",
             "connect_failed",
+            "identity_mismatch",
         }
         complete_status = {"success", "gbk_ignore_fallback"}
         last_attempt: Optional[Tuple[List[Dict[str, Any]], List[str]]] = None
@@ -6781,13 +6858,25 @@ class UnifiedTdxClient:
 
         pending_hosts = list(eligible_hosts)
         attempted_hosts = []
+        identity_reloaded_hosts = set()
+        directory_retry_host = None
         attempt_started = time.monotonic()
         while pending_hosts:
             _check_company_info_attempt()
             try:
-                bind_target = self.std_pool.connect_company_info_host(pending_hosts)
+                candidates = (
+                    [directory_retry_host] if directory_retry_host else pending_hosts
+                )
+                bind_target = self.std_pool.connect_company_info_host(candidates)
+                directory_retry_host = None
             except CompanyInfoFetchError as exc:
+                if exc.reason in {"cancelled", "attempt_timeout"}:
+                    raise
                 last_error = exc
+                if directory_retry_host is not None:
+                    pending_hosts.remove(directory_retry_host)
+                    directory_retry_host = None
+                    continue
                 break
             if bind_target not in pending_hosts:
                 raise CompanyInfoFetchError(
@@ -6798,12 +6887,13 @@ class UnifiedTdxClient:
             pending_hosts.remove(bind_target)
             attempted_hosts.append(bind_target)
             try:
-                categories = self.std_pool.call_current_host(
-                    "get_company_info_category",
-                    market,
-                    str(normalized_code),
-                    allow_none=True,
-                )
+                with self.std_pool.pin_host(bind_target):
+                    categories = self.std_pool.call_current_host(
+                        "get_company_info_category",
+                        market,
+                        str(normalized_code),
+                        allow_none=True,
+                    )
             except Exception as exc:
                 _check_company_info_attempt()
                 last_error = exc
@@ -6853,6 +6943,13 @@ class UnifiedTdxClient:
                         category_index=int(cat.get("index", seq)),
                         bind_host=host_pin,
                     )
+                    if (
+                        status in complete_status
+                        and not self._company_info_identity_matches(
+                            content, str(normalized_code), cat_name
+                        )
+                    ):
+                        content, status = "", "identity_mismatch"
                 except CompanyInfoFetchError as exc:
                     if exc.reason not in {"quota_timeout", "connect_failed"}:
                         raise
@@ -6890,6 +6987,14 @@ class UnifiedTdxClient:
             records = [row for row, _status in pairs]
             statuses = [status for _row, status in pairs]
             last_attempt = (records, statuses)
+            if "identity_mismatch" in statuses:
+                # 源站可能正在切换文件版本；同站重取一次目录和全部正文，再考虑换站。
+                # 本次整股结果全部丢弃，不能混用两轮目录定位或交付局部成功。
+                self.std_pool.reset_thread_connection(reconnect=False)
+                if bind_target not in identity_reloaded_hosts:
+                    identity_reloaded_hosts.add(bind_target)
+                    pending_hosts.insert(0, bind_target)
+                    directory_retry_host = bind_target
             if any(status in retry_status for status in statuses):
                 continue
             break
