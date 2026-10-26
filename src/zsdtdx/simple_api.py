@@ -177,10 +177,15 @@ def get_stock_concepts() -> Dict[str, Any]:
     - 无。标准行情主机取配置 `hosts.standard.szshbj` 与 `hosts.standard.szsh_only`。
       `infoharbor_block.dat` 提供概念、风格、指数；
       `tdxhy.cfg` 提供股票的通达信行业码；
-      `zhb.zip` 内的 `tdxzs.cfg` 把行业码换成钢铁、煤炭、水泥等行业板块名。
+      `zhb.zip` 内的 `tdxzs.cfg` 把行业码换成钢铁、煤炭、水泥等行业板块名，
+      并把有板块代码的简称换成目录全称；
+      `zhb.zip` 内的 `tdxzs3.cfg` 提供研究行业中类，股票按 X 码前五位归入；
+      `zhb.zip` 内的 `spblock.dat` 补进有当日股票名称的成分段。
+      同一板块代码或同一板块名只保留一个名称，成分取并集。
+      可发布股票完全相同的板块只保留名称最长的一个。
 
     输出:
-    - `{names, map}`：names 为有成分的板块名（概念、风格、指数、基础行业），去重按字排序；
+    - `{names, map}`：names 为有成分的板块名（概念、风格、指数、基础行业、研究行业中类，以及 spblock 中有股票的板块），去重按字排序；
       map 为股票名称 -> 所属板块名列表（去重按字排序）。
     - 股票名称来自 `get_stock_code_name` 当日码表；缺失或非当日时先按该路径更新。
     - 码表中没有名称的代码不进入 map。本接口自身不写盘；共享板块缓存有效时直接复用。
@@ -362,10 +367,13 @@ def get_stock_kline(
 
     返回:
     - mode="sync": `list[task_payload]`（传 queue 时同时推送 data/done）。
-    - mode="async": `StockKlineJob`（从 `job.queue` 消费到 done）。
+    - mode="async": `StockKlineJob`。行情从 `job.queue` 消费到 done。
+      `job.result()` 返回 `{"total_tasks","success_tasks","failed_tasks"}`，不保留行情正文；任务异常仍由 `result()` 抛出。
     - task_payload: `{"event":"data","task":{...},"rows":[...],"error":str|None}`。
       示例 rows 元素: `{"code":"sh.600000","freq":"d","open":10.07,"close":10.06,"high":10.25,"low":10.03,"volume":105771232,"amount":1072786048,"datetime":"2026-02-02 15:00:00"}`。
     - done: `{"event":"done","total_tasks":...,"success_tasks":...,"failed_tasks":...}`。
+      async 后台正常或异常结束时向可写队列发送一次；异常时另带 error，未完成任务计失败，job.result() 仍抛原异常。
+      队列自身故障、进程强制终止不能保证通知；有界队列需持续消费，调用侧可保留超时检查 job.done()。
     """
     return fetch_stock_kline(
         task=task,
@@ -511,7 +519,9 @@ def get_index_kline(
     - 标准行情 `volume` 统一为最小成交单位；5/15/30/60 分钟及周/月线已在 parser 层归一化。
 
     返回:
-    - sync: `list[task_payload]`；async: `StockKlineJob`。
+    - sync: `list[task_payload]`。
+    - async: `StockKlineJob`。行情从 `job.queue` 消费到 done；
+      `job.result()` 返回 total_tasks、success_tasks、failed_tasks，不保留行情正文。
     """
     return fetch_index_kline(
         task=task,
@@ -545,7 +555,9 @@ def get_block_kline(
 
     时间窗口 / 返回:
     - 时间补齐与 datetime 契约同 get_index_kline。
-    - sync: `list[task_payload]`；async: `StockKlineJob`。
+    - sync: `list[task_payload]`。
+    - async: `StockKlineJob`。行情从 `job.queue` 消费到 done；
+      `job.result()` 返回 total_tasks、success_tasks、failed_tasks，不保留行情正文。
     - rows 含 `block_name/freq/open/close/high/low/volume/amount/datetime`。
     """
     return fetch_block_kline(

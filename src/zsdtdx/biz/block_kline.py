@@ -41,7 +41,9 @@ def fetch_block_kline(
     输入：task 为 dict 或 BlockKlineTask 列表；其余参数与 get_block_kline 相同。
     输出：sync 为 payload 列表；async 为 StockKlineJob。
     用途：名称解析后按板块任务抓取，分页仍复用指数实现。
-    边界条件：task 为空或 mode 非法时抛 ValueError；未知板块名称由客户端抛错。
+    边界条件：
+    1. task 为空或 mode 非法时抛 ValueError；未知板块名称由客户端抛错。
+    2. async 总会带上队列，job.result() 只返回计数摘要，行情从队列消费。
     """
     mode_key = validate_kline_dispatch_args(
         queue=queue,

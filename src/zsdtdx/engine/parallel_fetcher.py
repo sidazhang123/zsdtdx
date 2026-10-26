@@ -10,7 +10,8 @@
 
 边界：
 1. 全局线程池在首次并行调用时创建，程序退出时统一关闭。
-2. 旧接口返回 DataFrame；任务接口返回 list[dict] 并支持队列实时事件。
+2. 旧接口返回 DataFrame。同步任务返回 list[dict]。
+3. 带队列的异步 K 线只经队列交付行情，job.result() 返回计数摘要；未带队列时 result() 仍返回 list[dict]。
 """
 
 import atexit
@@ -1336,7 +1337,12 @@ class StockKlineJob:
             return False
 
     def result(self, timeout: Optional[float] = None) -> Any:
-        """输入超时秒数，输出后台返回值；用于同步获取结果；失败会抛原异常。"""
+        """
+        输入超时秒数，输出后台返回值。
+
+        用途：等待后台结束并取出其返回值。
+        边界：失败抛出原异常。带队列的 K 线任务返回计数摘要；公司信息任务返回行列表。
+        """
         return self._future.result(timeout=timeout)
 
     def exception(self, timeout: Optional[float] = None) -> Optional[BaseException]:
@@ -2105,11 +2111,17 @@ class ParallelKlineFetcher:
         qfq: bool = True,
     ) -> StockKlineJob:
         """
-        异步启动 task 执行（stock/index 共用）并立即返回句柄。
+        异步启动 task 执行并立即返回句柄。
 
         输入：task_kind、tasks、queue、preprocessor_operator、qfq。
-        输出：StockKlineJob 异步句柄。
-        边界：任务异常由 job.exception()/job.result() 暴露。
+        输出：StockKlineJob。
+        用途：在后台线程按 chunk 拉取股票、指数或板块 K 线。
+        边界：
+        1. 传入 queue 时，行情只放入该队列；job.result() 返回 total_tasks、success_tasks、failed_tasks，不保留行情正文。
+        2. 未传 queue 时，job.result() 返回 payload 列表。
+        3. 后台正常或异常结束时向可用队列发送一次 done；异常终态附带 error，原异常仍由 job.result() 抛出。
+        4. 钩子丢弃的条目不进入队列或结果列表；钩子和投递完成后才计数，异常时未完成任务计为失败。
+        5. 队列写入保持阻塞背压；队列自身失败时仅尽力通知终态，不覆盖已有任务异常。
         """
         kind = str(task_kind or "stock").strip().lower()
         normalize_item = _chunk_task_kind_profile(kind)["normalize_item"]
@@ -2143,58 +2155,73 @@ class ParallelKlineFetcher:
         useful_threads = max(1, min(self.num_threads, len(unique_chunks)))
         self._ensure_async_prewarm(target_threads=useful_threads)
 
-        def _run_async_coordinator() -> List[Dict[str, Any]]:
-            outputs: List[Dict[str, Any]] = []
+        def _run_async_coordinator() -> Any:
+            """
+            输入闭包中的任务与队列，输出计数摘要或 payload 列表。
+
+            用途：生产行情并在正常或异常结束时写入一次 done。
+            边界：有队列时不保留已投递行情；无队列时返回列表；终态通知失败不得覆盖任务原异常。
+            """
             success_tasks = 0
             failed_tasks = 0
-
-            if total_tasks <= 0:
-                done_payload = {
-                    "event": "done",
-                    "total_tasks": 0,
-                    "success_tasks": 0,
-                    "failed_tasks": 0,
+            outputs: List[Dict[str, Any]] = []
+            terminal_error = None
+            iterator = None
+            raw_payload = processed_payload = None
+            try:
+                if total_tasks > 0:
+                    _emit_log(
+                        "info",
+                        (
+                            f"[Task Async] {async_log_label} "
+                            f"(num_threads={self.num_threads}, "
+                            f"任务数={total_tasks})"
+                        ),
+                    )
+                    iterator = self._iter_task_payloads_parallel_chunked(
+                        normalized_tasks, task_kind=kind, qfq=bool(qfq)
+                    )
+                    for raw_payload in iterator:
+                        error_text = str(raw_payload.get("error") or "").strip()
+                        processed_payload = self._apply_preprocessor_operator(
+                            raw_payload, preprocessor_operator
+                        )
+                        if processed_payload is not None:
+                            if queue is None:
+                                outputs.append(processed_payload)
+                            else:
+                                queue.put(processed_payload)
+                        if error_text:
+                            failed_tasks += 1
+                        else:
+                            success_tasks += 1
+                        raw_payload = processed_payload = None
+            except BaseException as exc:
+                failed_tasks = total_tasks - success_tasks
+                terminal_error = type(exc).__name__
+                try:
+                    terminal_error = str(exc) or terminal_error
+                except BaseException:
+                    pass
+                raise
+            finally:
+                # Future 会保留异常回溯；协调器不额外保住最后一条行情或已停止消费的迭代器。
+                raw_payload = processed_payload = iterator = None
+                summary = {
+                    "total_tasks": int(total_tasks),
+                    "success_tasks": int(success_tasks),
+                    "failed_tasks": int(failed_tasks),
                 }
                 if queue is not None:
-                    queue.put(done_payload)
-                return outputs
-
-            _emit_log(
-                "info",
-                (
-                    f"[Task Async] {async_log_label} "
-                    f"(num_threads={self.num_threads}, "
-                    f"任务数={total_tasks})"
-                ),
-            )
-            iterator = self._iter_task_payloads_parallel_chunked(
-                normalized_tasks, task_kind=kind, qfq=bool(qfq)
-            )
-
-            for raw_payload in iterator:
-                error_text = str(raw_payload.get("error") or "").strip()
-                if error_text:
-                    failed_tasks += 1
-                else:
-                    success_tasks += 1
-                processed_payload = self._apply_preprocessor_operator(
-                    raw_payload, preprocessor_operator
-                )
-                if processed_payload is None:
-                    continue
-                outputs.append(processed_payload)
-                if queue is not None:
-                    queue.put(processed_payload)
-
-            done_payload = {
-                "event": "done",
-                "total_tasks": int(total_tasks),
-                "success_tasks": int(success_tasks),
-                "failed_tasks": int(failed_tasks),
-            }
-            if queue is not None:
-                queue.put(done_payload)
-            return outputs
+                    done_payload = {"event": "done", **summary}
+                    if terminal_error is not None:
+                        done_payload["error"] = terminal_error
+                    try:
+                        queue.put(done_payload)
+                    except BaseException:
+                        if terminal_error is None:
+                            raise
+            return outputs if queue is None else summary
 
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=thread_prefix)
         future = executor.submit(_run_async_coordinator)
@@ -2218,7 +2245,12 @@ class ParallelKlineFetcher:
         ] = None,
         qfq: bool = True,
     ) -> StockKlineJob:
-        """异步启动股票 task 执行并立即返回句柄。"""
+        """
+        输入股票任务、可选队列、钩子和复权标志，输出异步句柄。
+
+        用途：股票 K 线 async 入口。
+        边界：带队列时行情只进入队列，result() 为计数摘要；未带队列时 result() 为 payload 列表。
+        """
         return self._fetch_tasks_async(
             task_kind="stock",
             tasks=tasks,
@@ -2237,7 +2269,12 @@ class ParallelKlineFetcher:
         ] = None,
         qfq: bool = True,
     ) -> StockKlineJob:
-        """异步启动指数 task 执行并立即返回句柄。"""
+        """
+        输入指数任务、可选队列、钩子和复权标志，输出异步句柄。
+
+        用途：指数 K 线 async 入口。
+        边界：带队列时行情只进入队列，result() 为计数摘要；未带队列时 result() 为 payload 列表。
+        """
         return self._fetch_tasks_async(
             task_kind="index",
             tasks=tasks,
@@ -2258,10 +2295,10 @@ class ParallelKlineFetcher:
         """
         输入板块任务，输出异步句柄。
 
-        输入：tasks 含 block_name 与路由。
+        输入：tasks 含 block_name 与路由；queue 与 preprocessor_operator 可选。
         输出：StockKlineJob。
         用途：板块 K 线 async 入口。
-        边界条件：异常由 job.result() 暴露。
+        边界条件：带队列时 result() 为计数摘要，未带队列时为 payload 列表；异常由 job.result() 抛出。
         """
         return self._fetch_tasks_async(
             task_kind="block",

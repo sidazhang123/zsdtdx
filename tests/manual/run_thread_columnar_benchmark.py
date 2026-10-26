@@ -71,6 +71,27 @@ class TreeSampler:
         ), self.peak
 
 
+def payloads_from_async_job(job, timeout):
+    """
+    输入异步 K 线句柄和超时秒数，输出 data 事件列表。
+
+    用途：基准脚本取得完整行情后再计算指纹。
+    边界：result() 为列表时直接返回；否则在任务完成后从队列读取 data，直到 done。缺少 done 时队列等待会超时。
+    """
+    result = job.result(timeout=timeout)
+    if isinstance(result, list):
+        return result
+    payloads = []
+    while True:
+        event = job.queue.get(timeout=timeout)
+        if not isinstance(event, dict):
+            continue
+        if event.get("event") == "done":
+            return payloads
+        if event.get("event") == "data":
+            payloads.append(event)
+
+
 def fingerprint(payloads):
     """输入完整事件列表，输出保持重复任务数量的摘要；不以字典键覆盖任务。"""
     values = []
@@ -125,9 +146,10 @@ def child(spec):
             prewarm = None
             if phase == "cold":
                 prewarm = prewarm_parallel_fetcher()
-            payloads = get_stock_kline(
-                task=tasks, mode="async", qfq=spec.get("qfq", True)
-            ).result(timeout=spec["timeout"])
+            payloads = payloads_from_async_job(
+                get_stock_kline(task=tasks, mode="async", qfq=spec.get("qfq", True)),
+                spec["timeout"],
+            )
             wall = time.perf_counter() - start
             cpu, peak = sampler.finish()
             result = {

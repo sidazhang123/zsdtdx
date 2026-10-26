@@ -74,8 +74,13 @@ def child(cfg, engine):
     )
 
     def stock(code, qfq=True):
-        """输入代码与复权设置，输出两周期任务结果；覆盖扩展与标准路由。"""
-        return get_stock_kline(
+        """
+        输入代码与复权设置，输出两周期 data 事件。
+
+        用途：覆盖扩展与标准路由的股票契约。
+        边界：result() 为列表时直接返回；否则从队列读取 data 直到 done。
+        """
+        job = get_stock_kline(
             task=[
                 dict(
                     code=code,
@@ -87,7 +92,19 @@ def child(cfg, engine):
             ],
             mode="async",
             qfq=qfq,
-        ).result(timeout=cfg["timeout_seconds"])
+        )
+        result = job.result(timeout=cfg["timeout_seconds"])
+        if isinstance(result, list):
+            return result
+        payloads = []
+        while True:
+            event = job.queue.get(timeout=cfg["timeout_seconds"])
+            if not isinstance(event, dict):
+                continue
+            if event.get("event") == "done":
+                return payloads
+            if event.get("event") == "data":
+                payloads.append(event)
 
     results = {}
     try:

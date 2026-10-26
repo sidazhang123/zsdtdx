@@ -44,6 +44,7 @@ def fetch_index_kline(
     1. sync 必须显式传入非空 task。
     2. async 传 None 或空列表时按近 7 日日线展开全部指数。
     3. mode 非法时抛 ValueError，且不会先去拉目录。
+    4. async 总会带上队列，job.result() 只返回计数摘要，行情从队列消费。
     """
     mode_key = validate_kline_dispatch_args(
         queue=queue,

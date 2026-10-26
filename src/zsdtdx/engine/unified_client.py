@@ -59,9 +59,7 @@ from zsdtdx.parser.block_index_catalog import (
     parse_block_index_catalog,
 )
 from zsdtdx.parser.infoharbor_block import (
-    build_stock_concept_payload,
-    parse_infoharbor_block,
-    parse_tdx_industry_blocks,
+    build_stock_concepts_from_named_files,
     read_zip_entry,
 )
 from zsdtdx.util.helper import parse_future_symbol
@@ -5273,11 +5271,14 @@ class UnifiedTdxClient:
         1. names: 有成分代码的板块名列表。
         2. map: 股票名称到所属板块名列表。
         用途：
-        1. 下载概念板块、行业归属和行业名称表，再用当日码表把代码换成名称。
+        1. 下载概念板块、基础行业、研究行业中类和 spblock 补充成分，再用当日码表把代码换成名称。
         边界条件：
         1. 码表内存或磁盘不是当日、或不存在时，走自动缓存流程下载更新。
         2. 某一份远程文件失败时，其余成功的部分仍然返回。
         3. 全部失败时返回空 names 与空 map。不落盘 pkl。
+        4. 有板块代码时名称用目录全称。同名板块只保留一个名称，成分取并集。
+        5. spblock 里没有当日股票名称的段不进入结果。
+        6. 可发布股票集合相同的板块只保留名称最长的一个；长度相同则保留字典序较后的名称。
         """
         code_name = self.get_stock_code_name_map()
         cache_dir = self._block_file_cache_dir()
@@ -5293,10 +5294,9 @@ class UnifiedTdxClient:
         zip_raw = files.get(TDXParams.ZHB_ZIP_REMOTE_FILE) or (
             self._download_named_hq_file(TDXParams.ZHB_ZIP_REMOTE_FILE)
         )
-        zs_raw = read_zip_entry(zip_raw, TDXParams.TDXZS_ZIP_MEMBER)
-        blocks = parse_infoharbor_block(block_raw)
-        blocks.extend(parse_tdx_industry_blocks(hy_raw, zs_raw))
-        return build_stock_concept_payload(blocks, code_name)
+        return build_stock_concepts_from_named_files(
+            block_raw, hy_raw, zip_raw, code_name
+        )
 
     def _named_hq_file_chunk_size(self) -> int:
         """输入：无。输出：命名文件单页字节。用途：0x06B9 翻页。边界：固定 30000。"""

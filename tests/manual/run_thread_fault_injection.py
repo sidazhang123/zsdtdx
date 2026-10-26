@@ -19,7 +19,7 @@ import yaml
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1] / "src"))
 
-from run_thread_columnar_benchmark import fingerprint  # noqa: E402
+from run_thread_columnar_benchmark import fingerprint, payloads_from_async_job  # noqa: E402
 from zsdtdx import destroy_parallel_fetcher, get_stock_kline, set_config_path  # noqa: E402
 from zsdtdx.engine import parallel_fetcher as pf  # noqa: E402
 
@@ -57,8 +57,9 @@ def main():
     ]
     report, cuts = {}, []
     try:
-        clean = get_stock_kline(task=tasks, mode="async").result(
-            timeout=cfg["timeout_seconds"]
+        clean = payloads_from_async_job(
+            get_stock_kline(task=tasks, mode="async"),
+            cfg["timeout_seconds"],
         )
         report["clean"] = fingerprint(clean)
         del clean
@@ -94,8 +95,9 @@ def main():
         )
         injector.start()
         try:
-            fault = get_stock_kline(task=tasks, mode="async").result(
-                timeout=cfg["timeout_seconds"]
+            fault = payloads_from_async_job(
+                get_stock_kline(task=tasks, mode="async"),
+                cfg["timeout_seconds"],
             )
             report["fault"] = fingerprint(fault)
             del fault

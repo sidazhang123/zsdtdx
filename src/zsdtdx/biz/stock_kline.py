@@ -37,7 +37,9 @@ def fetch_stock_kline(
     输入：task/queue/preprocessor_operator/mode/qfq 与 get_stock_kline 相同。
     输出：sync 为 payload 列表；async 为 StockKlineJob。
     用途：校验任务后交给股票抓取器。
-    边界条件：queue 无法 put、钩子不可调用或 mode 非法时抛 ValueError。
+    边界条件：
+    1. queue 无法 put、钩子不可调用或 mode 非法时抛 ValueError。
+    2. async 总会带上队列，job.result() 只返回计数摘要，行情从队列消费。
     """
     mode_key = validate_kline_dispatch_args(
         queue=queue,

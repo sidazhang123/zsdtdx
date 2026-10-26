@@ -473,19 +473,36 @@ def test_concurrent_jobs_keep_adjustment_and_duplicate_results_isolated(monkeypa
     try:
         a = fetcher.fetch_stock_tasks_async(tasks=[task, task], queue=a_queue, qfq=True)
         b = fetcher.fetch_stock_tasks_async(tasks=[task], queue=b_queue, qfq=False)
-        first, second = a.result(timeout=3), b.result(timeout=3)
-        assert len(first) == 2 and len(second) == 1
-        assert all(item["error"] is None for item in first + second)
-        assert first[0]["rows"][0]["open"] + 1 == second[0]["rows"][0]["open"]
-        first[0]["rows"][0]["open"] = -1
-        assert first[1]["rows"][0]["open"] != -1
-        for stream, count in ((a_queue, 2), (b_queue, 1)):
+        assert a.result(timeout=3) == {
+            "total_tasks": 2,
+            "success_tasks": 2,
+            "failed_tasks": 0,
+        }
+        assert b.result(timeout=3) == {
+            "total_tasks": 1,
+            "success_tasks": 1,
+            "failed_tasks": 0,
+        }
+
+        def _take(stream):
+            """输入队列，输出全部已到达事件。边界：不阻塞等待尚未入队的事件。"""
             events = []
             while not stream.empty():
                 events.append(stream.get_nowait())
-            assert [e["event"] for e in events] == ["data"] * count + ["done"]
-            assert events[-1]["success_tasks"] == count
-            assert all(event.get("event") in {"data", "done"} for event in events)
+            return events
+
+        a_events, b_events = _take(a_queue), _take(b_queue)
+        a_data = [event for event in a_events if event.get("event") == "data"]
+        b_data = [event for event in b_events if event.get("event") == "data"]
+        assert len(a_data) == 2 and len(b_data) == 1
+        assert all(item["error"] is None for item in a_data + b_data)
+        assert a_data[0]["rows"][0]["open"] + 1 == b_data[0]["rows"][0]["open"]
+        a_data[0]["rows"][0]["open"] = -1
+        assert a_data[1]["rows"][0]["open"] != -1
+        assert [event["event"] for event in a_events] == ["data", "data", "done"]
+        assert [event["event"] for event in b_events] == ["data", "done"]
+        assert a_events[-1]["success_tasks"] == 2
+        assert b_events[-1]["success_tasks"] == 1
         assert controller.snapshot()["inflight_threads"] == 0
     finally:
         assert runtime.stop() == 0
@@ -517,12 +534,18 @@ def test_stopping_job_suppresses_late_success_and_emits_done(monkeypatch):
         job = fetcher.fetch_stock_tasks_async(tasks=tasks, queue=stream)
         assert started.wait(timeout=1)
         assert runtime.stop(timeout=0.01) == 1
-        results = job.result(timeout=1)
-        assert len(results) == len(tasks)
-        assert all(item["error"] and item["rows"] == [] for item in results)
+        summary = job.result(timeout=1)
+        assert summary == {
+            "total_tasks": len(tasks),
+            "success_tasks": 0,
+            "failed_tasks": len(tasks),
+        }
         events = []
         while not stream.empty():
             events.append(stream.get_nowait())
+        data_events = [event for event in events if event.get("event") == "data"]
+        assert len(data_events) == len(tasks)
+        assert all(item["error"] and item["rows"] == [] for item in data_events)
         assert events[-1]["event"] == "done"
         assert events[-1]["failed_tasks"] == len(tasks)
         unblock.set()

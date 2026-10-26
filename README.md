@@ -201,7 +201,7 @@ with get_client():
 
 #### get_stock_concepts
 
-获取股票所属板块（成分归属）。概念、风格、指数来自 `infoharbor_block.dat`；通达信基础行业来自 `tdxhy.cfg` + `zhb.zip`/`tdxzs.cfg`。股票名称用 `get_stock_code_name` 当日码表。不写盘。
+获取股票所属板块（成分归属）。概念、风格、指数来自 `infoharbor_block.dat`；通达信基础行业来自 `tdxhy.cfg` + `zhb.zip`/`tdxzs.cfg`；研究行业中类来自 `tdxhy.cfg` 的 X 码前五位 + `zhb.zip`/`tdxzs3.cfg`；`zhb.zip`/`spblock.dat` 中能对上当日股票名称的成分段一并纳入。有 `88` 板块代码时使用目录全称。同一代码或同一名称只保留一个板块，成分取并集。可发布股票完全相同的板块只保留名称最长的一个。股票名称用 `get_stock_code_name` 当日码表。不写盘。
 
 与 `get_block_names` 文件同源，但语义不同：本接口回答「股票属于哪些板块」；可请求 K 线的板块指数名请用 `get_block_names`。
 
@@ -211,7 +211,7 @@ with get_client():
 
 **输出:**
 
-- `names`: 有成分代码的板块名称（概念、风格、指数、基础行业），去重后按字排序。
+- `names`: 有成分代码的板块名称（概念、风格、指数、基础行业、研究行业中类，以及 spblock 中有股票的板块），去重后按字排序。同名只出现一次。
 - `map`: 股票名称到所属板块名称列表；列表去重且按字排序。码表中没有名称的代码不进入 `map`。
 
 **调用示例:**
@@ -369,7 +369,7 @@ finally:
 **返回:**
 
 - mode="sync": `list[task_payload]`（传 queue 时同时推送 data/done）。
-- mode="async": `StockKlineJob`（从 `job.queue` 消费到 done）。
+- mode="async": `StockKlineJob`。行情从 `job.queue` 消费到 done。`job.result()` 返回 `total_tasks`、`success_tasks`、`failed_tasks`，不保留行情正文；任务异常仍由 `result()` 抛出。
 - task_payload:
 `{"event":"data","task":{...},"rows":[...],"error":str|None}`。
   > 示例：
@@ -381,6 +381,8 @@ finally:
   >  "error": null}
   > ```
 - done: `{"event":"done","total_tasks":...,"success_tasks":...,"failed_tasks":...}`。
+- async 任务成功启动后，后台正常或异常结束时向可写队列发送一次 done。异常结束时 done 另带 `error` 字符串，未完成任务计入 `failed_tasks`；`job.result()` 仍抛出原异常。done 表示生产端结束，收到后仍应调用 `job.result()` 检查异常。参数校验或预热初始化失败会直接抛错，不返回 job。股票、指数、板块异步 K 线共用此约定。
+- 有界队列必须持续消费，数据及 done 均按队列容量阻塞等待；队列自身故障或进程被强制终止时无法保证通知，调用侧可保留队列超时后检查 `job.done()` 的兜底。
 - 标准行情 `volume` 统一为与日线相同的最小成交单位；周/月线不会返回“手”。
 
 
@@ -421,6 +423,11 @@ result = get_index_kline(
     mode="sync",
 )
 ```
+
+**返回:**
+
+- sync: `list[task_payload]`。
+- async: `StockKlineJob`。行情从 `job.queue` 消费到 done；`job.result()` 返回 `total_tasks`、`success_tasks`、`failed_tasks`，不保留行情正文。
 
 **名称匹配与报错:**
 
@@ -490,7 +497,8 @@ result = get_block_kline(
 
 **返回:**
 
-- sync: `list[task_payload]`；async: `StockKlineJob`。
+- sync: `list[task_payload]`。
+- async: `StockKlineJob`。行情从 `job.queue` 消费到 done；`job.result()` 返回 `total_tasks`、`success_tasks`、`failed_tasks`，不保留行情正文。
 - rows 含 `block_name/freq/open/close/high/low/volume/amount/datetime`。
 
 

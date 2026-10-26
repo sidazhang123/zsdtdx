@@ -8,6 +8,7 @@ simple_api 端到端：同连接 None 确认重试 + chunk 重建连接重试。
 
 from __future__ import annotations
 
+import queue
 import sys
 import unittest
 from zsdtdx.engine.thread_runtime import ThreadRuntime
@@ -48,6 +49,23 @@ _SAMPLE_BAR = {
     "vol": 100,
     "amount": 1000.0,
 }
+
+
+def _data_events(job: Any) -> List[Dict[str, Any]]:
+    """
+    输入已完成的异步句柄，输出其中的 data 事件。
+
+    用途：后台完成后从队列取出行情，供断言使用。
+    边界：忽略 done 与其它事件；队列已空时返回当前已取出的 data。
+    """
+    payloads: List[Dict[str, Any]] = []
+    while True:
+        try:
+            event = job.queue.get_nowait()
+        except queue.Empty:
+            return payloads
+        if isinstance(event, dict) and event.get("event") == "data":
+            payloads.append(event)
 
 
 class _InlineThreadRuntime(ThreadRuntime):
@@ -279,8 +297,12 @@ class TestSimpleApiSameConnectionRetryE2E(unittest.TestCase):
             _thread_test_scope(),
         ):
             job = get_stock_kline(task=[dict(_SAMPLE_TASK)], mode="async")
-            payloads = job.result(timeout=60)
+            summary = job.result(timeout=60)
+            payloads = _data_events(job)
 
+        self.assertEqual(
+            summary, {"total_tasks": 1, "success_tasks": 1, "failed_tasks": 0}
+        )
         self.assertEqual(len(payloads), 1)
         self.assertIsNone(payloads[0].get("error"))
         self.assertGreaterEqual(ctx.std_pool.stats["same_conn_retries"], 1)
@@ -349,9 +371,13 @@ class TestSimpleApiChunkReconnectRetryE2E(unittest.TestCase):
             _thread_test_scope(),
         ):
             job = get_stock_kline(task=[dict(_SAMPLE_TASK)], mode="async")
-            payloads = job.result(timeout=60)
+            summary = job.result(timeout=60)
+            payloads = _data_events(job)
 
         self.assertGreaterEqual(state.get("chunk_attempts", 0), 2)
+        self.assertEqual(
+            summary, {"total_tasks": 1, "success_tasks": 1, "failed_tasks": 0}
+        )
         self.assertEqual(len(payloads), 1)
         self.assertIsNone(payloads[0].get("error"))
 
