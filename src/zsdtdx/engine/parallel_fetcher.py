@@ -11,7 +11,7 @@
 边界：
 1. 全局线程池在首次并行调用时创建，程序退出时统一关闭。
 2. 旧接口返回 DataFrame。同步任务返回 list[dict]。
-3. 带队列的异步 K 线只经队列交付行情，job.result() 返回计数摘要；未带队列时 result() 仍返回 list[dict]。
+3. 带队列的异步 K 线与公司信息只经队列交付正文，job.result() 返回计数摘要；未带队列的 K 线以及同步公司信息仍返回全文。
 """
 
 import atexit
@@ -1341,7 +1341,7 @@ class StockKlineJob:
         输入超时秒数，输出后台返回值。
 
         用途：等待后台结束并取出其返回值。
-        边界：失败抛出原异常。带队列的 K 线任务返回计数摘要；公司信息任务返回行列表。
+        边界：失败抛出原异常，超时抛出 TimeoutError。带队列的 K 线与公司信息任务返回计数摘要。
         """
         return self._future.result(timeout=timeout)
 
@@ -1939,8 +1939,12 @@ class ParallelKlineFetcher:
                             ],
                         },
                     )
+                    item = None
                     for item in report["payloads"]:
                         yield item
+                    report = None
+                    item = None
+                    future = None
                 else:
                     future.cancel()
                     for task in chunk.tasks:
@@ -1952,6 +1956,8 @@ class ParallelKlineFetcher:
                             if runtime.stopped.is_set()
                             else "chunk watchdog timeout",
                         )
+                    future = None
+                    item = None
 
     def _fetch_tasks_sync(
         self,
@@ -2551,6 +2557,7 @@ def _iter_company_info_chunk_results(
     1. sync 聚合与 async 队列推送共用；全程不经过 DataFrame。
     边界条件：
     1. codes 为空时不产出任何元素。
+    2. 每个分片交给调用方后即放开该分片 future 与结果引用，不把已完成分片留到下一次等待。
     """
     normalized_codes = normalize_company_info_codes(codes)
     if not normalized_codes:
@@ -2635,22 +2642,58 @@ def _iter_company_info_chunk_results(
         if not pending:
             break
         done_set, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
-        for fut in done_set:
+        while done_set:
+            fut = done_set.pop()
             idx = pending.pop(fut)
             try:
-                result = dict(fut.result())
+                result = fut.result()
                 result["requested_codes"] = chunks[idx]
-                yield result
             except Exception as exc:
                 outcomes = [
                     company_info_outcome(code, error=exc) for code in chunks[idx]
                 ]
-                yield {
+                result = {
                     "rows": [],
                     "errors": outcomes,
                     "outcomes": outcomes,
                     "requested_codes": chunks[idx],
                 }
+            del fut
+            yield result
+            result = None
+
+
+def _company_info_chunk_outcomes(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """输入一个分片结果，输出逐股终态。
+
+    用途：有 outcomes 时直接使用；只有 rows/errors 时按请求代码补齐。
+    边界：不复制正文字符串；调用方用完终态列表后应放开引用。空结果按 no_data 终态返回。
+    """
+    outcomes = result.get("outcomes")
+    if outcomes is not None:
+        return outcomes
+    by_code: Dict[str, List[Dict[str, Any]]] = {}
+    for row in result.get("rows") or []:
+        code = str(row.get("code", "")).strip()
+        by_code.setdefault(code, []).append(row)
+    errors = {
+        str(error.get("code", "")).strip(): error
+        for error in result.get("errors") or []
+    }
+    built: List[Dict[str, Any]] = []
+    for code in result.get("requested_codes", by_code.keys() | errors.keys()):
+        if code in errors:
+            outcome = company_info_outcome(
+                code,
+                error=RuntimeError(str(errors[code].get("error") or "fetch_failed")),
+            )
+            for key in ("reason", "status", "detail"):
+                if key in errors[code]:
+                    outcome[key] = errors[code][key]
+        else:
+            outcome = company_info_outcome(code, rows=by_code.get(code))
+        built.append(outcome)
+    return built
 
 
 def fetch_company_info_parallel(
@@ -2659,72 +2702,75 @@ def fetch_company_info_parallel(
     *,
     auto_prewarm: Optional[bool] = None,
     queue: Optional[Any] = None,
-) -> List[Dict[str, Any]]:
+    retain_rows: bool = True,
+) -> Any:
     """
-    多线程并行拉取公司信息，阻塞至完成；中间与返回均为 list[dict]。
+    多线程并行拉取公司信息，阻塞至完成。
 
     输入：
     1. codes/category: 股票列表与分类过滤。
     2. auto_prewarm: 是否预热。
-    3. queue: 可选；若提供则边抓边 put data/done 事件（与 async 事件结构一致）。
+    3. queue: 可选；若提供则边抓边 put data/done 事件。
+    4. retain_rows: 为 True 时返回全文行；为 False 时只保留去重和计数。
     输出：
-    1. [{"code","category","content"}, ...]；不含 DataFrame。
+    1. retain_rows 为 True 时返回 [{"code","category","content"}, ...]。
+    2. retain_rows 为 False 时返回 total_codes、success_codes、failed_codes。
+    边界：不使用 DataFrame。不保留正文时必须有队列，且不把正文放进去重表或返回值。
     """
+    if not retain_rows and queue is None:
+        raise ValueError("不保留正文时必须提供 queue")
     normalized = normalize_company_info_codes(codes)
     requested = set(normalized)
-    terminal: Dict[str, Dict[str, Any]] = {}
+    seen: set[str] = set()
     all_rows: List[Dict[str, Any]] = []
+    success_codes = 0
+    failed_codes = 0
+    failed_sample: List[Dict[str, str]] = []
 
     def _accept(outcome):
-        """输入一股终态，输出无；仅首次接受请求集合内代码，避免重复聚合和事件。"""
+        """输入一股终态，输出无；仅首次接受请求集合内代码，避免重复事件。"""
+        nonlocal success_codes, failed_codes
         code = outcome["code"]
-        if code not in requested or code in terminal:
+        if code not in requested or code in seen:
             return
-        terminal[code] = outcome
-        all_rows.extend(outcome["rows"])
+        seen.add(code)
         record_company_info_outcome(_shared_client_context, outcome)
         publish_company_info_outcome(outcome, queue)
+        if outcome["status"] == "success":
+            success_codes += 1
+            if retain_rows:
+                all_rows.extend(outcome["rows"])
+        else:
+            failed_codes += 1
+            if len(failed_sample) < 5:
+                failed_sample.append(
+                    {
+                        "code": str(outcome["code"]),
+                        "reason": str(outcome.get("reason") or ""),
+                    }
+                )
 
     iterator_error = None
+    result = None
+    outcomes = None
     try:
         for result in _iter_company_info_chunk_results(
             codes=normalized, category=category, auto_prewarm=auto_prewarm
         ):
-            outcomes = result.get("outcomes")
-            if outcomes is None:
-                # 接受仅含 rows/errors 的内部结果，同时对已知请求分片补齐空终态。
-                by_code: Dict[str, List[Dict[str, Any]]] = {}
-                for row in result.get("rows") or []:
-                    code = str(row.get("code", "")).strip()
-                    by_code.setdefault(code, []).append(row)
-                errors = {
-                    str(error.get("code", "")).strip(): error
-                    for error in result.get("errors") or []
-                }
-                outcomes = []
-                for code in result.get(
-                    "requested_codes", by_code.keys() | errors.keys()
-                ):
-                    if code in errors:
-                        outcome = company_info_outcome(
-                            code,
-                            error=RuntimeError(
-                                str(errors[code].get("error") or "fetch_failed")
-                            ),
-                        )
-                        for key in ("reason", "status", "detail"):
-                            if key in errors[code]:
-                                outcome[key] = errors[code][key]
-                    else:
-                        outcome = company_info_outcome(code, rows=by_code.get(code))
-                    outcomes.append(outcome)
+            outcomes = _company_info_chunk_outcomes(result)
             for outcome in outcomes:
                 _accept(outcome)
+            outcome = None
+            result = None
+            outcomes = None
     except Exception as exc:
         iterator_error = exc
+        outcome = None
+        result = None
+        outcomes = None
 
     for code in normalized:
-        if code not in terminal:
+        if code not in seen:
             outcome = company_info_outcome(
                 code,
                 error=iterator_error
@@ -2733,31 +2779,23 @@ def fetch_company_info_parallel(
             if iterator_error is None:
                 outcome["reason"] = "missing_result"
             _accept(outcome)
-    failed = [
-        outcome for outcome in terminal.values() if outcome["status"] != "success"
-    ]
-    if failed:
+    iterator_error = None
+    if failed_codes:
         _emit_log(
             "error",
             "[CompanyInfo Parallel] 部分股票失败",
-            {
-                "error_count": len(failed),
-                "sample": [
-                    {"code": item["code"], "reason": item["reason"]}
-                    for item in failed[:5]
-                ],
-            },
+            {"error_count": failed_codes, "sample": failed_sample},
         )
+    summary = {
+        "total_codes": len(normalized),
+        "success_codes": int(success_codes),
+        "failed_codes": int(failed_codes),
+    }
     if queue is not None:
-        queue.put(
-            {
-                "event": "done",
-                "total_codes": len(normalized),
-                "success_codes": len(terminal) - len(failed),
-                "failed_codes": len(failed),
-            }
-        )
-    return all_rows
+        queue.put({"event": "done", **summary})
+    if retain_rows:
+        return all_rows
+    return summary
 
 
 def fetch_company_info_async(
@@ -2768,28 +2806,31 @@ def fetch_company_info_async(
     auto_prewarm: Optional[bool] = None,
 ) -> StockKlineJob:
     """
-    异步并行拉取公司信息，立即返回 Job；结果经 queue 流式推送。
+    异步并行拉取公司信息，立即返回 Job；正文经 queue 流式推送。
 
     输入：
     1. codes/category: 股票列表与分类过滤。
     2. queue: 可选；不传则自动创建。
     3. auto_prewarm: 是否预热。
     输出：
-    1. StockKlineJob；`job.queue` 事件为 data/done；`job.result()` 为 list[dict] 全文行。
+    1. StockKlineJob。data 事件仍含 code 与 rows（code/category/content）；
+       done 与 job.result() 均为 total_codes、success_codes、failed_codes。
     边界条件：
     1. 中间传递与队列 payload 均不使用 DataFrame。
+    2. 库内不聚合整批正文。result() 支持等待、超时，并抛出协调过程中的原异常。
     """
     result_queue = queue if queue is not None else queue_mod.Queue()
     if not hasattr(result_queue, "put"):
         raise ValueError("queue 必须提供 put() 方法")
 
-    def _run() -> List[Dict[str, Any]]:
-        """后台线程执行并行抓取并写队列。"""
+    def _run() -> Dict[str, int]:
+        """输入闭包中的代码与队列，输出计数摘要。边界：不把正文作为返回值。"""
         return fetch_company_info_parallel(
             codes=codes,
             category=category,
             auto_prewarm=auto_prewarm,
             queue=result_queue,
+            retain_rows=False,
         )
 
     executor = ThreadPoolExecutor(

@@ -540,6 +540,7 @@ def round_get_company_info() -> Dict[str, Any]:
     errors = []
     empty = []
     rows_by_code: Dict[str, int] = {}
+    row_count = 0
     done = {}
     try:
         while True:
@@ -554,6 +555,7 @@ def round_get_company_info() -> Dict[str, Any]:
             code = str(event.get("code", ""))
             err = event.get("error")
             rows = list(event.get("rows") or [])
+            row_count += len(rows)
             if err:
                 errors.append({"code": code, "error": str(err)[:240]})
             elif not rows:
@@ -569,7 +571,7 @@ def round_get_company_info() -> Dict[str, Any]:
                 if bad_rows:
                     errors.append({"code": code, "error": "分类/正文为空或含替换符"})
                 rows_by_code[code] = len(rows)
-        result_rows = list(job.result() or [])
+        summary = job.result(timeout=QUEUE_TIMEOUT)
     finally:
         destroy_parallel_fetcher()
 
@@ -584,7 +586,8 @@ def round_get_company_info() -> Dict[str, Any]:
     return {
         "sample_codes": len(codes),
         "data_events": events,
-        "rows": len(result_rows),
+        "rows": row_count,
+        "summary": summary,
         "empty": len(empty),
         "errors": len(errors),
         "done": done,

@@ -361,12 +361,15 @@ def main():
                 mode="async",
             )
             messages = []
+            rows = []
             while True:
                 event = job.queue.get(timeout=600)
+                if event.get("event") == "data":
+                    rows.extend(event.get("rows") or [])
                 messages.append({k: v for k, v in event.items() if k != "rows"})
                 if event.get("event") == "done":
                     break
-            rows = job.result()
+            summary = job.result()
             bad = [
                 dict(
                     code=row["code"],
@@ -388,6 +391,7 @@ def main():
                 "seconds": time.perf_counter() - started,
                 "requested": len(codes),
                 "rows": len(rows),
+                "summary": summary,
                 "done": messages[-1],
                 "errors": [e for e in messages[:-1] if e.get("error")],
                 "bad_rows": bad,
@@ -397,7 +401,7 @@ def main():
             reports.append(report)
             write_json(output / "report.json", reports)
             print(json.dumps(report, ensure_ascii=False), flush=True)
-            del rows, job, messages
+            del rows, job, messages, summary
             gc.collect()
     finally:
         destroy_parallel_fetcher()

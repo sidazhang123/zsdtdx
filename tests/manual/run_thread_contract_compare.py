@@ -106,6 +106,26 @@ def child(cfg, engine):
             if event.get("event") == "data":
                 payloads.append(event)
 
+    def _company_rows():
+        """输入配置中的股票，输出队列里的公司信息行。
+
+        用途：异步公司信息的正文只在 data 事件中，result() 只提供计数。
+        边界：收到 done 后调用 result()，任务异常仍向外抛出。
+        """
+        job = get_company_info(
+            codes=[cfg["stock_code"]], category=["公司概况"], mode="async"
+        )
+        rows = []
+        while True:
+            event = job.queue.get(timeout=cfg["timeout_seconds"])
+            if not isinstance(event, dict):
+                continue
+            if event.get("event") == "done":
+                job.result(timeout=cfg["timeout_seconds"])
+                return rows
+            if event.get("event") == "data":
+                rows.extend(event.get("rows") or [])
+
     results = {}
     try:
         names = get_block_names()
@@ -144,9 +164,7 @@ def child(cfg, engine):
                 start_time=cfg["start_time"],
                 end_time=cfg["end_time"],
             ),
-            "company": lambda: get_company_info(
-                codes=[cfg["stock_code"]], category=["公司概况"], mode="async"
-            ).result(timeout=cfg["timeout_seconds"]),
+            "company": lambda: _company_rows(),
         }
         for name, call in cases.items():
             try:

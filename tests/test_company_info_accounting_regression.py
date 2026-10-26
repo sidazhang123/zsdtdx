@@ -200,7 +200,7 @@ def test_retry_only_failed_stock_and_normalized_unique_result(install_parallel):
 
 @pytest.mark.parametrize("as_job", [False, True])
 def test_empty_and_final_failure_have_one_terminal_event(install_parallel, as_job):
-    """输入空目录、成功和持续失败，输出相同队列/result口径及有界三次尝试。"""
+    """输入空目录、成功和持续失败，输出同一队列口径；异步 result 为计数，同步仍返回正文。"""
     client = FakeClient(
         {
             "600000": [[]],
@@ -217,12 +217,19 @@ def test_empty_and_final_failure_have_one_terminal_event(install_parallel, as_jo
     result_queue = queue.Queue()
     fn = pf.fetch_company_info_async if as_job else pf.fetch_company_info_parallel
     result = fn(["600000", "000001", "920128"], queue=result_queue)
-    rows = result.result(timeout=3) if as_job else result
-    assert rows == body("920128")
+    if as_job:
+        assert result.result(timeout=3) == {
+            "total_codes": 3,
+            "success_codes": 1,
+            "failed_codes": 2,
+        }
+    else:
+        assert result == body("920128")
     assert client.calls == {"600000": 1, "000001": 3, "920128": 1}
     messages = events(result_queue)
     assert_accounted(messages, 3, 1)
     by_code = {item["code"]: item for item in messages[:-1]}
+    assert by_code["920128"]["rows"] == body("920128")
     assert by_code["600000"]["status"] == "no_data"
     assert by_code["600000"]["reason"] == "no_data"
     assert by_code["000001"]["reason"] == "content_failed"

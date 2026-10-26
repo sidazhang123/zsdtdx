@@ -631,7 +631,7 @@ with get_client():
 **返回:**
 
 - `mode="sync"`: `list[dict]` 或 DataFrame。
-- `mode="async"`: `StockKlineJob`；从 `job.queue` 消费至 `event="done"`；`job.result()` 为全部行 list[dict]。
+- `mode="async"`: `StockKlineJob`；从 `job.queue` 消费至 `event="done"`。`job.result()` 返回 `total_codes`、`success_codes`、`failed_codes`，不保留正文；等待、超时和任务异常仍由 `result()` 表现。同步调用仍返回全文。
 
 **调度与结果对账:**
 
@@ -642,7 +642,7 @@ with get_client():
 - 目录与正文的站点限制覆盖实际 IO 及连接重新获取，连接丢失也不得跳到另一站继续使用旧偏移。正文起始标题须同时匹配股票代码和栏目；不匹配时整股丢弃，同站重取一次新目录与正文，仍失败再换站，耗尽后报 `content_failed`（detail 中含 `identity_mismatch`）。
 - 准入、连接、目录和正文失败可进入有限重试。全部尝试仍短页或正文中断时，不把部分正文作为完整成功交付；目录长度完整但夹有源端非法 GBK 字节时按 `errors="ignore"` 保留其余正文，不把源数据坏字节误判为传输截断。
 - 真实空目录或目录中没有匹配候选栏目时，单股底层仍可返回空列表；批量结果发出 `status="no_data"`、`reason="no_data"`、非空 `error` 的终态，并纳入 `failed_codes`，不进行无意义的网络重试。这仅表示本次无数据，不判定证券上市或存续资格。
-- 成功 `data` 事件仍含 `event/code/rows/error`；失败事件另带 `status/reason`，有取证摘要时带 `detail`。取消也归入失败计数并给出明确状态。运行态只记录最终取数失败，重试后成功不会保留中间网络失败为最终失败。
+- 成功 `data` 事件仍含 `event/code/rows/error`，`rows` 元素为 `code/category/content`；失败事件另带 `status/reason`，有取证摘要时带 `detail`。取消也归入失败计数并给出明确状态。运行态只记录最终取数失败，重试后成功不会保留中间网络失败为最终失败。异步写入队列后只保留代码去重和计数，`job.result()` 与 done 使用同一组计数。
 - category 仍是候选过滤器，不强制每个候选栏目都存在，也不硬编码栏目数量；缺少部分候选栏目不写运行态失败，需要必需栏目验收的调用方应按业务要求逐项核对。
 
 **调用示例:**

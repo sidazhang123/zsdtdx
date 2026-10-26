@@ -119,6 +119,7 @@ def fetch_company_info(
     1. codes 必须是非空 list。
     2. mode 只接受 sync/async。
     3. return_df 只影响 sync 的最终返回。
+    4. async 总会带队列。正文只出现在 data 事件的 rows 里；job.result() 只返回代码计数，等待、超时和任务异常仍由 result() 表现。
     """
     if isinstance(codes, (str, bytes)):
         raise TypeError('get_company_info 的 codes 须为 list，单票请传 ["600000"]')

@@ -446,8 +446,9 @@ def get_company_info(
 
     返回:
     - mode="sync": `list[dict]` 或 DataFrame（由 return_df 决定）。
-    - mode="async": `StockKlineJob`；从 `job.queue` 消费直到 `event="done"`；
-      `job.result()` 为全部行的 list[dict]。
+    - mode="async": `StockKlineJob`；从 `job.queue` 消费直到 `event="done"`。
+      `job.result()` 返回 `total_codes`、`success_codes`、`failed_codes`，不保留正文；
+      等待、超时和任务异常仍由 `result()` 表现。
 
     队列事件:
     - data: `{"event":"data","code":"...","rows":[...],"error":str|None}`

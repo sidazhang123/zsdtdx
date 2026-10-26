@@ -1,3 +1,10 @@
+## v3.0.4 - 2026-10-26
+
+- 异步公司信息只经队列交付正文。`job.result()` 返回 `total_codes`、`success_codes`、`failed_codes`；库内只保留代码去重和计数，不把整批正文放进聚合结果。同步公司信息仍返回全文。data 事件仍为 `code` 与 `rows` 中的 `code/category/content`，done 仍给出成功和失败计数。
+- 异步 K 线分片在交出后立即放开引用，避免已交付行情在生成器等待下一次结果时继续驻留。
+- 补充公司信息异步结果释放与超时回归，并同步文档及手工验收脚本。
+- 版本号：`pyproject.toml` 与 `__init__.__version__` 对齐为 `3.0.4`。
+
 ## v3.0.3 - 2026-10-26
 
 - 异步 K 线在带队列时只经队列交付行情。`job.result()` 返回 `total_tasks`、`success_tasks`、`failed_tasks`，不再保留已完成任务的行情正文。未带队列时 `result()` 仍返回 payload 列表。同步接口仍返回 payload 列表。
