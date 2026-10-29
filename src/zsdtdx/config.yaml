@@ -145,7 +145,8 @@ stock_scope:
 
 # 全市场股票统计宽表 get_stock_stat（0x054B + 0x0010 + zhb/tdxstat）。
 stock_stat:
-  # 054B 每页条数；服务端硬顶 80。
+  # 054B 每页条数；服务端硬顶 80，请求更大也只回 80。
+  # 同站连接数写死为 TDXParams.STOCK_STAT_QUOTE_WORKERS，不在这里配置。
   page_size: 80
   # 0010 每批代码数；服务端硬顶 100。
   finance_batch_size: 100

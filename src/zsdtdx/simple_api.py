@@ -384,32 +384,40 @@ def get_stock_kline(
     )
 
 
-def get_stock_stat() -> pd.DataFrame:
+def get_stock_stat(quotes_only: bool = False) -> pd.DataFrame:
     """获取全市场股票统计宽表。
 
     调用前置约定:
     - 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接。
 
     输入:
-    - 无。分页与财务批次由 `config.yaml` 的 `stock_stat` 控制
+    - quotes_only: False（默认）返回行情、财务和 zhb 宽表；True 只返回 0x054B 实时列。
+      True 时不拉取、不解析 0x0010 与 zhb/tdxhy。两种取值都返回 DataFrame。
+    - 分页与财务批次由 `config.yaml` 的 `stock_stat` 控制
       （`page_size`/`finance_batch_size`/`finance_workers`）。
-      行情 0x054B；财务/股本 0x0010；多日涨幅与估值等来自 zhb/tdxstat + tdxhy。
+      行情 0x054B 的同站连接数固定为 `TDXParams.STOCK_STAT_QUOTE_WORKERS`（4），不读配置。
+      全量时 zhb/tdxhy 与行情同时开始；0x0010 等行情页全部结束再开 `finance_workers` 条线程。
+      财务/股本 0x0010；多日涨幅与估值等来自 zhb/tdxstat + tdxhy。
       市值/市净/市销/市现用现价（现价非正则回退昨收）。
       市盈率(TTM|静)、股息率、多日涨幅与统计基准日按 zhb/tdxstat 文件原值返回。
 
     输出:
-    - 一行一只 A 股股票；中文表头。金额万元、量手、股本万股；不含指数/港股；无 codes。
-    - 返回列说明见 `STOCK_STAT_COLUMN_LABELS` 及 README「字段说明」。
+    - DataFrame。一行一只 A 股股票；中文表头。金额万元、量手、股本万股；不含指数/港股；无 codes。
+      `quotes_only=True` 同样返回 DataFrame，只是列更少。
+    - 全量列见 `STOCK_STAT_COLUMN_LABELS`。quotes_only 只含代码、现价、昨收、开高低、
+      总量/现量/成交额、买卖一档、内外盘、涨跌额、涨幅、振幅、均价、内外比。
       涨跌额=现价-昨收；涨幅(%)=(现价-昨收)/昨收*100；
       振幅(%)=(最高-最低)/昨收*100；总量(手)=当日成交量；现量(手)=最近分笔量；
       内盘(手)/外盘(手)=主动卖/买；内外比=内盘/外盘；换手(%)=总量/流通股本；
       流通市值/总市值=对应股本×现价；市净率/市销率/市现率=现价÷每股净资、总市值÷营业收入、现价÷每股现金流；
       财报更新日期=财务数据更新日期；净利润=归母；税后利润含少数股东损益。
+      换手、市值和财务列只在全量模式出现。
 
     调用示例:
     ```python
     with get_client():
         df = get_stock_stat()
+        quotes = get_stock_stat(quotes_only=True)
     ```
 
     返回示例（列节选）:
@@ -418,7 +426,7 @@ def get_stock_stat() -> pd.DataFrame:
     600000  9.98  9.90  ...  5.2         1.23        银行
     ```
     """
-    return fetch_stock_stat()
+    return fetch_stock_stat(quotes_only=quotes_only)
 
 
 def get_company_info(

@@ -5,18 +5,20 @@
 1. 定义全市场股票统计宽表对外列（内部英文键 + 中文表头映射）。
 2. 将行情行、财务行、tdxstat 快照按代码左连接，向量化计算市值/换手/估值后输出 DataFrame。
 3. 将 zhb/tdxstat 字段按文件原值返回，不推断其与实时行情的交易日关系。
-4. 编排 054B 实时行情、0010 财务批次与 zhb/tdxstat 静态统计数据。
+4. 编排同站并行的 054B 实时行情、行情结束后的 0010 财务批次，以及与行情重叠的 zhb/tdxstat。
 
 边界：
 1. 不组协议包、不管理连接池；通过统一客户端的通用数据能力拉取原始数据。
 2. 不强制刷新板块命名文件缓存；由客户端复用 `block_file_cache`。
 3. 无 codes 入参；范围固定为 A 股股票，按市场号与代码前缀排除指数/板块。
 4. 现价非正则时，仅实时行情与财务派生的估值指标回退昨收；不改写 tdxstat 字段。
-5. 不接码表；返回列为中文表头，见 `STOCK_STAT_COLUMN_LABELS`。
+5. 不接码表；返回列为中文表头。全量见 `STOCK_STAT_COLUMN_LABELS`，只返回行情时见 `STOCK_STAT_QUOTE_COLUMNS`。
+6. `quotes_only=True` 不拉取、不解析 0010 与 zhb/tdxhy。
 """
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
@@ -131,6 +133,33 @@ STOCK_STAT_COLUMNS: List[str] = [
     "contract_liab",
 ]
 
+# 0x054B 实时列。涨跌额/涨幅/振幅/均价/内外比由回包本地计算，不依赖 0010 或 zhb。
+STOCK_STAT_QUOTE_COLUMNS: List[str] = [
+    "code",
+    "price",
+    "last_close",
+    "open",
+    "high",
+    "low",
+    "vol",
+    "cur_vol",
+    "amount",
+    "bid1",
+    "ask1",
+    "bid_vol1",
+    "ask_vol1",
+    "s_vol",
+    "b_vol",
+    "change",
+    "change_pct",
+    "amplitude_pct",
+    "avg_price",
+    "io_ratio",
+]
+
+if STOCK_STAT_COLUMNS[: len(STOCK_STAT_QUOTE_COLUMNS)] != STOCK_STAT_QUOTE_COLUMNS:
+    raise RuntimeError("STOCK_STAT_QUOTE_COLUMNS 必须是宽表行情前缀")
+
 # 英文键 → 中文表头；仅最终返回列写说明/单位。
 # 返回量纲：价/涨跌额/均价为元（不标）；量为手；金额与市值为万元；股本为万股；
 # 每股*为元；已是百分点的比率标(%)；市净/市销/市现/市盈/贝塔不标单位。
@@ -236,6 +265,9 @@ if set(STOCK_STAT_COLUMN_LABELS) != set(STOCK_STAT_COLUMNS):
 STOCK_STAT_DISPLAY_COLUMNS: List[str] = [
     STOCK_STAT_COLUMN_LABELS[k] for k in STOCK_STAT_COLUMNS
 ]
+STOCK_STAT_QUOTE_DISPLAY_COLUMNS: List[str] = [
+    STOCK_STAT_COLUMN_LABELS[k] for k in STOCK_STAT_QUOTE_COLUMNS
+]
 
 # 0010 财务字段（含地区码内部列，投影前丢弃）。
 FINANCE_FIELD_KEYS = (
@@ -323,6 +355,43 @@ def is_stock_stat_row(market: int, code: str) -> bool:
     if market == 2:
         return c.startswith(("43", "83", "87", "88", "92"))
     return False
+
+
+def _empty_stock_stat_quote_df() -> pd.DataFrame:
+    """
+    输入：无。
+    输出：仅含实时行情中文表头的空表。
+    用途：quotes_only 且无行情行时的固定列契约。
+    边界：0 行，不含财务和 zhb 列。
+    """
+    return pd.DataFrame(columns=STOCK_STAT_QUOTE_DISPLAY_COLUMNS)
+
+
+def build_stock_stat_quote_df(
+    quote_rows: Sequence[Mapping[str, Any]],
+) -> pd.DataFrame:
+    """
+    输入：054B 行情行。
+    输出：只含实时行情列的中文表头 DataFrame。
+    用途：quotes_only 投影；成交额从元折为万元。
+    边界：不读财务和 zhb；无代码列时返回空表；缺失字段为 None。
+    """
+    if not quote_rows:
+        return _empty_stock_stat_quote_df()
+    frame = pd.DataFrame(list(quote_rows))
+    if "code" not in frame.columns:
+        return _empty_stock_stat_quote_df()
+    frame["code"] = frame["code"].astype(str)
+    if "amount" in frame.columns:
+        frame["amount"] = (
+            pd.to_numeric(frame["amount"], errors="coerce") / 10000.0
+        ).round(4)
+    for key in STOCK_STAT_QUOTE_COLUMNS:
+        if key not in frame.columns:
+            frame[key] = np.nan
+    out = frame.loc[:, list(STOCK_STAT_QUOTE_COLUMNS)].copy()
+    out = out.rename(columns=STOCK_STAT_COLUMN_LABELS)
+    return out.replace({np.nan: None})
 
 
 def _empty_stock_stat_df() -> pd.DataFrame:
@@ -546,37 +615,71 @@ def _load_stock_stat_static_maps(
         raise RuntimeError("stock_stat 静态统计数据不完整") from exc
 
 
-def _fetch_stock_stat_with_client(client: UnifiedTdxClient) -> pd.DataFrame:
+def _fetch_quote_rows(client: UnifiedTdxClient, page_size: int, workers: int):
     """
-    输入统一客户端，输出全市场 A 股统计宽表。
+    输入：客户端、页长、同站线程数。
+    输出：已滤成股票的 054B 行。
+    用途：行情分页入口。
+    边界：过滤器只影响保留行，不改变翻页终点。
+    """
+    return client.get_board_quote_rows_parallel(
+        page_size,
+        workers,
+        lambda row: is_stock_stat_row(int(row["market"]), str(row["code"])),
+    )
 
-    用途：按固定顺序编排 054B、0010 与静态统计数据，并调用向量化聚合核心。
-    边界：无 codes 过滤；任一数据源不完整时抛错；不包含指数与港股。
+
+def _fetch_stock_stat_with_client(
+    client: UnifiedTdxClient,
+    quotes_only: bool = False,
+) -> pd.DataFrame:
+    """
+    输入统一客户端和是否只返回实时行情，输出 A 股统计表。
+
+    用途：行情同站并行；全量时 zhb 与行情同时开始，0010 等行情页结束后再开线程。
+    边界：quotes_only 不拉取、不解析 0010 与 zhb；任一已请求的数据源不完整时抛错。
     """
     cfg = client.config.get("stock_stat", {}) or {}
     page_size = min(
         max(1, int(cfg.get("page_size", MAX_BOARD_QUOTE_PAGE))),
         MAX_BOARD_QUOTE_PAGE,
     )
-    batch_size = min(
-        max(1, int(cfg.get("finance_batch_size", MAX_FINANCE_INFO_BATCH))),
-        MAX_FINANCE_INFO_BATCH,
-    )
-    finance_workers = min(max(1, int(cfg.get("finance_workers", 4))), 8)
+    workers = int(TDXParams.STOCK_STAT_QUOTE_WORKERS)
+    if quotes_only:
+        return build_stock_stat_quote_df(_fetch_quote_rows(client, page_size, workers))
 
-    quote_rows = client.get_board_quote_rows(
-        page_size,
-        lambda row: is_stock_stat_row(int(row["market"]), str(row["code"])),
-    )
-    codes = [(int(row["market"]), str(row["code"])) for row in quote_rows]
-    finance_map = client.get_finance_info_batch_map(
-        codes,
-        batch_size,
-        finance_workers,
-    )
-    stat_map, region_map, industry_name_map, code_hy_map = _load_stock_stat_static_maps(
-        client
-    )
+    box: Dict[str, Any] = {"error": None, "value": None}
+
+    def _load_static() -> None:
+        try:
+            box["value"] = _load_stock_stat_static_maps(client)
+        except Exception as exc:
+            box["error"] = exc
+
+    static_thread = threading.Thread(target=_load_static, name="zsdtdx-stock-stat-zhb")
+    static_thread.start()
+    try:
+        quote_rows = _fetch_quote_rows(client, page_size, workers)
+        if not static_thread.is_alive():
+            static_thread.join()
+            if box["error"] is not None:
+                raise box["error"]
+        batch_size = min(
+            max(1, int(cfg.get("finance_batch_size", MAX_FINANCE_INFO_BATCH))),
+            MAX_FINANCE_INFO_BATCH,
+        )
+        finance_workers = min(max(1, int(cfg.get("finance_workers", 4))), 8)
+        codes = [(int(row["market"]), str(row["code"])) for row in quote_rows]
+        finance_map = client.get_finance_info_batch_map(
+            codes,
+            batch_size,
+            finance_workers,
+        )
+    finally:
+        static_thread.join()
+    if box["error"] is not None:
+        raise box["error"]
+    stat_map, region_map, industry_name_map, code_hy_map = box["value"]
     return build_stock_stat_df(
         quote_rows,
         finance_map,
@@ -587,14 +690,15 @@ def _fetch_stock_stat_with_client(client: UnifiedTdxClient) -> pd.DataFrame:
     )
 
 
-def fetch_stock_stat() -> pd.DataFrame:
+def fetch_stock_stat(quotes_only: bool = False) -> pd.DataFrame:
     """
-    输入：无。
-    输出：全市场股票统计宽表 DataFrame。
-    用途：simple_api 业务门面；复用活跃上下文客户端完成跨源聚合。
-    边界：无 codes；配置见 `config.yaml` 的 `stock_stat`；无活跃上下文时临时客户端会自动关闭。
+    输入：quotes_only 为 True 时只返回实时行情。
+    输出：全市场股票统计 DataFrame。
+    用途：simple_api 业务门面；复用活跃上下文客户端。
+    边界：默认全量；无 codes；配置见 `config.yaml` 的 `stock_stat`；无活跃上下文时临时客户端会自动关闭。
     """
+    quotes_only = bool(quotes_only)
     return call_with_main_client(
-        _fetch_stock_stat_with_client,
+        lambda client: _fetch_stock_stat_with_client(client, quotes_only=quotes_only),
         caller_name="get_stock_stat",
     )

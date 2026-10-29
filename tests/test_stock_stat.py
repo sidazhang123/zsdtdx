@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import struct
+import threading
 from collections import OrderedDict
 from contextlib import contextmanager
 
@@ -12,8 +13,10 @@ import zsdtdx.biz.stock_stat as stock_stat_module
 from zsdtdx.biz.stock_stat import (
     STOCK_STAT_COLUMN_LABELS,
     STOCK_STAT_DISPLAY_COLUMNS,
+    STOCK_STAT_QUOTE_DISPLAY_COLUMNS,
     _fetch_stock_stat_with_client,
     build_stock_stat_df,
+    build_stock_stat_quote_df,
     is_stock_stat_row,
 )
 from zsdtdx.engine.unified_client import UnifiedTdxClient
@@ -208,13 +211,17 @@ def test_stock_stat_business_orchestration_uses_generic_client_capabilities(
     输入同时含股票与指数的版面数据。
     输出业务层只向财务能力传入股票，并完成六源参数聚合。
     用途：固化 simple_api→biz→engine 的目标分层。
-    边界：不发网络请求，不解析真实静态文件。
+    边界：不发网络请求，不解析真实静态文件。zhb 必须在行情返回前已经开始，0010 必须在行情返回后。
     """
+
+    static_started = threading.Event()
+    quote_done = threading.Event()
 
     class FakeClient:
         config = {
             "stock_stat": {
                 "page_size": 80,
+                "quote_workers": 99,
                 "finance_batch_size": 100,
                 "finance_workers": 4,
             }
@@ -223,15 +230,20 @@ def test_stock_stat_business_orchestration_uses_generic_client_capabilities(
         def __init__(self):
             self.finance_args = None
 
-        def get_board_quote_rows(self, page_size, row_filter=None):
+        def get_board_quote_rows_parallel(self, page_size, workers, row_filter=None):
             assert page_size == 80
+            assert workers == 4
+            assert static_started.wait(2), "zhb 应在行情结束前开始"
             rows = [
                 {"market": 1, "code": "600000", "price": 10.0},
                 {"market": 0, "code": "399001", "price": 20.0},
             ]
-            return [row for row in rows if row_filter is None or row_filter(row)]
+            kept = [row for row in rows if row_filter is None or row_filter(row)]
+            quote_done.set()
+            return kept
 
         def get_finance_info_batch_map(self, codes, batch_size, workers):
+            assert quote_done.is_set()
             self.finance_args = (codes, batch_size, workers)
             return {"600000": {"code": "600000"}}
 
@@ -243,10 +255,15 @@ def test_stock_stat_business_orchestration_uses_generic_client_capabilities(
         {"600000": "T020603"},
     )
     captured = {}
+
+    def _load_static(_client):
+        static_started.set()
+        return static_maps
+
     monkeypatch.setattr(
         stock_stat_module,
         "_load_stock_stat_static_maps",
-        lambda _client: static_maps,
+        _load_static,
     )
 
     def fake_build(quote_rows, finance_map, stat_map, region_map, industry_map, hy_map):
@@ -660,3 +677,131 @@ def test_security_quotes_unlisted_still_isolated():
     rows = GetSecurityQuotesCmd(None).parseResponse(body)
     assert len(rows) == 1
     assert rows[0]["code"] == "301569"
+
+
+def test_stock_stat_quotes_only_skips_finance_and_zhb(monkeypatch):
+    """输入 quotes_only。输出只有实时列，且不调用 0010 和 zhb。"""
+
+    class FakeClient:
+        config = {"stock_stat": {"page_size": 80, "quote_workers": 99}}
+
+        def get_board_quote_rows_parallel(self, page_size, workers, row_filter=None):
+            assert page_size == 80
+            assert workers == 4
+            rows = [
+                {
+                    "market": 1,
+                    "code": "600000",
+                    "price": 10.0,
+                    "last_close": 9.0,
+                    "amount": 20000.0,
+                    "vol": 100,
+                },
+                {"market": 0, "code": "399001", "price": 20.0, "amount": 1.0},
+            ]
+            return [row for row in rows if row_filter is None or row_filter(row)]
+
+        def get_finance_info_batch_map(self, *_args, **_kwargs):
+            raise AssertionError("quotes_only 不应请求 0010")
+
+    def _load_static(_client):
+        raise AssertionError("quotes_only 不应读取 zhb")
+
+    monkeypatch.setattr(stock_stat_module, "_load_stock_stat_static_maps", _load_static)
+    df = _fetch_stock_stat_with_client(FakeClient(), quotes_only=True)
+    assert list(df.columns) == STOCK_STAT_QUOTE_DISPLAY_COLUMNS
+    assert df.iloc[0]["代码"] == "600000"
+    assert df.iloc[0]["成交额(万元)"] == 2.0
+    assert "行业" not in df.columns
+    assert len(df) == 1
+
+
+def test_stock_stat_quote_df_empty_keeps_quote_columns():
+    """输入空行情。输出只有实时行情表头。"""
+    df = build_stock_stat_quote_df([])
+    assert list(df.columns) == STOCK_STAT_QUOTE_DISPLAY_COLUMNS
+    assert df.empty
+
+
+class _FakeQuotePool:
+    """同站并行分页的离线连接池。"""
+
+    def __init__(self, hosts, fail_hosts=()):
+        self.hosts = list(hosts)
+        self.host_groups = {"szshbj": set(self.hosts)}
+        self.fail_hosts = set(fail_hosts)
+        self.calls = []
+        self.connects = []
+        self.lock = threading.Lock()
+        self.local = threading.local()
+
+    @contextmanager
+    def host_scope(self, name):
+        assert name == "szshbj"
+        yield self
+
+    @contextmanager
+    def pin_host(self, host):
+        self.local.host = host
+        yield self
+
+    def connect_thread_to_host(self, host, port):
+        target = (host, int(port))
+        with self.lock:
+            self.connects.append(target)
+        return target not in self.fail_hosts
+
+    def call_current_host(self, method, start, count, allow_none=False):
+        assert method == "get_board_quote_page"
+        assert count == 2
+        host = self.local.host
+        with self.lock:
+            self.calls.append((host, start))
+        if start == 0:
+            return [
+                {"market": 1, "code": "600000", "price": 10.0},
+                {"market": 0, "code": "399001", "price": 20.0},
+            ]
+        if start == 2:
+            return [{"market": 1, "code": "600001", "price": 3.0}]
+        return []
+
+    def reset_thread_connection(self, reconnect=False):
+        return True
+
+    def cleanup_dead_thread_connections(self):
+        return None
+
+
+def test_board_quote_parallel_pins_one_host_and_drops_extra_pages():
+    """输入两页加探测空页。输出按偏移排序，只留股票，探测页不进入结果。"""
+    host = ("1.1.1.1", 7709)
+    pool = _FakeQuotePool([host])
+    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+    client.std_pool = pool
+    rows = client.get_board_quote_rows_parallel(
+        2,
+        9,
+        lambda row: is_stock_stat_row(int(row["market"]), str(row["code"])),
+    )
+    assert [row["code"] for row in rows] == ["600000", "600001"]
+    assert {item[0] for item in pool.calls} == {host}
+    assert len(pool.connects) == 4
+    assert 0 in {item[1] for item in pool.calls}
+    assert 2 in {item[1] for item in pool.calls}
+
+
+def test_board_quote_parallel_retries_next_host_when_pin_fails():
+    """输入第一台站无法建立 4 条连接。输出整段改到下一台站。"""
+    bad = ("1.1.1.1", 7709)
+    good = ("2.2.2.2", 7709)
+    pool = _FakeQuotePool([bad, good], fail_hosts={bad})
+    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+    client._runtime_failures = []
+    client._runtime_failures_lock = None
+    client.std_pool = pool
+    rows = client.get_board_quote_rows_parallel(2, 4)
+    assert [row["code"] for row in rows] == ["600000", "399001", "600001"]
+    assert {item[0] for item in pool.calls} == {good}
+    assert bad in pool.connects
+    assert client._runtime_failures

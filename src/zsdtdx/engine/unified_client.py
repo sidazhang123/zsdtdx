@@ -1821,6 +1821,75 @@ class ChunkLocalRowCache:
         self._partitions.pop(partition_key, None)
 
 
+class _SameHostBoardQuoteError(RuntimeError):
+    """单站 054B 并行分页未完成。调用方可换下一台 szshbj 站整段重试。"""
+
+
+def _board_quote_row_key(row: Any, start: int) -> Tuple[int, str]:
+    """
+    输入：一页中的单行和页偏移。
+    输出：(market, code)。
+    用途：并行分页与顺序分页共用同一行合法性。
+    边界：解析失败、市场号或代码非法时抛 `_SameHostBoardQuoteError`。
+    """
+    if not isinstance(row, dict) or row.get("parse_error"):
+        raise _SameHostBoardQuoteError(f"054B 分页含解析失败行: start={start}")
+    try:
+        market = int(row.get("market", -1))
+    except (TypeError, ValueError) as exc:
+        raise _SameHostBoardQuoteError(f"054B 市场号非法: start={start}") from exc
+    code = str(row.get("code", "")).strip()
+    if market not in (0, 1, 2) or len(code) != 6 or not code.isdigit():
+        raise _SameHostBoardQuoteError(
+            f"054B 代码行非法: start={start}, market={market}, code={code!r}"
+        )
+    return market, code
+
+
+def _assemble_parallel_board_quotes(
+    pages: Dict[int, List[Any]],
+    errors: List[Tuple[int, str]],
+    page_size: int,
+    row_filter: Optional[Callable[[Dict[str, Any]], bool]],
+) -> List[Dict[str, Any]]:
+    """
+    输入：已完成页、页错误、页长和行过滤器。
+    输出：按页偏移排序、过滤后的行情行。
+    用途：短页作为终点，丢弃终点之后的探测页。
+    边界：没有短页、缺页、满页条数不对或代码重复时抛 `_SameHostBoardQuoteError`。
+    """
+    short_starts = [start for start, rows in pages.items() if len(rows) < page_size]
+    if not short_starts:
+        detail = errors[0][1] if errors else "054B 分页未在短页结束"
+        raise _SameHostBoardQuoteError(detail)
+    stop_at = min(short_starts)
+    required = range(0, stop_at + page_size, page_size)
+    seen: set[Tuple[int, str]] = set()
+    kept: List[Dict[str, Any]] = []
+    for start in required:
+        if start not in pages:
+            matched = [message for src, message in errors if src == start]
+            detail = matched[0] if matched else f"054B 缺少分页: start={start}"
+            raise _SameHostBoardQuoteError(detail)
+        rows = pages[start]
+        if start != stop_at and len(rows) != page_size:
+            raise _SameHostBoardQuoteError(
+                f"054B 满页条数异常: start={start}, rows={len(rows)}, page_size={page_size}"
+            )
+        page_seen: set[Tuple[int, str]] = set()
+        for row in rows:
+            key = _board_quote_row_key(row, start)
+            if key in page_seen or key in seen:
+                raise _SameHostBoardQuoteError(
+                    f"054B 分页重复代码: start={start}, key={key!r}"
+                )
+            page_seen.add(key)
+            seen.add(key)
+            if row_filter is None or row_filter(row):
+                kept.append(row)
+    return kept
+
+
 class UnifiedTdxClient:
     """统一行情高层客户端，封装市场路由、分页和连接池。"""
 
@@ -5885,6 +5954,187 @@ class UnifiedTdxClient:
         detail = "054B 分页未在 16 位偏移范围内结束"
         self._record_failure("board_quote", "page", "overflow", detail)
         raise RuntimeError(detail)
+
+    def _szshbj_quote_hosts(self) -> List[Tuple[str, int]]:
+        """
+        输入无，输出按连接池现有顺序排列的 szshbj 地址。
+        用途：行情并行分页只钉深沪北站，并沿用探测后的延迟顺序。
+        边界：池未配置该组时返回空列表。
+        """
+        pool = self.std_pool
+        grouped = set(getattr(pool, "host_groups", {}).get("szshbj", ()) or ())
+        return [
+            host for host in list(getattr(pool, "hosts", []) or []) if host in grouped
+        ]
+
+    def _note_same_host_board_failure(self, host: Tuple[str, int], detail: str) -> None:
+        """
+        输入站点和失败说明，输出无。
+        用途：整段换站前留下运行态记录。
+        边界：测试桩没有失败列表时跳过。
+        """
+        if not isinstance(getattr(self, "_runtime_failures", None), list):
+            return
+        self._record_failure(
+            "board_quote",
+            f"{host[0]}:{host[1]}",
+            "same_host",
+            detail,
+        )
+
+    def _board_quote_rows_on_host(
+        self,
+        host: Tuple[str, int],
+        page_size: int,
+        workers: int,
+        row_filter: Optional[Callable[[Dict[str, Any]], bool]],
+    ) -> List[Dict[str, Any]]:
+        """
+        输入站点、页长、线程数和行过滤器，输出该站过滤后的行情行。
+        用途：4 条连接创建后只向这一台站要页，短页结束后线程退出并断开。
+        边界：连接数不足、缺页或行非法时抛 `_SameHostBoardQuoteError`，不改去其它站。
+        """
+        pool = self.std_pool
+        state_lock = threading.Lock()
+        next_start = 0
+        stop_at: Optional[int] = None
+        failed = False
+        pages: Dict[int, List[Any]] = {}
+        errors: List[Tuple[int, str]] = []
+        connect_count = 0
+        barrier = threading.Barrier(workers)
+
+        def take() -> Optional[int]:
+            nonlocal next_start
+            with state_lock:
+                if failed:
+                    return None
+                if stop_at is not None and next_start > stop_at:
+                    return None
+                if next_start > 0xFFFF:
+                    return None
+                start = next_start
+                next_start += page_size
+                return start
+
+        def note(start: int, rows: List[Any]) -> None:
+            nonlocal stop_at
+            with state_lock:
+                pages[start] = rows
+                if len(rows) < page_size and (stop_at is None or start < stop_at):
+                    stop_at = start
+
+        def fail(start: int, message: str) -> None:
+            nonlocal failed
+            with state_lock:
+                errors.append((start, message))
+                failed = True
+
+        def worker() -> None:
+            nonlocal connect_count
+            waited = False
+            try:
+                with pool.host_scope("szshbj"):
+                    with pool.pin_host(host):
+                        try:
+                            connected = bool(
+                                pool.connect_thread_to_host(host[0], int(host[1]))
+                            )
+                        except Exception as exc:
+                            fail(-1, f"连接失败: {exc}")
+                            connected = False
+                        if connected:
+                            with state_lock:
+                                connect_count += 1
+                        barrier.wait(timeout=20)
+                        waited = True
+                        if connect_count != workers:
+                            return
+                        while True:
+                            start = take()
+                            if start is None:
+                                return
+                            try:
+                                page = pool.call_current_host(
+                                    "get_board_quote_page",
+                                    start,
+                                    page_size,
+                                    allow_none=True,
+                                )
+                            except Exception as exc:
+                                fail(start, str(exc))
+                                return
+                            if page is None:
+                                fail(
+                                    start,
+                                    f"054B 连接重试耗尽后返回 None: start={start}",
+                                )
+                                return
+                            if not isinstance(page, (list, tuple)):
+                                fail(
+                                    start,
+                                    f"054B 分页返回类型非法: {type(page).__name__}",
+                                )
+                                return
+                            note(start, list(page))
+            except threading.BrokenBarrierError:
+                return
+            except Exception as exc:
+                fail(-1, str(exc))
+                if not waited:
+                    try:
+                        barrier.abort()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    pool.reset_thread_connection(reconnect=False)
+                except Exception:
+                    pass
+
+        threads = [
+            threading.Thread(target=worker, name=f"zsdtdx-054b-{index}")
+            for index in range(workers)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        cleanup = getattr(pool, "cleanup_dead_thread_connections", None)
+        if callable(cleanup):
+            cleanup()
+        if connect_count != workers:
+            raise _SameHostBoardQuoteError(
+                f"{host[0]}:{host[1]} 同站连接 {connect_count}/{workers}"
+            )
+        return _assemble_parallel_board_quotes(pages, errors, page_size, row_filter)
+
+    def get_board_quote_rows_parallel(
+        self,
+        page_size: int,
+        workers: int,
+        row_filter: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        输入页长、同站线程数和可选行过滤器，输出过滤后的 054B 行情行。
+        用途：get_stock_stat 用固定线程数把全部行情页钉在同一台 szshbj 站上拉取。
+        边界：线程数限为 1..STOCK_STAT_QUOTE_WORKERS；当前站整段失败才换下一台；短页之后的探测页不进入结果。
+        """
+        page_size = max(1, int(page_size))
+        workers = min(max(1, int(workers)), int(TDXParams.STOCK_STAT_QUOTE_WORKERS))
+        hosts = self._szshbj_quote_hosts()
+        if not hosts:
+            raise RuntimeError("054B 无可用 szshbj 站点")
+        last_error: Optional[BaseException] = None
+        for host in hosts:
+            try:
+                return self._board_quote_rows_on_host(
+                    host, page_size, workers, row_filter
+                )
+            except _SameHostBoardQuoteError as exc:
+                last_error = exc
+                self._note_same_host_board_failure(host, str(exc))
+        raise RuntimeError(f"054B 同站并行分页失败: {last_error}") from last_error
 
     def get_finance_info_batch_map(
         self,

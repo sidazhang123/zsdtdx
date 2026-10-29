@@ -1,3 +1,9 @@
+## v3.0.5 - 2026-10-29
+
+- `get_stock_stat(quotes_only=False)` 默认仍返回行情、财务和 zhb 宽表。`quotes_only=True` 只返回 0x054B 实时列，不拉取、不解析 0x0010 与 zhb/tdxhy。
+- 0x054B 改为同站 4 条连接并行翻页，条数写死在 `TDXParams.STOCK_STAT_QUOTE_WORKERS`，不进入 YAML。当前站整段失败才换下一台 szshbj。全量时 zhb/tdxhy 与行情同时开始；0x0010 等行情页结束后再按 `finance_workers` 并发。`quotes_only=True` 同样返回 DataFrame。
+- 版本号：`pyproject.toml` 与 `__init__.__version__` 对齐为 `3.0.5`。
+
 ## v3.0.4 - 2026-10-26
 
 - 异步公司信息只经队列交付正文。`job.result()` 返回 `total_codes`、`success_codes`、`failed_codes`；库内只保留代码去重和计数，不把整批正文放进聚合结果。同步公司信息仍返回全文。data 事件仍为 `code` 与 `rows` 中的 `code/category/content`，done 仍给出成功和失败计数。

@@ -7,7 +7,7 @@
 
 边界：
 1. 仅包含常量类 `TDXParams`，不含运行时逻辑。
-2. 用户可调旋钮仍在 `config.yaml`；内部调度超时等继续写死在调用处。
+2. 用户可调旋钮仍在 `config.yaml`；协议上限与 `get_stock_stat` 同站连接数写在本类。
 """
 
 # coding=utf-8
@@ -52,6 +52,8 @@ class TDXParams:
 
     # 标准行情 K 线单页上限 800
     MAX_KLINE_COUNT = 800
+    # get_stock_stat 的 0x054B 同站连接数，不进入 config.yaml
+    STOCK_STAT_QUOTE_WORKERS = 4
     # 扩展行情 K 线单页上限 700
     MAX_EXTENDED_KLINE_COUNT = 700
     # 标准行情码表 0x044D 单页条数

@@ -25,7 +25,7 @@ from zsdtdx.simple_api import (
 )
 from zsdtdx.engine.unified_client import UnifiedTdxClient
 
-__version__ = "3.0.4"
+__version__ = "3.0.5"
 
 __all__ = [
     "__version__",

@@ -105,7 +105,7 @@ block_tasks = [
 
 用户侧 YAML **允许不完整**：运行时以包内默认 `config.yaml` 为底，对用户文件中与内置**同名的键**做深合并覆盖；内置不存在的键会被丢弃；列表字段（如 `hosts.standard.szshbj`）整段替换，不做元素并集。
 
-标准行情地址按能力分为 `szshbj`（支持深沪北）与 `szsh_only`（仅支持深沪）。北交所行情、F10 以及覆盖全市场的 `get_stock_stat` 054B/0010 请求只在 `szshbj` 内建连、重连和换站；纯深沪任务使用两组可达地址的并集。合法空页仍作为分页终止条件，不会触发跨站重试。
+标准行情地址按能力分为 `szshbj`（支持深沪北）与 `szsh_only`（仅支持深沪）。北交所行情、F10 以及覆盖全市场的 `get_stock_stat` 054B/0010 请求只在 `szshbj` 内建连、重连和换站；`get_stock_stat` 的 054B 用同站多连接拉完全部页，当前站整段失败才换下一台。纯深沪任务使用两组可达地址的并集。合法空页仍作为分页终止条件，不会触发跨站重试。
 
 TCP 可用地址探测在后台或首次建连前由 `_ensure_availability_hosts_cache` 统一写入进程内缓存；默认 `async_background_probe=True` 时函数立即返回，不阻塞启动。
 
@@ -687,14 +687,15 @@ with get_client():
 
 **输入:**
 
-- 无。分页与财务批次由 `config.yaml` 的 `stock_stat` 控制
+- quotes_only: 默认 `False`，返回行情、财务和 zhb 宽表。`True` 时只返回 `0x054B` 实时列，不拉取、不解析 `0x0010` 与 `zhb.zip`/`tdxhy.cfg`。两种模式都返回 DataFrame。
+- 分页与财务批次由 `config.yaml` 的 `stock_stat` 控制
   （`page_size` / `finance_batch_size` / `finance_workers`）。
-- 行情来自 `0x054B`；财务/股本来自批量 `0x0010`；多日涨幅与 PE 等来自
-  `zhb.zip`（tdxstat）与 `tdxhy.cfg`，复用板块命名文件 6 小时缓存。
-- `0x054B` 整段分页与每个 `0x0010` 并发批次均限定在 `szshbj` 能力组，避免不支持北交所的节点返回缺行或协议错误。
-- 市值 / 市净 / 市销 / 市现用现价，现价非正则回退昨收。
+- 行情来自 `0x054B`，同站连接数固定为 `TDXParams.STOCK_STAT_QUOTE_WORKERS`（4），不读 YAML。当前站整段失败才换下一台。
+- 全量模式下，`zhb.zip`（tdxstat）与 `tdxhy.cfg` 和行情同时开始，复用板块命名文件 6 小时缓存；批量 `0x0010` 等行情页全部结束后再按 `finance_workers` 并发。
+- `0x054B` 与每个 `0x0010` 并发批次均限定在 `szshbj` 能力组，避免不支持北交所的节点返回缺行或协议错误。
+- 市值 / 市净 / 市销 / 市现用现价，现价非正则回退昨收。这些列以及行业、多日涨幅只在全量模式出现。
 - 市盈(TTM|静) / 股息率 / 多日涨幅 / 统计基准日按 `zhb.zip` 中 tdxstat 文件原值返回，不根据本机日期或实时价格折算。
-- 不含港股；无 `codes` 入参。返回列为中文表头（含单位）。
+- 不含港股；无 `codes` 入参。返回列为中文表头（含单位）。`quotes_only=True` 的列是代码、现价、昨收、开高低、总量、现量、成交额、买卖一档、内外盘、涨跌额、涨幅、振幅、均价、内外比。
 
 **字段说明（仅最终返回列）:**
 
@@ -728,6 +729,7 @@ from zsdtdx import get_client, get_stock_stat
 
 with get_client():
     df = get_stock_stat()
+    quotes = get_stock_stat(quotes_only=True)
 ```
 
 **返回示例（列节选）:**
@@ -989,6 +991,7 @@ stock_scope:
 
 stock_stat:
   # 全市场股票统计宽表 get_stock_stat。
+  # 0x054B 同站连接数固定为 4，见 TDXParams.STOCK_STAT_QUOTE_WORKERS。
   page_size: 80
   finance_batch_size: 100
   # 0010 财务批次并发线程数；1=串行，内部限制为 1..8。
