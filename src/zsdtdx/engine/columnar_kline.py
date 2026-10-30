@@ -10,6 +10,8 @@ import threading
 
 import numpy as np
 
+from zsdtdx.block_identity import normalize_block_identity
+
 from zsdtdx.engine.thread_runtime import check_deadline
 from zsdtdx.params import TDXParams
 from zsdtdx.parser.kline_columns import (
@@ -195,7 +197,11 @@ def fetch_chunk_columns(client, tasks, kind="stock", qfq=True):
                 "code": code,
                 "kind": kind,
                 "error": error
-                or (None if selected is not None and len(selected) else "no_data"),
+                or (
+                    None
+                    if kind == "block" or selected is not None and len(selected)
+                    else "no_data"
+                ),
             }
         )
     return {
@@ -233,7 +239,11 @@ def materialize_task_columns(client, item):
         }
     else:
         field = "block_name" if kind == "block" else "index_name"
-        identity = {field: str(route.get("name") or task[field])}
+        identity = {
+            field: normalize_block_identity(task[field])
+            if kind == "block"
+            else str(route.get("name") or task[field])
+        }
         if kind != "block":
             identity["code"] = item["code"]
     frequency = client._normalize_freq(task["freq"])

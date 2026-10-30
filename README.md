@@ -201,9 +201,9 @@ with get_client():
 
 #### get_stock_concepts
 
-获取股票所属板块（成分归属）。概念、风格、指数来自 `infoharbor_block.dat`；通达信基础行业来自 `tdxhy.cfg` + `zhb.zip`/`tdxzs.cfg`；研究行业中类来自 `tdxhy.cfg` 的 X 码前五位 + `zhb.zip`/`tdxzs3.cfg`；`zhb.zip`/`spblock.dat` 中能对上当日股票名称的成分段一并纳入。有 `88` 板块代码时使用目录全称。同一代码或同一名称只保留一个板块，成分取并集。可发布股票完全相同的板块只保留名称最长的一个。股票名称用 `get_stock_code_name` 当日码表。不写盘。
+获取股票所属板块（成分归属）。概念、风格、指数来自 `infoharbor_block.dat`；通达信基础行业来自 `tdxhy.cfg` + `zhb.zip`/`tdxzs.cfg`；研究行业中类来自 `tdxhy.cfg` 的 X 码前五位 + `zhb.zip`/`tdxzs3.cfg`；`zhb.zip`/`spblock.dat` 中能对上当日股票名称的成分段一并纳入。有 `88` 板块代码时使用目录全称。以（中文分类名称，板块名称）作为身份。同分类同代码或同名成分取并集；不同身份即使成分相同也分别保留，不跨分类合并。股票名称用当日码表，完整映射写入共享6小时缓存。
 
-与 `get_block_names` 文件同源，但语义不同：本接口回答「股票属于哪些板块」；可请求 K 线的板块指数名请用 `get_block_names`。
+与 `get_block_names` 文件同源，但语义不同：本接口回答「股票属于哪些板块」；完整六类板块目录请用 `get_block_names`；目录中允许包含无 K 线的板块。
 
 **调用前置约定:**
 
@@ -211,8 +211,8 @@ with get_client():
 
 **输出:**
 
-- `names`: 有成分代码的板块名称（概念、风格、指数、基础行业、研究行业中类，以及 spblock 中有股票的板块），去重后按字排序。同名只出现一次。
-- `map`: 股票名称到所属板块名称列表；列表去重且按字排序。码表中没有名称的代码不进入 `map`。
+- `names`: 有成分代码的板块二元组（中文分类名称，板块名称），包含（概念、风格、指数、基础行业、研究行业中类，以及 spblock 中有股票的板块），去重后按字排序。同分类同名只出现一次，跨分类同名分别保留。
+- `map`: 股票名称到所属板块二元组列表；列表去重且按字排序。码表中没有名称的代码不进入 `map`。
 
 **调用示例:**
 
@@ -226,7 +226,7 @@ with get_client():
 **返回示例:**
 
 ```json
-{"names": ["5G概念", "芯片"], "map": {"中信特钢": ["5G概念"]}}
+{"names": [["概念", "5G概念"], ["概念", "芯片"]], "map": {"中信特钢": [["概念", "5G概念"]]}}
 ```
 
 
@@ -439,9 +439,9 @@ result = get_index_kline(
 
 #### get_block_names
 
-获取可请求 K 线的「全部板块」指数名称列表（概念、非统计风格、地区、研究行业中类）。
+获取全部六类板块的（中文分类名称，板块名称）二元组列表，保留空成分和无代码板块。
 
-与 `get_stock_concepts` 共用三份命名文件（`infoharbor_block.dat`、`tdxhy.cfg`、`zhb.zip`），但本接口是板块指数名单，不是股票归属。与 `get_block_kline` 共用 6 小时本地缓存。
+与 `get_stock_concepts`、`get_block_kline` 共用 `block_catalog.pkl` 完整6小时缓存，包含六类目录、板块代码路由、原始证券成分、股票码名和带分类的股票归属；本接口返回目录，股票归属接口返回映射。缓存期限与原始三文件一致，从原文下载时间起计6小时；有效原文优先复用，原文失效先刷新，原文提前更新也会触发映射重建。
 
 **调用前置约定:**
 
@@ -449,7 +449,17 @@ result = get_index_kline(
 
 **输出:**
 
-- 板块名称列表，不含指数代码；可直接作为 `get_block_kline` 的 `block_name`。历史区间没有行情时返回空 rows，不视为报错。
+- 二元组列表，不含指数代码；可直接作为 `get_block_kline` 的 `block_name`。六类及标记见下表。风格包含统计板块；不纳入地区。
+- 目录无可确定代码（含同分类同名多代码）、服务端空页或历史区间没有行情时返回 `rows=[]`、`error=None`，不计失败；网络或解析错误仍报告失败。
+
+| 中文分类名称 | 内部标记 | 来源 |
+|---|---|---|
+| 概念 | GN | infoharbor_block.dat、tdxzs.cfg |
+| 风格 | FG | infoharbor_block.dat、tdxzs.cfg |
+| 指数成分 | ZS | infoharbor_block.dat |
+| 通达信基础行业 | HY | tdxhy.cfg、tdxzs.cfg |
+| 研究行业中类 | RS | tdxhy.cfg X码前五位、tdxzs3.cfg |
+| 补充成分 | SP | spblock.dat；该分类保留来源身份 |
 
 **调用示例:**
 
@@ -464,18 +474,18 @@ with get_client():
 
 #### get_block_kline
 
-获取板块指数 K 线（按板块名称，支持 sync/async）。
+获取板块 K 线（按分类和名称二元组，支持 sync/async）。
 
 **调用前置约定:**
 
 - sync/async 均不要求前置 `with get_client()`；无 with 时名称解析会临时建连。
 - 抓取连接由并行层常驻 client 管理（与 `get_stock_kline` 相同）。
 - 必须显式传入非空 task；不会自动拉全部板块。
-- `block_name` 使用 `get_block_names` 的返回值；与其共用 6 小时文件缓存。
+- `block_name` 使用 `get_block_names` 的返回值；三个板块接口共用与原始文件同生命周期的6小时完整映射磁盘缓存。
 
 **输入:**
 
-- task: `BlockKlineTask` 或等价 dict，字段 `{block_name, freq, start_time, end_time}`。
+- task: `BlockKlineTask` 或等价 dict，字段 `{block_name, freq, start_time, end_time}`；`block_name` 必须是二元组，例如 `("通达信基础行业", "元器件")`。也接受 JSON 二元素数组，拒绝旧版裸名称。
 - queue / preprocessor_operator / mode：与 `get_index_kline` 相同。
 - 无 `qfq`。底层命令为板块指数 `0x0523`；回包 OHLC 为绝对价（与个股/指数 `0x052D` 差分不同）。
 
@@ -499,7 +509,7 @@ result = get_block_kline(
 
 - sync: `list[task_payload]`。
 - async: `StockKlineJob`。行情从 `job.queue` 消费到 done；`job.result()` 返回 `total_tasks`、`success_tasks`、`failed_tasks`，不保留行情正文。
-- rows 含 `block_name/freq/open/close/high/low/volume/amount/datetime`。
+- rows 含 `block_name/freq/open/close/high/low/volume/amount/datetime`；task 与 rows 的 `block_name` 都保留二元组。空行情返回 `rows=[]`、`error=None`，在异步摘要中计入成功。
 
 
 
@@ -942,7 +952,7 @@ pagination:
   standard_kline_qfq: true
 
 catalog_cache:
-  # 标准/扩展码表、ETF/LOF 名称板块按自然日缓存；板块三文件按 6 小时缓存。
+  # 标准/扩展码表、ETF/LOF按自然日缓存；原始板块三文件及衍生映射共用6小时生命周期。
   # 调用方无需控制缓存开关：有效即复用，缺失、损坏或过期即自动重建。
   # ETF 文件为 etf_code_name.pkl；当日已有则 get_etf_code_name 不再下载 0x02C5/0x06B9
   #（含 infoharbor_ex.name、zhb.zip/ilong.dat 与板块文件）。
@@ -1017,7 +1027,8 @@ index_kline:
 - `catalog_cache` 说明：
   - 标准行情（深沪京 `get_security_list`）、扩展行情（`get_instrument_info`）与 ETF/LOF 名称板块分文件按自然日缓存。
   - ETF/LOF 缓存文件为 `etf_code_name.pkl`；`get_etf_code_name` 仅在本地没有当日文件时下载 `0x02C5/0x06B9`。
-  - 板块三文件缓存为 `block_named_files.pkl`，有效期 6 小时；板块名称、板块 K 线、股票板块归属与股票统计共享读取。
+  - `block_catalog.pkl` 为三个板块接口共用的完整映射缓存，保存六类目录、代码路由、原始成分、股票码名和股票归属。有效期从原始文件下载时间起计6小时，建图不重新计时；原文来源变化、旧版本、损坏、未来时间和空码表不会命中。首次重建受跨进程锁保护，原子写入，目录沿用 `catalog_cache.path`。
+  - 原始三文件 `block_named_files.pkl` 按6小时供股票统计和映射构建共用。有效原文优先复用，包括跨午夜仍未满6小时的文件；原文失效则先重新下载再建图，股票统计等其它调用提前刷新原文也会使旧图失效。常用路径只检查原文内存、期限和文件元数据，不重复解析原文或计算哈希。
   - 股票 / 期货 / 指数在使用时从对应侧过滤；指数会同时确保 std 与 ex 当日缓存最新。
   - 同一缓存冷启动使用进程内与跨进程 single-flight，避免并发重复下载；缓存写失败只影响该次持久化，不影响已取得的业务数据和其它缓存。
   - 默认缓存位置会自动选择用户可写目录（Windows: `LOCALAPPDATA`，Linux: `XDG_CACHE_HOME` 或 `~/.cache`）。

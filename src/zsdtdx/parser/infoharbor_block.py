@@ -5,9 +5,9 @@
 1. 解析 `infoharbor_block.dat` 正文，得到概念、风格、指数板块与成分代码。
 2. 解析 `tdxhy.cfg` 与 `tdxzs.cfg`，得到通达信基础行业板块与成分代码。
 3. 解析 `zhb.zip` 的 `spblock.dat`，补进有股票成分的板块。
-4. 解析 `tdxzs3.cfg` 的研究行业中类，并按板块代码或名称与已有板块合并。
-5. 同一板块代码保留目录全称并合并成分；同一板块名再取并集。
-6. 用股票代码名称表收成 `{names, map}`。
+4. 解析 `tdxzs3.cfg` 的研究行业中类，仅在同分类内按代码或名称合并。
+5. 同分类同一板块代码保留目录全称并合并成分；不同分类同名保持独立。
+6. 用股票代码名称表收成 `{names, map}`，板块身份为（中文分类名称，板块名称）。
 
 边界：
 1. 不访问网络，不读写缓存，不生成 pkl 文件。
@@ -26,6 +26,7 @@ from collections import defaultdict
 from typing import Dict, List, Sequence, Tuple
 
 from zsdtdx.params import TDXParams
+from zsdtdx.block_identity import BlockIdentity, block_identity
 
 # infoharbor 成分行里的市场号，与标准行情码表前缀一致。
 _MARKET_PREFIX = {0: "sz", 1: "sh", 2: "bj"}
@@ -251,7 +252,7 @@ def parse_research_industry_blocks(hy_raw: bytes, zs3_raw: bytes) -> List[dict]:
     边界条件：
     1. 大类、小类不生成板块。股票的长码按前五位归入中类。
     2. 对不上中类名称的 X 码丢弃。没有成分的中类不返回。
-    3. 与基础行业同名时不在这里取舍，由后续按名称并集。
+    3. 与基础行业同名仍为两个分类，后续不会跨分类取并集。
     """
     mids: Dict[str, Tuple[str, str]] = {}
     for line in _decode_gbk(zs3_raw).splitlines():
@@ -399,9 +400,9 @@ def merge_concept_blocks(
     1. blocks: 含 `name`、`codes`，可选 `block_code`、`kind`。
     2. code_to_name: 板块代码到目录全称。
     输出：
-    1. 每个最终名称一块。有板块代码时名称用目录全称，成分取并集。
+    1. 每个分类和名称一块。有板块代码时名称用目录全称，同分类成分取并集。
     用途：
-    1. 同代码或同名不保留两套成分。
+    1. 同分类内同代码或同名不保留两套成分；不同分类始终独立。
     边界条件：
     1. 没有目录全称时沿用成分文件里的名称。
     2. 没有成分的板块不返回。
@@ -410,7 +411,7 @@ def merge_concept_blocks(
     name_to_codes: Dict[str, List[str]] = defaultdict(list)
     for code, name in code_to_name.items():
         name_to_codes[name].append(code)
-    by_code: Dict[str, dict] = {}
+    by_code: Dict[tuple, dict] = {}
     loose: List[dict] = []
     for block in blocks:
         raw_name = str(block.get("name") or "").strip()
@@ -428,7 +429,7 @@ def merge_concept_blocks(
         ]
         if block_code:
             slot = by_code.setdefault(
-                block_code,
+                (str(block.get("kind") or ""), block_code),
                 {
                     "name": code_to_name.get(block_code) or raw_name,
                     "kind": str(block.get("kind") or ""),
@@ -453,13 +454,13 @@ def merge_concept_blocks(
         }
         _union_codes(loose_slot["codes"], members)
         loose.append(loose_slot)
-    by_name: Dict[str, dict] = {}
+    by_name: Dict[tuple, dict] = {}
     for slot in list(by_code.values()) + loose:
         name = str(slot.get("name") or "").strip()
         if not name:
             continue
         dest = by_name.setdefault(
-            name,
+            (slot.get("kind") or "", name),
             {
                 "name": name,
                 "kind": slot.get("kind") or "",
@@ -487,13 +488,13 @@ def collapse_identical_stock_sets(
     code_name: Dict[str, str],
 ) -> List[dict]:
     """
-    输入已按代码和名称合并的板块，输出成分相同者只留一个名称。
+    输入已按分类、代码和名称合并的板块，同分类内成分相同者只留一个名称。
 
     输入：
     1. blocks: 每块含 `name` 与 `codes`。
     2. code_name: `前缀代码 -> 股票名称`。
     输出：
-    1. 同一组有名称的股票只保留一个板块。
+    1. 每个分类内，同一组有名称的股票只保留一个板块。
     用途：
     1. 去掉 a、c 都映射到同一组成分股 b 的重复板块。
     边界条件：
@@ -508,7 +509,7 @@ def collapse_identical_stock_sets(
         if not stocks:
             kept.append(block)
             continue
-        grouped[stocks].append(block)
+        grouped[(block.get("kind"), stocks)].append(block)
     for items in grouped.values():
         winner = max(
             items,
@@ -542,7 +543,7 @@ def prepare_concept_blocks(
     1. block_raw、hy_raw、zip_raw: 概念文件、行业归属和 zhb.zip。
     2. code_name: 用于识别可发布股票，以及 spblock 是否有股票成分。
     输出：
-    1. 板块列表。同一代码、同一名称、同一组成分股都只剩一个名称。
+    1. 板块列表。同一分类内同代码、同名、同组成分股只保留一个名称。
     用途：
     1. 概念函数和对照脚本共用这一条组装路径。
     边界条件：
@@ -584,12 +585,17 @@ def build_stock_concepts_from_named_files(
     边界条件：
     1. zip 缺少成员时该来源为空，其它来源仍参与。
     2. `spblock.dat` 中码表没有名称的代码整段不纳入；有名称的代码才合并。
-    3. 同板块代码使用目录全称。同名板块只保留一个名称，成分取并集。
+    3. 同板块代码使用目录全称；仅同分类同名合并，不跨分类取并集。
     4. 研究行业只收五位 X 码对应的中类。
-    5. 可发布股票集合相同的板块只保留名称最长的一个。
+    5. 同分类内可发布股票集合相同的板块只保留名称最长的一个。
     """
     return build_stock_concept_payload(
-        prepare_concept_blocks(block_raw, hy_raw, zip_raw, code_name),
+        prepare_concept_blocks(
+            block_raw,
+            hy_raw,
+            zip_raw,
+            code_name,
+        ),
         code_name,
     )
 
@@ -605,8 +611,8 @@ def build_stock_concept_payload(
     1. blocks: 概念板块与基础行业板块。
     2. code_name: `get_stock_code_name` 的 `前缀代码 -> 股票名称`。
     输出：
-    1. names: 有有效成分代码的板块名，去重后按字排序。
-    2. map: 股票名称 -> 所属板块名列表；列表去重且按字排序。
+    1. names: 有有效成分代码的（中文分类名称，板块名称），去重后按字排序。
+    2. map: 股票名称 -> 所属板块二元组列表；列表去重且按字排序。
     用途：
     1. 把「板块 -> 股票代码」收成「股票名称 -> 板块名」。
     边界条件：
@@ -614,8 +620,8 @@ def build_stock_concept_payload(
     2. 多个代码对应同一股票名时，板块名取并集。
     3. 不写文件。
     """
-    names: List[str] = []
-    code_to_blocks: Dict[Tuple[int, str], List[str]] = {}
+    names: List[BlockIdentity] = []
+    code_to_blocks: Dict[Tuple[int, str], List[BlockIdentity]] = {}
     for block in blocks:
         name = str(block.get("name") or "").strip()
         if not name:
@@ -634,11 +640,12 @@ def build_stock_concept_payload(
             codes.append((market_id, code_text))
         if not codes:
             continue
-        names.append(name)
+        identity = block_identity(str(block.get("kind") or ""), name)
+        names.append(identity)
         for market_id, code_text in codes:
-            code_to_blocks.setdefault((market_id, code_text), []).append(name)
+            code_to_blocks.setdefault((market_id, code_text), []).append(identity)
 
-    name_map: Dict[str, List[str]] = {}
+    name_map: Dict[str, List[BlockIdentity]] = {}
     for (market_id, code_text), block_names in code_to_blocks.items():
         prefixed = _prefixed_stock_code(market_id, code_text)
         stock_name = str(code_name.get(prefixed) or "").strip()

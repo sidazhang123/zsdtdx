@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import math
+import hashlib
 import os
 import pickle
 import tempfile
@@ -46,6 +47,24 @@ def block_file_cache_path(cache_dir: Optional[Path] = None) -> Optional[Path]:
     if directory is None:
         return None
     return Path(directory) / _CACHE_FILENAME
+
+
+def block_file_cache_token(cache_dir):
+    """以轻量文件元数据识别其它客户端的刷新/删除，不在热路径反序列化原文。"""
+    if cache_dir is None:
+        return None
+    try:
+        stat = block_file_cache_path(cache_dir).stat()
+        return stat.st_mtime_ns, stat.st_size, stat.st_ino
+    except OSError:
+        return None
+
+
+def block_files_hashes(files):
+    """每次接受新的原始快照时计算一次，用于衍生缓存的来源校验。"""
+    return {
+        name: hashlib.sha256(files[name]).hexdigest() for name in REQUIRED_BLOCK_FILES
+    }
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:

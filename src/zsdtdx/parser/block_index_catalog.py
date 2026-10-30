@@ -2,165 +2,142 @@
 模块：`parser/block_index_catalog.py`。
 
 职责：
-1. 从 `zhb.zip` 内的 `tdxzs.cfg` / `tdxzs3.cfg` 选出「全部板块」指数目录。
-2. 给出板块名称列表，以及名称到指数代码的内部映射。
+1. 从三份命名文件建立概念、风格、指数成分、基础行业、研究中类、补充成分目录。
+2. 按（中文分类名称，板块名称）解析 K 线路由。
 
 边界：
-1. 不访问网络，不读写缓存。
-2. `infoharbor_block.dat` 与 `tdxhy.cfg` 必须随三份文件一起存在且非空，本模块不解析其成分。
-3. 只收录概念、非统计风格、地区、研究行业中类；通达信 T 行业与统计风格不进入。
-4. 同名只保留排序靠前的一条，保证名称可唯一反查代码。
+1. 不访问网络，不读写缓存；空成分、无代码板块仍进入目录。
+2. 同分类同名仅保留一项；不同代码冲突或缺少代码时不猜测路由。
+3. 不纳入地区分类；风格不再过滤统计板块。
 """
 
-from __future__ import annotations
-
+from collections import defaultdict
 import re
-from typing import Dict, List, Sequence
+from typing import Dict, Sequence
 
-from zsdtdx.params import TDXParams
-from zsdtdx.parser.infoharbor_block import read_zip_entry
-
-# 板块指数代码。
-_BLOCK_CODE = re.compile(r"^88\d{4}$")
-# tdxzs.cfg 分类：3 地区，4 概念，5 风格。
-_KIND_BY_TDXZS = {"4": "GN", "5": "FG", "3": "DQ"}
-_KIND_ORDER = {"GN": 0, "FG": 1, "DQ": 2, "HY": 3}
-# 研究行业中类：tdxzs3 分类 12，且行业码长度为 5（如 X4006）。
-_RESEARCH_KIND = "12"
-_RESEARCH_CODE_LEN = 5
-# 「全部板块」不展示的统计风格：名称前缀，或固定全名。
-_STATISTIC_STYLE_PREFIXES = ("昨", "历史", "最近")
-_STATISTIC_STYLE_NAMES = frozenset({"轮动趋势", "板块趋势", "通达信热股", "通达信热"})
-
-REQUIRED_BLOCK_FILES = (
-    "infoharbor_block.dat",
-    "tdxhy.cfg",
-    "zhb.zip",
+from zsdtdx.block_identity import BLOCK_KIND_NAMES, block_identity
+from zsdtdx.parser.infoharbor_block import (
+    catalog_full_names,
+    parse_infoharbor_block,
+    parse_research_industry_blocks,
+    parse_spblock,
+    parse_tdx_industry_blocks,
+    read_zip_entry,
 )
 
-
-def _decode_gbk(raw: bytes) -> str:
-    """
-    输入字节，输出 GBK 文本。
-
-    输入：raw 为文件原文。
-    输出：文本；空输入为空串。
-    用途：板块配置为 GBK。
-    边界条件：非法字节丢弃，不抛异常。
-    """
-    if not raw:
-        return ""
-    return bytes(raw).decode("gbk", "ignore")
+_BLOCK_CODE = re.compile(r"^88\d{4}$")
+REQUIRED_BLOCK_FILES = ("infoharbor_block.dat", "tdxhy.cfg", "zhb.zip")
 
 
-def _is_statistic_style(name: str) -> bool:
-    """
-    输入风格板块名，输出是否为「全部板块」不展示的统计板。
-
-    输入：name 为 tdxzs 名称。
-    输出：True 表示昨日涨停、历史新高等统计板。
-    用途：风格分类共 158 个，其中约 27 个不进入 560 名单。
-    边界条件：空名称视为统计板，不收录。
-    """
-    text = str(name or "").strip()
-    if text == "":
-        return True
-    if text in _STATISTIC_STYLE_NAMES:
-        return True
-    return text.startswith(_STATISTIC_STYLE_PREFIXES)
-
-
-def _pipe_rows(raw: bytes) -> List[List[str]]:
-    """
-    输入竖线分隔原文，输出字段行。
-
-    输入：raw 为 cfg 字节。
-    输出：每行至少 6 列且代码为 88xxxx 的字段列表。
-    用途：解析 tdxzs.cfg / tdxzs3.cfg。
-    边界条件：空文件返回 []；代码不是 88xxxx 的行丢弃。
-    """
-    rows: List[List[str]] = []
-    for line in _decode_gbk(raw).splitlines():
+def _pipe_rows(raw: bytes):
+    """输出目录中至少六字段且代码为88开头的行。"""
+    rows = []
+    for line in raw.decode("gbk", "ignore").splitlines():
         parts = [part.strip() for part in line.split("|")]
-        if len(parts) < 6 or _BLOCK_CODE.fullmatch(parts[1] or "") is None:
-            continue
-        rows.append(parts)
+        if len(parts) >= 6 and _BLOCK_CODE.fullmatch(parts[1]):
+            rows.append(parts)
     return rows
 
 
 class BlockIndexCatalog:
-    """
-    板块指数目录。
-
-    输入：由 `parse_block_index_catalog` 构造。
-    输出：`names` 为名称列表；`by_name` 为名称到代码记录。
-    用途：`get_block_names` 读 names；K 线按名称取 code/market。
-    边界条件：names 与 by_name 一一对应，不含重复名称。
-    """
+    """六类板块目录；names 与 by_name 均以中文分类和名称的二元组为键。"""
 
     def __init__(self, records: Sequence[dict]):
-        """
-        输入：records 为已排序且名称唯一的记录。
-        输出：无。
-        用途：冻结目录。
-        边界条件：跳过空名称。
-        """
-        names: List[str] = []
-        by_name: Dict[str, dict] = {}
+        self.names = []
+        self.by_name = {}
+        candidates = defaultdict(set)
+        members = defaultdict(set)
+        ambiguous = set()
         for record in records:
-            name = str(record.get("name") or "").strip()
-            if name == "" or name in by_name:
-                continue
-            item = {
-                "name": name,
-                "code": str(record.get("code") or "").strip(),
-                "market": int(record.get("market", 1)),
-                "kind": str(record.get("kind") or "").strip(),
-            }
-            names.append(name)
-            by_name[name] = item
-        self.names = names
-        self.by_name = by_name
+            kind = record["kind"]
+            identity = block_identity(kind, record["name"])
+            if record.get("empty_reason") == "ambiguous_code":
+                ambiguous.add(identity)
+            if identity not in self.by_name:
+                self.names.append(identity)
+                self.by_name[identity] = {
+                    "name": identity[1],
+                    "identity": identity,
+                    "kind": kind,
+                    "code": "",
+                    "market": 1,
+                    "concept_order": None,
+                }
+            source_order = record.get("concept_order")
+            previous_order = self.by_name[identity]["concept_order"]
+            if source_order is not None and (
+                previous_order is None or source_order < previous_order
+            ):
+                self.by_name[identity]["concept_order"] = source_order
+            members[identity].update(tuple(pair) for pair in record.get("members", []))
+            if record.get("code"):
+                candidates[identity].add(str(record["code"]))
+        for identity, record in self.by_name.items():
+            codes = sorted(candidates[identity])
+            if identity in ambiguous:
+                codes = []
+            record["code"] = codes[0] if len(codes) == 1 else ""
+            record["members"] = sorted(members[identity])
+            record["empty_reason"] = (
+                ""
+                if len(codes) == 1
+                else "ambiguous_code"
+                if codes or identity in ambiguous
+                else "no_code"
+            )
 
 
 def parse_block_index_catalog(files: Dict[str, bytes]) -> BlockIndexCatalog:
-    """
-    输入三份板块文件，输出「全部板块」指数目录。
-
-    输入：
-    1. files: 键为 infoharbor_block.dat、tdxhy.cfg、zhb.zip 的原文字典。
-    输出：
-    1. BlockIndexCatalog。名称按种类（概念、风格、地区、研究行业）再按代码排序。
-    用途：
-    1. 从 zhb.zip 的两张表选出可请求 K 线的板块指数。
-    边界条件：
-    1. 任一文件缺失或为空时抛 ValueError。
-    2. zip 中缺少 tdxzs.cfg 或 tdxzs3.cfg 时抛 ValueError。
-    3. 板块指数 market 固定为 1。
-    """
-    payload = dict(files or {})
+    """输入三件套，输出全部六类目录；目录不要求成分非空或具备K线代码。"""
     for name in REQUIRED_BLOCK_FILES:
-        if not payload.get(name):
+        if not files.get(name):
             raise ValueError(f"板块文件为空: {name}")
-    zs_raw = read_zip_entry(payload["zhb.zip"], TDXParams.TDXZS_ZIP_MEMBER)
-    zs3_raw = read_zip_entry(payload["zhb.zip"], TDXParams.TDXZS3_ZIP_MEMBER)
-    if not zs_raw or not zs3_raw:
-        raise ValueError(
-            f"zhb.zip 缺少 {TDXParams.TDXZS_ZIP_MEMBER} 或 {TDXParams.TDXZS3_ZIP_MEMBER}"
+    zs = read_zip_entry(files["zhb.zip"], "tdxzs.cfg")
+    zs3 = read_zip_entry(files["zhb.zip"], "tdxzs3.cfg")
+    if not zs or not zs3:
+        raise ValueError("zhb.zip 缺少 tdxzs.cfg 或 tdxzs3.cfg")
+    full_names = catalog_full_names(zs, zs3)
+    # 补充成分与无代码标题，只在目录名称唯一对应代码时关联。
+    name_codes = defaultdict(set)
+    for code, name in full_names.items():
+        name_codes[name].add(code)
+    selected = []
+    typed_name_codes = defaultdict(set)
+    for row in _pipe_rows(zs):
+        kind = {"4": "GN", "5": "FG", "2": "HY"}.get(row[2])
+        if kind == "HY" and re.fullmatch(r"T\d+", row[5]) is None:
+            continue
+        if kind and row[0]:
+            selected.append({"name": row[0], "code": row[1], "kind": kind})
+            typed_name_codes[(kind, row[0])].add(row[1])
+    for row in _pipe_rows(zs3):
+        if row[2] == "12" and re.fullmatch(r"X\d{4}", row[5]) and row[0]:
+            selected.append({"name": row[0], "code": row[1], "kind": "RS"})
+            typed_name_codes[("RS", row[0])].add(row[1])
+    blocks = parse_infoharbor_block(files["infoharbor_block.dat"])
+    blocks += parse_tdx_industry_blocks(files["tdxhy.cfg"], zs)
+    blocks += parse_research_industry_blocks(files["tdxhy.cfg"], zs3)
+    blocks += parse_spblock(read_zip_entry(files["zhb.zip"], "spblock.dat"))
+    for source_order, block in enumerate(blocks):
+        kind = block["kind"]
+        if kind not in BLOCK_KIND_NAMES:
+            continue
+        code = block["block_code"]
+        name = full_names.get(code, block["name"])
+        candidates = (
+            name_codes[name] if kind == "SP" else typed_name_codes[(kind, name)]
         )
-
-    selected: List[dict] = []
-    for parts in _pipe_rows(zs_raw):
-        kind = _KIND_BY_TDXZS.get(parts[2], "")
-        if kind == "":
-            continue
-        name = parts[0]
-        if kind == "FG" and _is_statistic_style(name):
-            continue
-        selected.append({"name": name, "code": parts[1], "market": 1, "kind": kind})
-    for parts in _pipe_rows(zs3_raw):
-        if parts[2] != _RESEARCH_KIND or len(parts[5]) != _RESEARCH_CODE_LEN:
-            continue
-        selected.append({"name": parts[0], "code": parts[1], "market": 1, "kind": "HY"})
-    selected.sort(key=lambda item: (_KIND_ORDER.get(item["kind"], 9), item["code"]))
+        if not code and len(candidates) == 1:
+            code = next(iter(candidates))
+        selected.append(
+            {
+                "name": name,
+                "code": code,
+                "kind": kind,
+                "members": block["codes"],
+                "concept_order": source_order,
+            }
+        )
+    order = {kind: index for index, kind in enumerate(BLOCK_KIND_NAMES)}
+    selected.sort(key=lambda r: (order[r["kind"]], r.get("code") or "~", r["name"]))
     return BlockIndexCatalog(selected)

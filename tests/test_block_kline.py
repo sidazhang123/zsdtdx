@@ -101,14 +101,21 @@ def _files() -> dict:
 
 
 def test_block_catalog_keeps_all_board_subset():
-    """输入最小三文件。输出概念、风格、地区、研究中类，并去掉统计风格和 T 行业。"""
+    """输入最小三文件。输出带分类身份的目录，纳入统计风格和 T 行业，研究行业仅收中类。"""
     catalog = parse_block_index_catalog(_files())
-    assert catalog.names == ["汽车拆解", "高分红股", "黑龙江", "精细化工"]
-    assert catalog.by_name["汽车拆解"]["code"] == "880744"
-    assert catalog.by_name["汽车拆解"]["market"] == 1
-    assert "昨日涨停" not in catalog.by_name
-    assert "煤炭" not in catalog.by_name
-    assert "煤炭开采" not in catalog.by_name
+    assert catalog.names == [
+        ("概念", "汽车拆解"),
+        ("风格", "轮动趋势"),
+        ("风格", "高分红股"),
+        ("风格", "昨日涨停"),
+        ("通达信基础行业", "煤炭"),
+        ("研究行业中类", "精细化工"),
+    ]
+    assert catalog.by_name[("概念", "汽车拆解")]["code"] == "880744"
+    assert catalog.by_name[("概念", "汽车拆解")]["market"] == 1
+    assert ("风格", "昨日涨停") in catalog.by_name
+    assert ("通达信基础行业", "煤炭") in catalog.by_name
+    assert ("研究行业中类", "煤炭开采") not in catalog.by_name
 
 
 def test_block_file_cache_expires_at_six_hours(tmp_path):
@@ -142,6 +149,7 @@ def _block_cache_client(tmp_path):
     client._catalog_cache_enabled = True
     client._catalog_cache_dir = tmp_path
     client._record_failure = lambda *args: None
+    client.get_stock_code_name_map = lambda: {"sz.000001": "平安银行"}
     return client
 
 
@@ -158,7 +166,7 @@ def test_semantically_broken_block_cache_is_rebuilt(tmp_path):
 
     client._download_block_named_files = download
     names = client.get_block_names()
-    assert "汽车拆解" in names
+    assert ("概念", "汽车拆解") in names
     assert downloads == [1]
     loaded = load_fresh_block_files(cache_dir=tmp_path)
     assert loaded is not None
@@ -260,14 +268,14 @@ def test_block_payload_uses_block_name_without_code():
     payload = _build_symbol_kline_payload(
         "block_name",
         task={
-            "block_name": "汽车拆解",
+            "block_name": ("概念", "汽车拆解"),
             "freq": "d",
             "start_time": "2026-09-01 09:30:00",
             "end_time": "2026-09-29 16:00:00",
         },
         rows=[
             {
-                "block_name": "汽车拆解",
+                "block_name": ("概念", "汽车拆解"),
                 "freq": "d",
                 "open": 1.0,
                 "close": 2.0,
@@ -279,13 +287,13 @@ def test_block_payload_uses_block_name_without_code():
             }
         ],
     )
-    assert payload["task"]["block_name"] == "汽车拆解"
+    assert payload["task"]["block_name"] == ("概念", "汽车拆解")
     assert "index_name" not in payload["task"]
     assert "code" not in payload["rows"][0]
-    assert payload["rows"][0]["block_name"] == "汽车拆解"
+    assert payload["rows"][0]["block_name"] == ("概念", "汽车拆解")
     kept = _normalize_block_task_payload(
         {
-            "block_name": "汽车拆解",
+            "block_name": ("概念", "汽车拆解"),
             "freq": "d",
             "start_time": "2026-09-01 09:30:00",
             "end_time": "2026-09-29 16:00:00",
@@ -295,7 +303,7 @@ def test_block_payload_uses_block_name_without_code():
             "_index_route_name": "汽车拆解",
         }
     )
-    assert kept["block_name"] == "汽车拆解"
+    assert kept["block_name"] == ("概念", "汽车拆解")
     assert "index_name" not in kept
     assert kept["_index_route_code"] == "880744"
 
@@ -314,11 +322,18 @@ def test_get_block_kline_attaches_internal_route(monkeypatch):
 
     class _Client:
         def resolve_block_index_route(self, block_name):
-            assert block_name == "汽车拆解"
+            assert block_name == ("概念", "汽车拆解")
             return {"name": block_name, "code": "880744", "market": 1, "kind": "GN"}
 
         def prepare_block_kline_tasks(self, tasks):
             return UnifiedTdxClient.prepare_block_kline_tasks(self, tasks)
+
+        def _load_block_index_catalog(self):
+            from zsdtdx.parser.block_index_catalog import BlockIndexCatalog
+
+            return BlockIndexCatalog(
+                [{"name": "汽车拆解", "kind": "GN", "code": "880744"}]
+            )
 
     monkeypatch.setattr(
         "zsdtdx.engine.parallel_fetcher.get_fetcher", lambda: _Fetcher()
@@ -333,7 +348,7 @@ def test_get_block_kline_attaches_internal_route(monkeypatch):
     result = get_block_kline(
         task=[
             {
-                "block_name": "汽车拆解",
+                "block_name": ("概念", "汽车拆解"),
                 "freq": "d",
                 "start_time": "2026-09-29",
                 "end_time": "2026-09-29",
@@ -343,7 +358,7 @@ def test_get_block_kline_attaches_internal_route(monkeypatch):
     )
     assert result == []
     task = captured["tasks"][0]
-    assert task["block_name"] == "汽车拆解"
+    assert task["block_name"] == ("概念", "汽车拆解")
     assert "index_name" not in task
     assert "_block_kline" not in task
     assert task["_index_route_code"] == "880744"

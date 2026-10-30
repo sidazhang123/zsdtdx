@@ -67,12 +67,12 @@ def test_block_and_index_task_symbol_fields():
         end_time="2026-02-13",
     ).to_dict()
     block_payload = BlockKlineTask(
-        block_name="汽车拆解",
+        block_name=("概念", "汽车拆解"),
         freq="d",
         start_time="2026-02-13",
         end_time="2026-02-13",
     ).to_dict()
     assert index_payload["index_name"] == "上证指数"
     assert "code" not in index_payload
-    assert block_payload["block_name"] == "汽车拆解"
+    assert block_payload["block_name"] == ("概念", "汽车拆解")
     assert "index_name" not in block_payload

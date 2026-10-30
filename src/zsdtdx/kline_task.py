@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, ClassVar, Dict
 
+from zsdtdx.block_identity import normalize_block_identity
+
 from zsdtdx.util.helper import (
     TASK_FREQ_MAP,
     normalize_task_time_window,
@@ -147,7 +149,7 @@ class BlockKlineTask(KlineTask):
     """
     板块指数 K 线任务。
 
-    输入：block_name、freq、start_time、end_time。
+    输入：block_name 为（中文分类名称，板块名称），以及 freq/start_time/end_time。
     输出：`to_dict()` 为标准化任务字典。
     用途：传给 get_block_kline；block_name 来自 get_block_names。
     边界条件：校验与时间补齐由 `KlineTask` 完成；不接受空 task 自动展开全部板块。
@@ -158,6 +160,20 @@ class BlockKlineTask(KlineTask):
     start_time: Any
     end_time: Any
     symbol_field: ClassVar[str] = "block_name"
+
+    def validate(self) -> None:
+        """分类和名称共同校验；周期与时间继续使用共同校验。"""
+        normalize_block_identity(self.block_name)
+        super().validate()
+        start, end = normalize_task_time_window(self.start_time, self.end_time)
+        if parse_task_datetime(start)[0] > parse_task_datetime(end)[0]:
+            raise ValueError("start_time 不能晚于 end_time")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """保留二元组，不将板块身份转为字符串；JSON二元素数组同样接受。"""
+        payload = super().to_dict()
+        payload["block_name"] = normalize_block_identity(self.block_name)
+        return payload
 
 
 __all__ = [

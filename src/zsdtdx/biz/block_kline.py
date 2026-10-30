@@ -2,7 +2,7 @@
 模块：`biz/block_kline.py`。
 
 职责：
-1. 把板块名称换成代码路由后，按板块任务交给抓取器。
+1. 把（中文分类名称，板块名称）换成代码路由后，按板块任务交给抓取器。
 
 边界：
 1. 任务类定义在包根 `kline_task.py`。
@@ -44,6 +44,7 @@ def fetch_block_kline(
     边界条件：
     1. task 为空或 mode 非法时抛 ValueError；未知板块名称由客户端抛错。
     2. async 总会带上队列，job.result() 只返回计数摘要，行情从队列消费。
+    3. 无代码板块与合法空行情返回空 rows、error=None，任务身份保持二元组。
     """
     mode_key = validate_kline_dispatch_args(
         queue=queue,

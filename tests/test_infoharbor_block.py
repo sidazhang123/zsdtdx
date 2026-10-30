@@ -83,10 +83,10 @@ def test_payload_matches_concept_pkl_shape():
     blocks = parse_infoharbor_block(_sample_raw())
     code_name = {"sz.000001": "平安银行", "sh.600000": "浦发银行"}
     payload = build_stock_concept_payload(blocks, code_name)
-    assert payload["names"] == ["芯片", "融资融券"]
+    assert payload["names"] == [("概念", "芯片"), ("风格", "融资融券")]
     assert payload["map"] == {
-        "平安银行": ["芯片", "融资融券"],
-        "浦发银行": ["芯片"],
+        "平安银行": [("概念", "芯片"), ("风格", "融资融券")],
+        "浦发银行": [("概念", "芯片")],
     }
 
 
@@ -99,7 +99,7 @@ def test_same_stock_name_unions_blocks():
     payload = build_stock_concept_payload(
         blocks, {"sz.000001": "藏格矿业", "sh.600000": "藏格矿业"}
     )
-    assert payload["map"]["藏格矿业"] == ["锂矿", "黄金概念"]
+    assert payload["map"]["藏格矿业"] == [("概念", "锂矿"), ("概念", "黄金概念")]
 
 
 def test_industry_blocks_join_t_code_and_skip_region():
@@ -144,10 +144,17 @@ def test_get_stock_concepts_merges_industry():
         TDXParams.TDXHY_REMOTE_FILE,
         TDXParams.ZHB_ZIP_REMOTE_FILE,
     ]
-    assert payload["map"]["平安银行"] == ["芯片", "融资融券"]
-    assert payload["map"]["浦发银行"] == ["煤炭开采", "芯片"]
-    assert payload["map"]["五洲特纸"] == ["造纸"]
-    assert "浙江板块" not in payload["names"]
+    assert payload["map"]["平安银行"] == [
+        ("概念", "芯片"),
+        ("通达信基础行业", "煤炭"),
+        ("风格", "融资融券"),
+    ]
+    assert payload["map"]["浦发银行"] == [
+        ("概念", "芯片"),
+        ("通达信基础行业", "煤炭开采"),
+    ]
+    assert payload["map"]["五洲特纸"] == [("通达信基础行业", "造纸")]
+    assert all(name[1] != "浙江板块" for name in payload["names"])
 
 
 def test_catalog_full_name_and_spblock_stock_members():
@@ -171,16 +178,19 @@ def test_catalog_full_name_and_spblock_stock_members():
         buf.getvalue(),
         {"sz.000001": "平安银行", "sz.000002": "万科Ａ", "sh.600000": "浦发银行"},
     )
-    assert "智能机器" not in payload["names"]
-    assert "深债ETF" not in payload["names"]
-    assert payload["map"]["平安银行"] == ["含可转债", "机器人概念"]
-    assert payload["map"]["浦发银行"] == ["含可转债"]
-    assert payload["map"]["万科Ａ"] == ["融资融券"]
+    assert all(name[1] not in {"智能机器", "深债ETF"} for name in payload["names"])
+    assert payload["map"]["平安银行"] == [
+        ("概念", "机器人概念"),
+        ("补充成分", "中证500"),
+        ("补充成分", "含可转债"),
+    ]
+    assert payload["map"]["浦发银行"] == [("补充成分", "含可转债")]
+    assert payload["map"]["万科Ａ"] == [("风格", "融资融券")]
     assert parse_spblock(b"") == []
 
 
-def test_same_name_unions_after_code_merge():
-    """输入同名的有代码板块和无代码板块。输出一个名称和成分并集。边界：重名目录不猜测代码。"""
+def test_same_name_keeps_categories_after_code_merge():
+    """同名基础行业与补充成分独立保留；重名目录不猜测补充成分代码。"""
     merged = merge_concept_blocks(
         [
             {
@@ -193,13 +203,14 @@ def test_same_name_unions_after_code_merge():
         ],
         {"880001": "甲", "881001": "甲"},
     )
-    assert len(merged) == 1
+    assert len(merged) == 2
     assert merged[0]["name"] == "甲"
-    assert merged[0]["codes"] == [(0, "000001"), (1, "600000")]
+    assert merged[0]["codes"] == [(0, "000001")]
+    assert merged[1]["codes"] == [(1, "600000")]
 
 
-def test_research_industry_unions_same_name():
-    """输入基础行业与研究行业中类。输出同名并集，大类不进入。边界：小类股票归入前五位中类。"""
+def test_research_industry_keeps_same_name_separate():
+    """基础行业与研究中类同名分别保留，大类不进入；小类股票归入前五位中类。"""
     hy = "0|000001|T1001|||X400401\n1|600000|T2001|||X5001\n".encode("gbk")
     zs = "元器件|880492|2|1|0|T1001\n"
     zs3 = (
@@ -217,10 +228,17 @@ def test_research_industry_unions_same_name():
         buf.getvalue(),
         {"sz.000001": "平安银行", "sh.600000": "浦发银行"},
     )
-    assert payload["names"] == ["元器件", "全国性银行"]
-    assert payload["map"]["平安银行"] == ["元器件"]
-    assert payload["map"]["浦发银行"] == ["全国性银行"]
-    assert "能源" not in payload["names"]
+    assert payload["names"] == [
+        ("研究行业中类", "元器件"),
+        ("研究行业中类", "全国性银行"),
+        ("通达信基础行业", "元器件"),
+    ]
+    assert payload["map"]["平安银行"] == [
+        ("研究行业中类", "元器件"),
+        ("通达信基础行业", "元器件"),
+    ]
+    assert payload["map"]["浦发银行"] == [("研究行业中类", "全国性银行")]
+    assert all(name[1] != "能源" for name in payload["names"])
     assert parse_research_industry_blocks(b"", b"") == []
 
 
@@ -238,9 +256,9 @@ def test_identical_constituents_keep_longest_name():
         b"",
         {"sz.000001": "平安银行", "sh.600000": "浦发银行"},
     )
-    assert payload["names"] == ["中成药"]
-    assert payload["map"]["平安银行"] == ["中成药"]
-    assert payload["map"]["浦发银行"] == ["中成药"]
+    assert payload["names"] == [("概念", "中成药")]
+    assert payload["map"]["平安银行"] == [("概念", "中成药")]
+    assert payload["map"]["浦发银行"] == [("概念", "中成药")]
 
 
 def test_get_stock_concepts_empty_download():

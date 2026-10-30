@@ -34,6 +34,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from zsdtdx.block_identity import normalize_block_identity
+
 from zsdtdx.util.company_info_state import (
     company_info_outcome,
     normalize_company_info_codes,
@@ -830,7 +832,11 @@ def _normalize_symbol_kline_task(
     """
     if not isinstance(task, dict):
         raise ValueError("task 必须是 dict")
-    symbol = str(task.get(symbol_field, "")).strip()
+    symbol = (
+        normalize_block_identity(task.get(symbol_field))
+        if symbol_field == "block_name"
+        else str(task.get(symbol_field, "")).strip()
+    )
     freq = str(task.get("freq", "")).strip().lower()
     start_time = str(task.get("start_time", "")).strip()
     end_time = str(task.get("end_time", "")).strip()
@@ -848,6 +854,8 @@ def _normalize_symbol_kline_task(
         "start_time": start_time,
         "end_time": end_time,
     }
+    if symbol_field == "block_name" and task.get("_block_no_kline"):
+        normalized["_block_no_kline"] = str(task["_block_no_kline"])
     route_source = str(task.get("_index_route_source", "")).strip().lower()
     route_code = str(task.get("_index_route_code", "")).strip()
     route_name = str(task.get("_index_route_name", "")).strip()
@@ -1004,7 +1012,11 @@ def _build_symbol_kline_payload(
     return {
         "event": "data",
         "task": {
-            symbol_field: str(task.get(symbol_field, "")),
+            symbol_field: (
+                normalize_block_identity(task.get(symbol_field))
+                if symbol_field == "block_name"
+                else str(task.get(symbol_field, ""))
+            ),
             "freq": str(task.get("freq", "")),
             "start_time": str(task.get("start_time", "")),
             "end_time": str(task.get("end_time", "")),
@@ -1793,6 +1805,14 @@ class ParallelKlineFetcher:
         from zsdtdx.engine.unified_client import _ensure_availability_hosts_cache
         from zsdtdx.parser.kline_columns import warmup_kline_decoders
 
+        if task_kind == "block":
+            routable = []
+            for task in tasks:
+                if task.get("_block_no_kline"):
+                    yield _build_symbol_kline_payload("block_name", task=task, rows=[])
+                else:
+                    routable.append(task)
+            tasks = routable
         if not tasks:
             return
         sources = {

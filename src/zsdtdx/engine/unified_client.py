@@ -31,12 +31,22 @@ from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple
 import pandas as pd
 import yaml
 
+from zsdtdx.block_identity import normalize_block_identity
+
 import zsdtdx.net.base_socket_client as _base_socket_client
 from zsdtdx.cache.block_file_cache import (
     BLOCK_FILE_TTL_SECONDS,
+    block_file_cache_token,
+    block_files_hashes,
     invalidate_block_files,
     load_fresh_block_files,
     save_block_files,
+)
+from zsdtdx.cache.block_catalog_cache import (
+    block_catalog_snapshot_matches,
+    build_block_catalog_snapshot,
+    load_block_catalog_snapshot,
+    save_block_catalog_snapshot,
 )
 from zsdtdx.cache.catalog_disk_cache import (
     KIND_ETF,
@@ -1894,7 +1904,7 @@ class UnifiedTdxClient:
     """统一行情高层客户端，封装市场路由、分页和连接池。"""
 
     # 板块三文件缓存的进程内互斥，避免名称与 K 线同时触发下载。
-    _block_catalog_lock = threading.Lock()
+    _block_catalog_lock = threading.RLock()
     # F10 路由建立与二次检查共用 single-flight；只读已发布路由不持锁。
     _company_info_route_lock = threading.Lock()
     # std/ex/ETF 冷启动的进程内 single-flight；跨进程由同目录 lockfile 兜底。
@@ -2279,7 +2289,11 @@ class UnifiedTdxClient:
         if not isinstance(task, dict):
             raise ValueError("task 必须是 dict")
         field = str(symbol_field or "index_name")
-        symbol = str(task.get(field, "")).strip()
+        symbol = (
+            normalize_block_identity(task.get(field))
+            if field == "block_name"
+            else str(task.get(field, "")).strip()
+        )
         freq = str(task.get("freq", "")).strip().lower()
         start_time = str(task.get("start_time", "")).strip()
         end_time = str(task.get("end_time", "")).strip()
@@ -2334,7 +2348,11 @@ class UnifiedTdxClient:
         include_code: bool = True,
     ) -> List[Dict[str, Any]]:
         """输入标准化任务和路由，输出指数或板块 K 线；板块路由失败时不改查指数目录。"""
-        symbol = str(normalized_task.get(symbol_field, "")).strip()
+        symbol = (
+            normalize_block_identity(normalized_task.get(symbol_field))
+            if symbol_field == "block_name"
+            else str(normalized_task.get(symbol_field, "")).strip()
+        )
         freq = str(normalized_task.get("freq", "")).strip().lower()
         start_dt = self._to_datetime_no_df(normalized_task.get("start_time"))
         end_dt = self._to_datetime_no_df(normalized_task.get("end_time"))
@@ -2399,7 +2417,9 @@ class UnifiedTdxClient:
 
         return self._normalize_index_kline_rows(
             rows=raw_rows,
-            index_name=str(resolved_route.get("name", symbol)),
+            index_name=symbol
+            if symbol_field == "block_name"
+            else str(resolved_route.get("name", symbol)),
             route_code=str(effective_route.get("code", "")),
             freq=freq,
             start_dt=start_dt,
@@ -2844,7 +2864,11 @@ class UnifiedTdxClient:
 
         n = len(rows)
         normalized_freq = self._normalize_freq(freq)
-        route_name = str(index_name).strip()
+        route_name = (
+            normalize_block_identity(index_name)
+            if name_field == "block_name"
+            else str(index_name).strip()
+        )
         route_code_text = str(route_code).strip()
 
         timestamps = np.empty(n, dtype=np.int64)
@@ -3499,13 +3523,18 @@ class UnifiedTdxClient:
         用途：复用指数分页，请求命令为 get_block_bars。
         边界条件：任务缺少路由时抛 ValueError，不走指数名称目录。
         """
-        return self.get_index_kline_rows_for_chunk_tasks(
+        result = self.get_index_kline_rows_for_chunk_tasks(
             tasks,
             enable_cache,
             symbol_field="block_name",
             bars_api="get_block_bars",
             include_code=False,
         )
+        # 合法空页/区间无行情不是任务失败；网络和解析异常仍保留原错误。
+        for item in result["results"]:
+            if item.get("error") == "no_data":
+                item["error"] = None
+        return result
 
     def get_index_kline_rows_for_chunk_tasks(
         self,
@@ -3542,11 +3571,11 @@ class UnifiedTdxClient:
                 )
             )
 
-        base_symbol = str(normalized_tasks[0][symbol_field]).strip()
+        base_symbol = normalized_tasks[0][symbol_field]
         base_freq = str(normalized_tasks[0]["freq"]).strip()
         for task in normalized_tasks[1:]:
             if (
-                str(task[symbol_field]).strip() != base_symbol
+                task[symbol_field] != base_symbol
                 or str(task["freq"]).strip() != base_freq
             ):
                 raise ValueError(f"chunk 任务必须属于同一 {symbol_field}+freq")
@@ -3615,7 +3644,11 @@ class UnifiedTdxClient:
         category = self._freq_to_category(base_freq)
         source = str(route.get("source", "std")).strip().lower()
         route_code = str(route.get("code", "")).strip()
-        route_name = str(route.get("name", base_symbol)).strip() or base_symbol
+        route_name = (
+            base_symbol
+            if symbol_field == "block_name"
+            else str(route.get("name", base_symbol)).strip() or base_symbol
+        )
         page_size = self._kline_page_size(source)
         max_pages = int(_DEFAULT_MAX_KLINE_PAGES)
 
@@ -5064,9 +5097,12 @@ class UnifiedTdxClient:
         files: Dict[str, bytes] = {}
         for name in REQUIRED_BLOCK_FILES:
             raw = self._download_named_hq_file(name)
+            files[name] = bytes(raw or b"")
+        # 仅供股票归属在源端缺文件时给出未落盘的部分结果。
+        self._block_partial_named_files = files
+        for name, raw in files.items():
             if not raw:
                 raise ValueError(f"板块文件下载失败: {name}")
-            files[name] = bytes(raw)
         return files
 
     def _block_file_cache_dir(self) -> Optional[Path]:
@@ -5100,6 +5136,7 @@ class UnifiedTdxClient:
         """读取并语义校验板块快照；畸形快照会失效删除。"""
         if cache_dir is None:
             return None
+        token = block_file_cache_token(cache_dir)
         fresh = load_fresh_block_files(cache_dir=cache_dir)
         if fresh is None:
             return None
@@ -5112,7 +5149,18 @@ class UnifiedTdxClient:
                 self._record_block_cache_failure("invalidate_failed", unlink_exc)
             self._record_block_cache_failure("semantic_invalid", exc)
             return None
+        if token != block_file_cache_token(cache_dir):
+            return None
+        fresh["disk_token"] = token
         return fresh
+
+    def _remember_block_named_files(self, snapshot):
+        """接受已验证原文并记录来源指纹；热路径无需反复解析完整目录。"""
+        snapshot["source_hashes"] = block_files_hashes(snapshot["files"])
+        self._block_named_files_snapshot = snapshot
+        self._block_named_files_disk_token = snapshot["disk_token"]
+        self._block_validated_source = snapshot
+        return snapshot
 
     def _fresh_memory_block_files_snapshot(self) -> Optional[Dict[str, object]]:
         """输出进程内未过期板块快照；时间异常或内容损坏时主动丢弃。"""
@@ -5128,13 +5176,23 @@ class UnifiedTdxClient:
                 or not math.isfinite(age)
                 or age < 0
                 or age >= BLOCK_FILE_TTL_SECONDS
+                or block_file_cache_token(self._block_file_cache_dir())
+                != getattr(self, "_block_named_files_disk_token", None)
             ):
                 raise ValueError("板块内存快照已过期或时间戳非法")
-            self._validate_block_named_files(files)
+            if any(
+                not isinstance(files.get(name), bytes) or not files[name]
+                for name in REQUIRED_BLOCK_FILES
+            ):
+                raise ValueError("板块内存原文不完整")
+            if snapshot is not getattr(self, "_block_validated_source", None):
+                self._validate_block_named_files(files)
+                snapshot["source_hashes"] = block_files_hashes(files)
+                self._block_validated_source = snapshot
         except Exception:
             self._block_named_files_snapshot = None
             return None
-        return {"fetched_at": fetched_at, "files": files}
+        return snapshot
 
     def _ensure_block_named_files_snapshot(self) -> Dict[str, object]:
         """命中有效板块快照；缺失时 single-flight 下载、校验并尽力写盘。"""
@@ -5145,8 +5203,7 @@ class UnifiedTdxClient:
                 return memory
             fresh = self._try_load_valid_block_files(cache_dir)
             if fresh is not None:
-                self._block_named_files_snapshot = fresh
-                return fresh
+                return self._remember_block_named_files(fresh)
             disk_guard = (
                 cache_refresh_lock(cache_dir, "block")
                 if cache_dir is not None
@@ -5155,8 +5212,7 @@ class UnifiedTdxClient:
             with disk_guard:
                 fresh = self._try_load_valid_block_files(cache_dir)
                 if fresh is not None:
-                    self._block_named_files_snapshot = fresh
-                    return fresh
+                    return self._remember_block_named_files(fresh)
                 files = self._download_block_named_files()
                 self._validate_block_named_files(files)
                 stamp = time.time()
@@ -5165,9 +5221,12 @@ class UnifiedTdxClient:
                         stamp = save_block_files(files, cache_dir=cache_dir)
                     except Exception as exc:
                         self._record_block_cache_failure("write_failed", exc)
-                snapshot = {"fetched_at": stamp, "files": files}
-                self._block_named_files_snapshot = snapshot
-                return snapshot
+                snapshot = {
+                    "fetched_at": stamp,
+                    "files": files,
+                    "disk_token": block_file_cache_token(cache_dir),
+                }
+                return self._remember_block_named_files(snapshot)
 
     def get_block_named_files(self) -> Dict[str, bytes]:
         """
@@ -5184,51 +5243,115 @@ class UnifiedTdxClient:
         输入无，输出板块指数目录。
 
         输入：无。
-        输出：6 小时内有效的 BlockIndexCatalog。
+        输出：原始文件有效期内的完整映射派生的 BlockIndexCatalog。
         用途：名称列表与 K 线名称解析共用。
         边界条件：
-        1. 缓存未过期则不下载。
-        2. 过期或损坏时重新下载三份文件并覆盖缓存。
+        1. 优先复用有效原文和映射，不重复下载。
+        2. 原始文件过期先刷新再建图；来源更新或映射损坏也会重建。
         3. 下载或解析失败时抛 ValueError，不使用过期缓存。
         """
-        snapshot = self._ensure_block_named_files_snapshot()
+        snapshot = self._ensure_block_catalog_snapshot()
         cached = getattr(self, "_block_index_catalog", None)
-        cached_at = getattr(self, "_block_index_catalog_at", None)
-        if (
-            isinstance(cached, BlockIndexCatalog)
-            and cached_at == snapshot["fetched_at"]
-        ):
+        cached_snapshot = getattr(self, "_block_index_catalog_snapshot", None)
+        if isinstance(cached, BlockIndexCatalog) and cached_snapshot is snapshot:
             return cached
-        catalog = parse_block_index_catalog(snapshot["files"])
+        catalog = BlockIndexCatalog(snapshot["records"])
         if not catalog.names:
             raise ValueError("板块目录为空")
         self._block_index_catalog = catalog
-        self._block_index_catalog_at = snapshot["fetched_at"]
+        self._block_index_catalog_snapshot = snapshot
         return catalog
 
-    def get_block_names(self) -> List[str]:
+    def _ensure_block_catalog_snapshot(self) -> Dict[str, Any]:
+        """映射跟随原始三文件的6小时生命周期；源过期先刷新，源变化即重建。"""
+        name_scope = json.dumps(getattr(self, "stock_scope_cfg", {}), sort_keys=True)
+        with self._block_catalog_lock:
+            self._block_pending_code_name = None
+            self._block_partial_named_files = {}
+            # 即使映射刚生成，也必须先确认它依赖的原始快照仍有效。
+            source = self._ensure_block_named_files_snapshot()
+            expected = {
+                "name_scope": name_scope,
+                "source_fetched_at": source["fetched_at"],
+                "source_hashes": source["source_hashes"],
+            }
+            memory = getattr(self, "_block_catalog_snapshot", None)
+            if block_catalog_snapshot_matches(memory, **expected):
+                return memory
+            cache_dir = self._block_file_cache_dir()
+            guard = (
+                cache_refresh_lock(cache_dir, "block_catalog")
+                if cache_dir is not None
+                else nullcontext()
+            )
+            with guard:
+                # 等待跨进程锁期间源文件可能已由股票统计等其它调用刷新。
+                source = self._ensure_block_named_files_snapshot()
+                expected = {
+                    "name_scope": name_scope,
+                    "source_fetched_at": source["fetched_at"],
+                    "source_hashes": source["source_hashes"],
+                }
+                snapshot = (
+                    load_block_catalog_snapshot(cache_dir, **expected)
+                    if cache_dir is not None
+                    else None
+                )
+                if snapshot is not None and not block_catalog_snapshot_matches(
+                    snapshot, **expected
+                ):
+                    snapshot = None
+                if snapshot is None:
+                    code_name = self.get_stock_code_name_map()
+                    self._block_pending_code_name = code_name
+                    for _ in range(2):
+                        source = self._ensure_block_named_files_snapshot()
+                        self._block_partial_named_files = source["files"]
+                        snapshot = build_block_catalog_snapshot(
+                            source["files"],
+                            code_name,
+                            name_scope=name_scope,
+                            source_fetched_at=source["fetched_at"],
+                        )
+                        if block_catalog_snapshot_matches(
+                            snapshot, name_scope=name_scope
+                        ):
+                            break
+                    else:
+                        raise ValueError("原始板块文件在建图期间过期，未生成有效映射")
+                    if cache_dir is not None:
+                        try:
+                            save_block_catalog_snapshot(snapshot, cache_dir)
+                        except OSError as exc:
+                            self._record_block_cache_failure(
+                                "derived_write_failed", exc
+                            )
+                self._block_catalog_snapshot = snapshot
+                self._block_pending_code_name = None
+                self._block_partial_named_files = {}
+                return snapshot
+
+    def get_block_names(self) -> List[Tuple[str, str]]:
         """
         输入无，输出「全部板块」名称列表。
 
-        输入：无。三份命名文件走 6 小时缓存。
-        输出：板块名称列表，不含指数代码。
+        输入：无。与股票归属及K线共用6小时完整映射缓存。
+        输出：六类（中文分类名称，板块名称）二元组列表，不含指数代码。
         用途：供 get_block_kline 的 block_name 使用。
         边界条件：缓存过期时重新下载；目录为空时抛 ValueError。
         """
         return list(self._load_block_index_catalog().names)
 
-    def resolve_block_index_route(self, block_name: str) -> Dict[str, Any]:
+    def resolve_block_index_route(self, block_name: Any) -> Dict[str, Any]:
         """
         输入板块名称，输出内部指数路由。
 
-        输入：block_name 为 get_block_names 返回的名称。
+        输入：block_name 为 get_block_names 返回的分类和名称二元组。
         输出：`{name, code, market, kind}`。
         用途：K 线请求前把名称换成 88xxxx。
         边界条件：名称不在目录中时抛 ValueError。
         """
-        name = str(block_name or "").strip()
-        if name == "":
-            raise ValueError("板块名称不能为空")
+        name = normalize_block_identity(block_name)
         record = self._load_block_index_catalog().by_name.get(name)
         if record is None:
             raise ValueError(f"未知板块: {name}")
@@ -5312,10 +5435,14 @@ class UnifiedTdxClient:
         用途：上下文客户端把名称换成 88xxxx，任务主键保持 block_name。
         边界条件：名称不在目录中时抛 ValueError。
         """
+        # 整批任务固定同一目录，避免每个名称都重复验证、解析三份文件。
+        catalog = self._load_block_index_catalog()
         routed: List[Dict[str, Any]] = []
         for task_item in list(tasks or []):
-            block_name = str(task_item.get("block_name") or "").strip()
-            route = self.resolve_block_index_route(block_name)
+            block_name = normalize_block_identity(task_item.get("block_name"))
+            route = catalog.by_name.get(block_name)
+            if route is None:
+                raise ValueError(f"未知板块: {block_name}")
             routed.append(
                 {
                     "block_name": block_name,
@@ -5326,6 +5453,9 @@ class UnifiedTdxClient:
                     "_index_route_market": int(route["market"]),
                     "_index_route_code": str(route["code"]),
                     "_index_route_name": block_name,
+                    "_block_no_kline": route.get("empty_reason", "")
+                    if not route["code"]
+                    else "",
                 }
             )
         return routed
@@ -5344,28 +5474,34 @@ class UnifiedTdxClient:
         边界条件：
         1. 码表内存或磁盘不是当日、或不存在时，走自动缓存流程下载更新。
         2. 某一份远程文件失败时，其余成功的部分仍然返回。
-        3. 全部失败时返回空 names 与空 map。不落盘 pkl。
-        4. 有板块代码时名称用目录全称。同名板块只保留一个名称，成分取并集。
+        3. 完整目录、股票码名与归属写入共享6小时缓存；部分结果不落盘，全部失败返回空结构。
+        4. 有板块代码时名称用目录全称；同分类同名成分取并集，不跨分类合并。
         5. spblock 里没有当日股票名称的段不进入结果。
-        6. 可发布股票集合相同的板块只保留名称最长的一个；长度相同则保留字典序较后的名称。
+        6. 同分类内相同股票成分只保留最长名称；不同分类保持独立。
         """
-        code_name = self.get_stock_code_name_map()
-        cache_dir = self._block_file_cache_dir()
-        with self._block_catalog_lock:
-            fresh = self._try_load_valid_block_files(cache_dir)
-        files = dict(fresh["files"]) if fresh is not None else {}
-        block_raw = files.get(TDXParams.INFOHARBOR_BLOCK_REMOTE_FILE) or (
-            self._download_named_hq_file(TDXParams.INFOHARBOR_BLOCK_REMOTE_FILE)
-        )
-        hy_raw = files.get(TDXParams.TDXHY_REMOTE_FILE) or (
-            self._download_named_hq_file(TDXParams.TDXHY_REMOTE_FILE)
-        )
-        zip_raw = files.get(TDXParams.ZHB_ZIP_REMOTE_FILE) or (
-            self._download_named_hq_file(TDXParams.ZHB_ZIP_REMOTE_FILE)
-        )
-        return build_stock_concepts_from_named_files(
-            block_raw, hy_raw, zip_raw, code_name
-        )
+        try:
+            snapshot = self._ensure_block_catalog_snapshot()
+            payload = snapshot["stock_concepts"]
+            # 二元组叶子不可变，只复制会被调用方修改的容器。
+            return {
+                "names": list(payload["names"]),
+                "map": {name: list(blocks) for name, blocks in payload["map"].items()},
+            }
+        except ValueError:
+            # 保留旧有的部分归属容错，但不把不完整结果写成有效缓存。
+            files = getattr(self, "_block_partial_named_files", {})
+            pending = getattr(self, "_block_pending_code_name", None)
+            code_name = self.get_stock_code_name_map() if pending is None else pending
+            try:
+                return build_stock_concepts_from_named_files(
+                    files.get(TDXParams.INFOHARBOR_BLOCK_REMOTE_FILE, b""),
+                    files.get(TDXParams.TDXHY_REMOTE_FILE, b""),
+                    files.get(TDXParams.ZHB_ZIP_REMOTE_FILE, b""),
+                    code_name,
+                )
+            finally:
+                self._block_pending_code_name = None
+                self._block_partial_named_files = {}
 
     def _named_hq_file_chunk_size(self) -> int:
         """输入：无。输出：命名文件单页字节。用途：0x06B9 翻页。边界：固定 30000。"""

@@ -177,7 +177,7 @@ def _kind_task(kind: str, symbol: str) -> dict:
     field = {"stock": "code", "index": "index_name", "block": "block_name"}[kind]
     task = _task()
     task.pop("code")
-    return {**task, field: symbol}
+    return {**task, field: ("概念", symbol) if kind == "block" else symbol}
 
 
 @pytest.mark.parametrize("kind", ["stock", "index", "block"])

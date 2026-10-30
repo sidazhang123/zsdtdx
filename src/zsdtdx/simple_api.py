@@ -25,7 +25,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 
@@ -181,14 +181,14 @@ def get_stock_concepts() -> Dict[str, Any]:
       并把有板块代码的简称换成目录全称；
       `zhb.zip` 内的 `tdxzs3.cfg` 提供研究行业中类，股票按 X 码前五位归入；
       `zhb.zip` 内的 `spblock.dat` 补进有当日股票名称的成分段。
-      同一板块代码或同一板块名只保留一个名称，成分取并集。
-      可发布股票完全相同的板块只保留名称最长的一个。
+      板块身份统一为（中文分类名称，板块名称）；同分类同代码或同名成分取并集。
+      不同身份即使成分相同也分别保留，不跨分类合并。
 
     输出:
     - `{names, map}`：names 为有成分的板块名（概念、风格、指数、基础行业、研究行业中类，以及 spblock 中有股票的板块），去重按字排序；
-      map 为股票名称 -> 所属板块名列表（去重按字排序）。
+      map 为股票名称 -> 所属板块二元组列表（去重按字排序）。names 同样为二元组列表。
     - 股票名称来自 `get_stock_code_name` 当日码表；缺失或非当日时先按该路径更新。
-    - 码表中没有名称的代码不进入 map。本接口自身不写盘；共享板块缓存有效时直接复用。
+    - 码表中没有名称的代码不进入 map。三个板块接口共用 block_catalog.pkl 完整6小时缓存，跟随原文下载时间到期，原文更新即重建。
 
     调用示例:
     ```python
@@ -198,7 +198,7 @@ def get_stock_concepts() -> Dict[str, Any]:
 
     返回示例:
     ```json
-    {"names": ["5G概念", "芯片"], "map": {"中信特钢": ["5G概念"]}}
+    {"names": [["概念", "5G概念"], ["概念", "芯片"]], "map": {"中信特钢": [["概念", "5G概念"]]}}
     ```
     """
     return call_with_main_client(
@@ -241,20 +241,22 @@ def get_etf_code_name() -> Dict[str, str]:
     )
 
 
-def get_block_names() -> List[str]:
+def get_block_names() -> List[Tuple[str, str]]:
     """获取可请求 K 线的「全部板块」指数名称列表。
 
     调用前置约定:
     - 可直接调用；连续调用多个上下文 API 时建议进入 `with get_client():` 复用连接。
-    - 与 `get_block_kline` 共用三份命名文件的 6 小时本地缓存。
+    - 与 `get_stock_concepts`、`get_block_kline` 共用与原始三文件同生命周期的6小时映射磁盘缓存。
     - 与 `get_stock_concepts` 文件同源，但本接口是板块指数名单，不是股票归属。
 
     输入:
     - 无。文件为 `infoharbor_block.dat`、`tdxhy.cfg`、`zhb.zip`（目录来自 zip 内 tdxzs/tdxzs3）。
 
     输出:
-    - 名称列表：概念、非统计风格、地区、研究行业中类；不含指数代码。
-      可直接作为 `get_block_kline` 的 `block_name`；历史区间没有行情时返回空 rows，不视为报错。
+    - （中文分类名称，板块名称）二元组列表，不含指数代码。
+      六类：概念 GN、风格 FG、指数成分 ZS、通达信基础行业 HY、研究行业中类 RS、补充成分 SP。
+      风格包含统计板块；空成分和无代码板块也保留，不包含地区分类。
+      可直接作为 `get_block_kline` 的 `block_name`；无代码或区间无行情返回空 rows，不视为报错。
 
     调用示例:
     ```python
@@ -554,13 +556,19 @@ def get_block_kline(
     调用前置约定:
     - sync/async 均不要求前置 `with get_client()`；无 with 时名称解析会临时建连。
     - 抓取连接由并行层常驻 client 管理（与 get_stock_kline 相同）。
-    - 板块名与 `get_block_names` 共用 6 小时文件缓存；必须显式非空 task（不会自动拉全量）。
+    - 板块目录、股票归属与K线共用 block_catalog.pkl 6小时缓存；必须显式非空 task（不会自动拉全量）。
 
     输入:
     - task: dict 或 `BlockKlineTask`，字段 `block_name/freq/start_time/end_time`；
-      `block_name` 取自 `get_block_names`。
+      `block_name` 为（中文分类名称，板块名称），取自 `get_block_names`；也接受二元素 list。
+      不接受旧版裸名称。目录中无代码、代码有歧义或服务端无行情时返回 rows=[]、error=None；
+      未知分类/名称、非法参数和真实请求失败仍报告错误。
     - queue / preprocessor_operator / mode：与 get_index_kline 相同（空 dict 亦丢弃）。
     - 无复权参数；底层命令为板块指数 0x0523；回包 OHLC 为绝对价（非 0x052D 差分）。
+    - 分类限制：当前「指数成分」目录未提供可确定的 K 线代码，返回空 rows；
+      「补充成分」多数条目同样没有可用 K 线路由，返回空 rows。
+      补充成分不是整类禁用：如「含可转债」「专精特新」能唯一关联板块代码时仍可获取 K 线。
+      两类归属和名称均会保留在目录中；实际覆盖取决于当前命名文件，不据分类猜测代码。
 
     时间窗口 / 返回:
     - 时间补齐与 datetime 契约同 get_index_kline。
