@@ -201,7 +201,7 @@ with get_client():
 
 #### get_stock_concepts
 
-获取股票所属板块（成分归属）。概念、风格、指数来自 `infoharbor_block.dat`；通达信基础行业来自 `tdxhy.cfg` + `zhb.zip`/`tdxzs.cfg`；研究行业中类来自 `tdxhy.cfg` 的 X 码前五位 + `zhb.zip`/`tdxzs3.cfg`；`zhb.zip`/`spblock.dat` 中能对上当日股票名称的成分段一并纳入。有 `88` 板块代码时使用目录全称。以（中文分类名称，板块名称）作为身份。同分类同代码或同名成分取并集；不同身份即使成分相同也分别保留，不跨分类合并。股票名称用当日码表，完整映射写入共享6小时缓存。
+获取股票所属板块（成分归属）。概念、风格、指数来自 `infoharbor_block.dat`；通达信基础行业来自 `tdxhy.cfg` + `zhb.zip`/`tdxzs.cfg`；研究行业中类来自 `tdxhy.cfg` 的 X 码前五位 + `zhb.zip`/`tdxzs3.cfg`；`zhb.zip`/`spblock.dat` 中能对上当日股票名称的成分段一并纳入。有 `88` 板块代码时使用目录全称。以（中文分类名称，板块名称）作为身份。同分类同代码或同名成分取并集；股票归属在同分类内对相同成分只保留最长名称，不跨分类合并；完整板块目录仍保留全部身份。股票名称用当日码表，完整映射写入共享6小时缓存。
 
 与 `get_block_names` 文件同源，但语义不同：本接口回答「股票属于哪些板块」；完整六类板块目录请用 `get_block_names`；目录中允许包含无 K 线的板块。
 
@@ -488,6 +488,7 @@ with get_client():
 - task: `BlockKlineTask` 或等价 dict，字段 `{block_name, freq, start_time, end_time}`；`block_name` 必须是二元组，例如 `("通达信基础行业", "元器件")`。也接受 JSON 二元素数组，拒绝旧版裸名称。
 - queue / preprocessor_operator / mode：与 `get_index_kline` 相同。
 - 无 `qfq`。底层命令为板块指数 `0x0523`；回包 OHLC 为绝对价（与个股/指数 `0x052D` 差分不同）。
+- 当前“指数成分”目录未提供可确定的K线代码，返回空行情；“补充成分”多数条目也无可用路由，但“含可转债”“专精特新”等能关联唯一代码的条目仍可获取K线。目录保留不代表保证有行情。
 
 **调用示例:**
 

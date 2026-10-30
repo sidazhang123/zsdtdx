@@ -30,43 +30,11 @@ from zsdtdx.parser.block_index_catalog import (
 )
 from zsdtdx.parser.infoharbor_block import (
     build_stock_concept_payload,
-    collapse_identical_stock_sets,
-    merge_concept_blocks,
+    prepare_concept_blocks_from_parsed,
 )
 
 BLOCK_CATALOG_CACHE_VERSION = 3
 BLOCK_CATALOG_CACHE_FILENAME = "block_catalog.pkl"
-
-
-def _stock_payload(records, code_name):
-    """从同一份成分图派生股票归属，校验时也用此关系核对派生数据。"""
-    blocks = []
-    prefixes = {0: "sz", 1: "sh", 2: "bj"}
-    # 目录展示顺序不决定归属别名；缺少目录全称时保持原始成分文件的先出现者。
-    ordered = sorted(
-        records,
-        key=lambda r: r["concept_order"]
-        if r["concept_order"] is not None
-        else math.inf,
-    )
-    for record in ordered:
-        members = record["members"]
-        if record["kind"] == "SP":
-            members = [
-                (m, c) for m, c in members if code_name.get(f"{prefixes[m]}.{c}")
-            ]
-        blocks.append(
-            {
-                "name": record["name"],
-                "kind": record["kind"],
-                "codes": members,
-                "block_code": record["code"],
-            }
-        )
-    merged = merge_concept_blocks(blocks, {})
-    return build_stock_concept_payload(
-        collapse_identical_stock_sets(merged, code_name), code_name
-    )
 
 
 def build_block_catalog_snapshot(
@@ -78,6 +46,12 @@ def build_block_catalog_snapshot(
         raise ValueError("股票名称码表为空，不能生成完整板块映射缓存")
     catalog = parse_block_index_catalog(files)
     records = list(catalog.by_name.values())
+    stock_blocks = [
+        {key: block[key] for key in ("name", "kind", "block_code", "codes")}
+        for block in prepare_concept_blocks_from_parsed(
+            catalog.source_blocks, catalog.full_names, code_name
+        )
+    ]
     snapshot = {
         "version": BLOCK_CATALOG_CACHE_VERSION,
         "kind": "block_catalog",
@@ -92,7 +66,8 @@ def build_block_catalog_snapshot(
         },
         "records": records,
         "code_name": dict(code_name),
-        "stock_concepts": _stock_payload(records, code_name),
+        "stock_blocks": stock_blocks,
+        "stock_concepts": build_stock_concept_payload(stock_blocks, code_name),
     }
     if not validate_block_catalog_snapshot(snapshot):
         raise ValueError("板块映射缓存结构或股票码表无效")
@@ -157,9 +132,6 @@ def validate_block_catalog_snapshot(snapshot):
             ):
                 return False
             identities.add(identity)
-            order = record["concept_order"]
-            if order is not None and (type(order) is not int or order < 0):
-                return False
             if record["kind"] not in BLOCK_KIND_NAMES or record["market"] != 1:
                 return False
             if record["code"] and not re.fullmatch(r"88\d{4}", record["code"]):
@@ -196,7 +168,30 @@ def validate_block_catalog_snapshot(snapshot):
                 or not {normalize_block_identity(i) for i in blocks} <= concept_names
             ):
                 return False
-        return concepts == _stock_payload(records, names)
+        stock_blocks = snapshot["stock_blocks"]
+        if not isinstance(stock_blocks, list):
+            return False
+        stock_identities = set()
+        for block in stock_blocks:
+            identity = block_identity(block["kind"], block["name"])
+            if identity not in identities or identity in stock_identities:
+                return False
+            stock_identities.add(identity)
+            if block["block_code"] and not re.fullmatch(
+                r"88\d{4}", block["block_code"]
+            ):
+                return False
+            if not isinstance(block["codes"], list) or not block["codes"]:
+                return False
+            for market, code in block["codes"]:
+                if (
+                    market not in (0, 1, 2)
+                    or not isinstance(code, str)
+                    or not re.fullmatch(r"\d{6}", code)
+                    or code == "000000"
+                ):
+                    return False
+        return concepts == build_stock_concept_payload(stock_blocks, names)
     except (KeyError, TypeError, ValueError, OverflowError, OSError):
         return False
 

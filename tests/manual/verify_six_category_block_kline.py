@@ -10,7 +10,6 @@
 2. 不更改正式缓存；原始文件、报告及明细均放在独立验收目录。
 """
 
-import argparse
 from collections import Counter, defaultdict
 from datetime import datetime
 import hashlib
@@ -18,6 +17,8 @@ import json
 from pathlib import Path
 import sys
 import time
+
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
@@ -36,11 +37,13 @@ from zsdtdx.engine.unified_client import UnifiedTdxClient  # noqa: E402
 
 def main():
     """按分类与周期对账全部任务，保存可重现的快照、空项和失败项。"""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--start", default="2026-10-01")
-    parser.add_argument("--end", default="2026-10-30")
-    parser.add_argument("--freq", nargs="+", default=["15", "30", "60", "d", "w"])
-    args = parser.parse_args()
+    settings = (
+        yaml.safe_load(Path(__file__).with_suffix(".yaml").read_text(encoding="utf-8"))
+        or {}
+    )
+    start_time = settings.get("start_time", "2026-10-01")
+    end_time = settings.get("end_time", "2026-10-30")
+    frequencies = settings.get("frequencies", ["15", "30", "60", "d", "w"])
     out = (
         ROOT
         / "tests/manual/artifacts/six_category_block_kline"
@@ -117,14 +120,14 @@ def main():
                 if identity in routes
             ]
             sync_samples = get_block_kline(
-                task=[BlockKlineTask(i, "d", args.start, args.end) for i in sample_ids],
+                task=[BlockKlineTask(i, "d", start_time, end_time) for i in sample_ids],
                 mode="sync",
             )
             job = get_block_kline(
                 task=[
-                    BlockKlineTask(i, freq, args.start, args.end)
+                    BlockKlineTask(i, freq, start_time, end_time)
                     for i in names
-                    for freq in args.freq
+                    for freq in frequencies
                 ],
                 mode="async",
             )
@@ -184,7 +187,7 @@ def main():
                     flush=True,
                 )
         summary = job.result(timeout=10)
-        assert len(details) == len(names) * len(args.freq) == summary["total_tasks"]
+        assert len(details) == len(names) * len(frequencies) == summary["total_tasks"]
         assert len({(d["category"], d["name"], d["freq"]) for d in details}) == len(
             details
         )
@@ -193,8 +196,8 @@ def main():
             by_category[d["category"]][d["status"]] += 1
             by_frequency[d["freq"]][d["status"]] += 1
         report = {
-            "window": [args.start, args.end],
-            "frequencies": args.freq,
+            "window": [start_time, end_time],
+            "frequencies": frequencies,
             "snapshot": snapshot,
             "names": len(names),
             "cache": cache_check,

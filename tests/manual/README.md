@@ -67,6 +67,6 @@ py tests/manual/run_cache_lifecycle_acceptance.py
 - `baseline_results_dir` 非空时只重测线程快照，旧版指标引用该目录已有记录；报告必须注明引用关系，不能称为同轮交替测量。设置为空可重新执行旧新交替对照。
 # 六类板块完整目录与K线覆盖
 
-执行 `py tests/manual/verify_six_category_block_kline.py`，默认对2026-10-01至2026-10-30的全部六类板块验证15/30/60分钟、日线、周线。可用 `--start`、`--end`、`--freq` 调整窗口和周期。
+执行 `py tests/manual/verify_six_category_block_kline.py`，默认对2026-10-01至2026-10-30的全部六类板块验证15/30/60分钟、日线、周线。窗口和周期在同目录 `verify_six_category_block_kline.yaml` 中调整。
 
 脚本同时检查统一映射6小时缓存的跨客户端磁盘重载、分类同名路由隔离，以及公开同步/异步接口。报告分别统计有行情、无代码空返回、服务端/区间为空和真实请求失败；产物保存在 `artifacts/six_category_block_kline/<运行时间>/`。

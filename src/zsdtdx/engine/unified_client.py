@@ -5462,7 +5462,7 @@ class UnifiedTdxClient:
 
     def get_stock_concepts(self) -> Dict[str, Any]:
         """
-        输入无，输出 `{names, map}`；板块来自标准行情命名文件，名称来自当日码表。
+        输入无，输出 `{names, map}`；板块来自标准行情命名文件，名称来自建图时有效码表。
 
         输入：
         1. 无。主机使用配置里的标准行情地址。
@@ -5472,33 +5472,39 @@ class UnifiedTdxClient:
         用途：
         1. 下载概念板块、基础行业、研究行业中类和 spblock 补充成分，再用当日码表把代码换成名称。
         边界条件：
-        1. 码表内存或磁盘不是当日、或不存在时，走自动缓存流程下载更新。
+        1. 建图时保证股票码表有效；映射有效期内连同名称一起复用。
         2. 某一份远程文件失败时，其余成功的部分仍然返回。
         3. 完整目录、股票码名与归属写入共享6小时缓存；部分结果不落盘，全部失败返回空结构。
         4. 有板块代码时名称用目录全称；同分类同名成分取并集，不跨分类合并。
         5. spblock 里没有当日股票名称的段不进入结果。
         6. 同分类内相同股票成分只保留最长名称；不同分类保持独立。
         """
-        try:
-            snapshot = self._ensure_block_catalog_snapshot()
-            payload = snapshot["stock_concepts"]
-            # 二元组叶子不可变，只复制会被调用方修改的容器。
-            return {
-                "names": list(payload["names"]),
-                "map": {name: list(blocks) for name, blocks in payload["map"].items()},
-            }
-        except ValueError:
-            # 保留旧有的部分归属容错，但不把不完整结果写成有效缓存。
-            files = getattr(self, "_block_partial_named_files", {})
-            pending = getattr(self, "_block_pending_code_name", None)
-            code_name = self.get_stock_code_name_map() if pending is None else pending
+        # 暂存原文属于本次调用；锁覆盖回退与清理，避免并发请求覆盖已成功的来源。
+        with self._block_catalog_lock:
             try:
-                return build_stock_concepts_from_named_files(
-                    files.get(TDXParams.INFOHARBOR_BLOCK_REMOTE_FILE, b""),
-                    files.get(TDXParams.TDXHY_REMOTE_FILE, b""),
-                    files.get(TDXParams.ZHB_ZIP_REMOTE_FILE, b""),
-                    code_name,
-                )
+                try:
+                    snapshot = self._ensure_block_catalog_snapshot()
+                except ValueError:
+                    # 部分归属可交付，但不写成完整缓存。
+                    files = getattr(self, "_block_partial_named_files", {})
+                    pending = getattr(self, "_block_pending_code_name", None)
+                    code_name = (
+                        self.get_stock_code_name_map() if pending is None else pending
+                    )
+                    return build_stock_concepts_from_named_files(
+                        files.get(TDXParams.INFOHARBOR_BLOCK_REMOTE_FILE, b""),
+                        files.get(TDXParams.TDXHY_REMOTE_FILE, b""),
+                        files.get(TDXParams.ZHB_ZIP_REMOTE_FILE, b""),
+                        code_name,
+                    )
+                payload = snapshot["stock_concepts"]
+                # 二元组叶子不可变，只复制会被调用方修改的容器。
+                return {
+                    "names": list(payload["names"]),
+                    "map": {
+                        name: list(blocks) for name, blocks in payload["map"].items()
+                    },
+                }
             finally:
                 self._block_pending_code_name = None
                 self._block_partial_named_files = {}

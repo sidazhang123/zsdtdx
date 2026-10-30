@@ -42,9 +42,13 @@ def _pipe_rows(raw: bytes):
 class BlockIndexCatalog:
     """六类板块目录；names 与 by_name 均以中文分类和名称的二元组为键。"""
 
-    def __init__(self, records: Sequence[dict]):
+    def __init__(self, records: Sequence[dict], *, source_blocks=None, full_names=None):
+        """输入目录记录及原始归属来源，输出按分类名称索引；歧义代码仅保留身份不猜路由。"""
         self.names = []
         self.by_name = {}
+        # 展示目录会合并同名代码，归属处理仍需保留原始代码/成分对应及出现顺序。
+        self.source_blocks = source_blocks or []
+        self.full_names = full_names or {}
         candidates = defaultdict(set)
         members = defaultdict(set)
         ambiguous = set()
@@ -61,14 +65,7 @@ class BlockIndexCatalog:
                     "kind": kind,
                     "code": "",
                     "market": 1,
-                    "concept_order": None,
                 }
-            source_order = record.get("concept_order")
-            previous_order = self.by_name[identity]["concept_order"]
-            if source_order is not None and (
-                previous_order is None or source_order < previous_order
-            ):
-                self.by_name[identity]["concept_order"] = source_order
             members[identity].update(tuple(pair) for pair in record.get("members", []))
             if record.get("code"):
                 candidates[identity].add(str(record["code"]))
@@ -118,7 +115,7 @@ def parse_block_index_catalog(files: Dict[str, bytes]) -> BlockIndexCatalog:
     blocks += parse_tdx_industry_blocks(files["tdxhy.cfg"], zs)
     blocks += parse_research_industry_blocks(files["tdxhy.cfg"], zs3)
     blocks += parse_spblock(read_zip_entry(files["zhb.zip"], "spblock.dat"))
-    for source_order, block in enumerate(blocks):
+    for block in blocks:
         kind = block["kind"]
         if kind not in BLOCK_KIND_NAMES:
             continue
@@ -135,9 +132,8 @@ def parse_block_index_catalog(files: Dict[str, bytes]) -> BlockIndexCatalog:
                 "code": code,
                 "kind": kind,
                 "members": block["codes"],
-                "concept_order": source_order,
             }
         )
     order = {kind: index for index, kind in enumerate(BLOCK_KIND_NAMES)}
     selected.sort(key=lambda r: (order[r["kind"]], r.get("code") or "~", r["name"]))
-    return BlockIndexCatalog(selected)
+    return BlockIndexCatalog(selected, source_blocks=blocks, full_names=full_names)

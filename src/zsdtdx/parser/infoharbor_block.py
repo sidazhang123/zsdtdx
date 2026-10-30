@@ -26,7 +26,7 @@ from collections import defaultdict
 from typing import Dict, List, Sequence, Tuple
 
 from zsdtdx.params import TDXParams
-from zsdtdx.block_identity import BlockIdentity, block_identity
+from zsdtdx.block_identity import BLOCK_KIND_NAMES, BlockIdentity, block_identity
 
 # infoharbor 成分行里的市场号，与标准行情码表前缀一致。
 _MARKET_PREFIX = {0: "sz", 1: "sh", 2: "bj"}
@@ -530,6 +530,21 @@ def collapse_identical_stock_sets(
     return kept
 
 
+def prepare_concept_blocks_from_parsed(
+    blocks: Sequence[dict], full_names: Dict[str, str], code_name: Dict[str, str]
+) -> List[dict]:
+    """输入原文顺序的板块及权威目录，输出股票归属块；仅同分类合并、去重，未知分类跳过。"""
+    supported = [
+        block
+        for block in blocks
+        if block.get("kind") in BLOCK_KIND_NAMES
+        and (block["kind"] != "SP" or _named_stock_pairs(block, code_name))
+    ]
+    return collapse_identical_stock_sets(
+        merge_concept_blocks(supported, full_names), code_name
+    )
+
+
 def prepare_concept_blocks(
     block_raw: bytes,
     hy_raw: bytes,
@@ -556,12 +571,8 @@ def prepare_concept_blocks(
     blocks = parse_infoharbor_block(block_raw)
     blocks.extend(parse_tdx_industry_blocks(hy_raw, zs_raw))
     blocks.extend(parse_research_industry_blocks(hy_raw, zs3_raw))
-    for block in parse_spblock(read_zip_entry(zip_raw, TDXParams.SPBLOCK_ZIP_MEMBER)):
-        if not _named_stock_pairs(block, code_name):
-            continue
-        blocks.append(block)
-    merged = merge_concept_blocks(blocks, full_names)
-    return collapse_identical_stock_sets(merged, code_name)
+    blocks.extend(parse_spblock(read_zip_entry(zip_raw, TDXParams.SPBLOCK_ZIP_MEMBER)))
+    return prepare_concept_blocks_from_parsed(blocks, full_names, code_name)
 
 
 def build_stock_concepts_from_named_files(
