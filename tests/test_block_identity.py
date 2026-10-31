@@ -1,4 +1,4 @@
-"""六类板块身份、同名路由、空行情与队列交付的离线回归。"""
+"""六类板块身份、同名路由、空行情与队列交付的离线回归。不含补充成分。"""
 
 import io
 import queue
@@ -30,7 +30,10 @@ def _files():
                 "gbk"
             ),
         )
-        archive.writestr("tdxzs3.cfg", "元器件|881333|12|1|0|X4004\n".encode("gbk"))
+        archive.writestr(
+            "tdxzs3.cfg",
+            "元器件|881333|12|1|0|X4004\n锂|881079|12|1|1|X140301\n".encode("gbk"),
+        )
         archive.writestr("spblock.dat", "#独立补充\n#空概念\n".encode("gbk"))
     return {
         "infoharbor_block.dat": "#ZS_独立指数,0,,\n".encode("gbk"),
@@ -40,15 +43,17 @@ def _files():
 
 
 def test_all_six_categories_and_same_name_routes():
-    """目录保留无成分/无代码，双行业同名分别路由；SP不冒充概念分类。"""
+    """目录保留无成分/无代码，双行业同名分别路由；不产生补充成分。"""
     catalog = parse_block_index_catalog(_files())
     assert {r["kind"] for r in catalog.by_name.values()} == set(BLOCK_KIND_NAMES)
     assert catalog.by_name[("通达信基础行业", "元器件")]["code"] == "880492"
     assert catalog.by_name[("研究行业中类", "元器件")]["code"] == "881333"
+    assert catalog.by_name[("研究行业小类", "锂")]["code"] == "881079"
+    assert catalog.by_name[("研究行业小类", "锂")]["empty_reason"] == ""
     assert ("风格", "历史新高") in catalog.names
     assert catalog.by_name[("指数成分", "独立指数")]["empty_reason"] == "no_code"
-    assert catalog.by_name[("补充成分", "空概念")]["kind"] == "SP"
-    assert catalog.by_name[("补充成分", "空概念")]["code"] == "880900"
+    assert all(name[0] != "补充成分" for name in catalog.names)
+    assert ("概念", "空概念") in catalog.by_name
     client = UnifiedTdxClient.__new__(UnifiedTdxClient)
     client._load_block_index_catalog = lambda: catalog
     tasks = client.prepare_block_kline_tasks(

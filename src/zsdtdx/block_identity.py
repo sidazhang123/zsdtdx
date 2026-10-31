@@ -2,7 +2,7 @@
 模块：`block_identity.py`。
 
 职责：
-1. 统一板块的六类标记、中文分类和二元组标识。
+1. 统一板块的六类标记、中文分类和二元组标识。不包含补充成分。
 
 边界：
 1. 不访问网络；分类属于板块身份，不能跨分类按名称合并。
@@ -16,7 +16,7 @@ BLOCK_KIND_NAMES = {
     "ZS": "指数成分",
     "HY": "通达信基础行业",
     "RS": "研究行业中类",
-    "SP": "补充成分",
+    "RL": "研究行业小类",
 }
 BLOCK_NAME_KINDS = {name: kind for kind, name in BLOCK_KIND_NAMES.items()}
 BlockIdentity = Tuple[str, str]

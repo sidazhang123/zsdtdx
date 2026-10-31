@@ -7,7 +7,7 @@
 `zsdtdx` 是一个面向 A 股/期货行情场景的 Python 封装库，参考 pytdx 生态提供统一 API、连接池、重试和并行抓取能力。部分请求组包与回包解析已按实盘抓包重新实现，并非对 `pytdx` 的直接二次封装或运行时依赖；归属说明见 `THIRD_PARTY_NOTICES.md`。
 
 - **名称**：`zsdtdx`
-- **版本**：`3.0.5`（同时定义在 `pyproject.toml` 与 `src/zsdtdx/__init__.py`）
+- **版本**：`3.0.7`（同时定义在 `pyproject.toml` 与 `src/zsdtdx/__init__.py`）
 - **许可证**：MIT（见 `LICENSE`）
 - **Python 要求**：`>=3.10`
 - **核心依赖**：`numpy`、`numba`、`pandas`、`PyYAML`、`six`、`psutil`
@@ -16,7 +16,7 @@
 
 - 标准/扩展行情连接管理（`get_client`、`set_config_path`）
 - 股票代码表、期货列表查询
-- 股票所属板块（`get_stock_concepts`：`infoharbor_block.dat` 概念/风格/指数，`tdxhy.cfg` + `zhb.zip` 内 `tdxzs.cfg` 补基础行业）
+- 股票所属板块（`get_stock_concepts`：`infoharbor_block.dat` 概念/风格/指数，`tdxhy.cfg` + `zhb.zip` 内 `tdxzs.cfg`/`tdxzs3.cfg` 基础行业与研究行业中类/小类；不含补充成分）
 - 股票/指数/板块指数 K 线（同步 + 异步并行；任务类见 `kline_task.py`）
 - 商品期货 K 线
 - 全市场股票统计宽表（`get_stock_stat`）与期货实时最新价
@@ -155,7 +155,7 @@ with get_client() as client:
 属于主进程上下文的 API：
 
 - `get_stock_code_name`
-- `get_stock_concepts`（`infoharbor_block.dat` 加 `tdxhy.cfg` 与 `zhb.zip`/`tdxzs.cfg` 的基础行业；当日码表换成股票名；返回 `{names, map}`；不写 pkl）
+- `get_stock_concepts`（`infoharbor_block.dat` 加 `tdxhy.cfg` 与 `zhb.zip`/`tdxzs.cfg`/`tdxzs3.cfg` 的基础行业与研究行业；不含补充成分；当日码表换成股票名；返回 `{names, map}`；写入共享 `block_catalog.pkl`）
 - `get_etf_code_name`（ETF+LOF 并集：`spec/specetfdata.txt` + `spec/speclofdata.txt`；名称优先 `infoharbor_ex.name` 与 `zhb.zip`/`ilong.dat` 合并且同码取 ilong，板块缺名回退 std/`0x044D` 版面短名；当日 `etf_code_name.pkl`；空列表不落盘；不读银河安装目录；不扩宽 `get_stock_code_name`）
 - `get_block_names`
 - `get_all_future_list`

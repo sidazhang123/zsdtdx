@@ -17,7 +17,10 @@ from zsdtdx.engine.parallel_fetcher import (
     _build_symbol_kline_payload,
     _normalize_block_task_payload,
 )
-from zsdtdx.parser.block_index_catalog import parse_block_index_catalog
+from zsdtdx.parser.block_index_catalog import (
+    parse_block_index_catalog,
+    published_block_names,
+)
 from zsdtdx.parser.diff_kline_page import parse_diff_encoded_kline_page
 from zsdtdx.parser.get_block_bars import GetBlockBarsCmd
 from zsdtdx.parser.get_security_bars import pack_standard_kline_request
@@ -101,7 +104,7 @@ def _files() -> dict:
 
 
 def test_block_catalog_keeps_all_board_subset():
-    """输入最小三文件。输出带分类身份的目录，纳入统计风格和 T 行业，研究行业仅收中类。"""
+    """输入最小三文件。输出带分类身份的目录，纳入统计风格、T 行业和研究行业小类，不纳入研究行业大类。"""
     catalog = parse_block_index_catalog(_files())
     assert catalog.names == [
         ("概念", "汽车拆解"),
@@ -110,12 +113,60 @@ def test_block_catalog_keeps_all_board_subset():
         ("风格", "昨日涨停"),
         ("通达信基础行业", "煤炭"),
         ("研究行业中类", "精细化工"),
+        ("研究行业小类", "煤炭开采"),
     ]
     assert catalog.by_name[("概念", "汽车拆解")]["code"] == "880744"
     assert catalog.by_name[("概念", "汽车拆解")]["market"] == 1
     assert ("风格", "昨日涨停") in catalog.by_name
     assert ("通达信基础行业", "煤炭") in catalog.by_name
     assert ("研究行业中类", "煤炭开采") not in catalog.by_name
+    assert catalog.by_name[("研究行业小类", "煤炭开采")]["code"] == "881002"
+    assert catalog.by_name[("研究行业小类", "煤炭开采")]["empty_reason"] == ""
+    assert ("研究行业中类", "能源") not in catalog.by_name
+    assert ("研究行业小类", "能源") not in catalog.by_name
+    client = UnifiedTdxClient.__new__(UnifiedTdxClient)
+    client._load_block_index_catalog = lambda: catalog
+    tasks = client.prepare_block_kline_tasks(
+        [
+            {
+                "block_name": ("研究行业小类", "煤炭开采"),
+                "freq": "d",
+                "start_time": "2026-10-01",
+                "end_time": "2026-10-30",
+            }
+        ]
+    )
+    assert tasks[0]["_index_route_code"] == "881002"
+    assert tasks[0]["_block_no_kline"] == ""
+    assert published_block_names(catalog) == catalog.names
+
+
+def test_published_names_keep_minor_and_leaf_mid_only():
+    """二级和三级都入库。公开名单只返回三级；没有三级的二级才返回。"""
+    catalog = parse_block_index_catalog(
+        {
+            "infoharbor_block.dat": b"block",
+            "tdxhy.cfg": b"hy",
+            "zhb.zip": _zhb(
+                ["占位|880001|9|0|0|Z"],
+                [
+                    "煤炭|881001|12|1|0|X10",
+                    "煤炭开采|881002|12|1|0|X1001",
+                    "动力煤|881003|12|1|1|X100101",
+                    "焦炭加工|881005|12|1|1|X1002",
+                ],
+            ),
+        }
+    )
+    assert ("研究行业中类", "煤炭开采") in catalog.by_name
+    assert catalog.by_name[("研究行业中类", "煤炭开采")]["code"] == "881002"
+    assert ("研究行业小类", "动力煤") in catalog.by_name
+    assert ("研究行业中类", "焦炭加工") in catalog.by_name
+    assert ("研究行业中类", "煤炭") not in catalog.by_name
+    assert published_block_names(catalog) == [
+        ("研究行业中类", "焦炭加工"),
+        ("研究行业小类", "动力煤"),
+    ]
 
 
 def test_block_file_cache_expires_at_six_hours(tmp_path):

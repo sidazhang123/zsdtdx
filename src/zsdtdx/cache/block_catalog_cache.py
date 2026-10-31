@@ -2,7 +2,7 @@
 模块：`cache/block_catalog_cache.py`。
 
 职责：
-1. 按原始文件的6小时生命周期保存完整六类目录、路由、成分和股票归属。
+1. 按原始文件的6小时生命周期保存完整六类目录、路由、成分和股票归属。不含补充成分。
 2. 提供原子写入与结构校验，供三个板块公开接口共用。
 
 边界：
@@ -33,7 +33,7 @@ from zsdtdx.parser.infoharbor_block import (
     prepare_concept_blocks_from_parsed,
 )
 
-BLOCK_CATALOG_CACHE_VERSION = 3
+BLOCK_CATALOG_CACHE_VERSION = 7
 BLOCK_CATALOG_CACHE_FILENAME = "block_catalog.pkl"
 
 
@@ -49,7 +49,7 @@ def build_block_catalog_snapshot(
     stock_blocks = [
         {key: block[key] for key in ("name", "kind", "block_code", "codes")}
         for block in prepare_concept_blocks_from_parsed(
-            catalog.source_blocks, catalog.full_names, code_name
+            catalog.source_blocks, catalog.full_names
         )
     ]
     snapshot = {
@@ -171,12 +171,10 @@ def validate_block_catalog_snapshot(snapshot):
         stock_blocks = snapshot["stock_blocks"]
         if not isinstance(stock_blocks, list):
             return False
-        stock_identities = set()
         for block in stock_blocks:
             identity = block_identity(block["kind"], block["name"])
-            if identity not in identities or identity in stock_identities:
+            if identity not in identities:
                 return False
-            stock_identities.add(identity)
             if block["block_code"] and not re.fullmatch(
                 r"88\d{4}", block["block_code"]
             ):

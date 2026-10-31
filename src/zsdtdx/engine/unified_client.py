@@ -67,6 +67,7 @@ from zsdtdx.parser.block_index_catalog import (
     REQUIRED_BLOCK_FILES,
     BlockIndexCatalog,
     parse_block_index_catalog,
+    published_block_names,
 )
 from zsdtdx.parser.infoharbor_block import (
     build_stock_concepts_from_named_files,
@@ -5336,11 +5337,13 @@ class UnifiedTdxClient:
         输入无，输出「全部板块」名称列表。
 
         输入：无。与股票归属及K线共用6小时完整映射缓存。
-        输出：六类（中文分类名称，板块名称）二元组列表，不含指数代码。
+        输出：六类（中文分类名称，板块名称）二元组列表，不含指数代码，不含补充成分。
         用途：供 get_block_kline 的 block_name 使用。
-        边界条件：缓存过期时重新下载；目录为空时抛 ValueError。
+        边界条件：
+        1. 缓存过期时重新下载；目录为空时抛 ValueError。
+        2. 研究行业二级和三级都在目录缓存中；返回值只含三级，没有三级的二级才返回。
         """
-        return list(self._load_block_index_catalog().names)
+        return published_block_names(self._load_block_index_catalog())
 
     def resolve_block_index_route(self, block_name: Any) -> Dict[str, Any]:
         """
@@ -5470,14 +5473,14 @@ class UnifiedTdxClient:
         1. names: 有成分代码的板块名列表。
         2. map: 股票名称到所属板块名列表。
         用途：
-        1. 下载概念板块、基础行业、研究行业中类和 spblock 补充成分，再用当日码表把代码换成名称。
+        1. 下载概念板块、基础行业和研究行业，再用当日码表把代码换成名称。不解析补充成分。
         边界条件：
         1. 建图时保证股票码表有效；映射有效期内连同名称一起复用。
         2. 某一份远程文件失败时，其余成功的部分仍然返回。
         3. 完整目录、股票码名与归属写入共享6小时缓存；部分结果不落盘，全部失败返回空结构。
-        4. 有板块代码时名称用目录全称；同分类同名成分取并集，不跨分类合并。
-        5. spblock 里没有当日股票名称的段不进入结果。
-        6. 同分类内相同股票成分只保留最长名称；不同分类保持独立。
+        4. 原文名称和不同的目录全称都保留；成分不同的同名板块不并成一套成分。
+        5. 不返回补充成分。
+        6. 相同成分的不同板块名都返回。研究行业小类有名称时归入小类，否则归入上一级中类。
         """
         # 暂存原文属于本次调用；锁覆盖回退与清理，避免并发请求覆盖已成功的来源。
         with self._block_catalog_lock:

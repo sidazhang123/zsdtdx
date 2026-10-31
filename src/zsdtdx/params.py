@@ -89,7 +89,7 @@ class TDXParams:
     ZHB_ZIP_REMOTE_FILE = "zhb.zip"
     TDXZS_ZIP_MEMBER = "tdxzs.cfg"
     TDXZS3_ZIP_MEMBER = "tdxzs3.cfg"
-    # zhb.zip 内的补充成分段。标题没有板块代码，成分是市场号加六位代码。
+    # zhb.zip 内的 spblock.dat。板块目录和股票归属不解析该成员。
     SPBLOCK_ZIP_MEMBER = "spblock.dat"
     ILONG_ZIP_MEMBER = "ilong.dat"
     TDXSTAT_ZIP_MEMBER = "tdxstat.cfg"

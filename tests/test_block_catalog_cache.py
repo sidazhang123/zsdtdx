@@ -29,7 +29,7 @@ def _files():
         archive.writestr("spblock.dat", "#补充板块\n0000001\n".encode("gbk"))
     return {
         "infoharbor_block.dat": "#ZS_独立指数,1,,\n0#000001,\n".encode("gbk"),
-        "tdxhy.cfg": "0|000001|T1204|||\n1|600000||||X400401\n".encode("gbk"),
+        "tdxhy.cfg": "0|000001|T1204|||\n1|600000||||X4004\n".encode("gbk"),
         "zhb.zip": buffer.getvalue(),
     }
 
@@ -96,9 +96,10 @@ def test_all_three_interfaces_share_disk_graph_without_sources(tmp_path):
     concepts = first.get_stock_concepts()
     assert concepts["map"]["平安银行"] == [
         ("指数成分", "独立指数"),
-        ("补充成分", "补充板块"),
         ("通达信基础行业", "元器件"),
     ]
+    assert all(name[0] != "补充成分" for name in concepts["names"])
+    assert all(name[0] != "补充成分" for name in names)
     assert concepts["map"]["浦发银行"] == [("研究行业中类", "元器件")]
     path = block_catalog_cache_path(tmp_path)
     original = path.read_bytes()
