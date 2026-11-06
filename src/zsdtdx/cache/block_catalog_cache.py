@@ -4,6 +4,7 @@
 职责：
 1. 按原始文件的6小时生命周期保存完整六类目录、路由、成分和股票归属。不含补充成分。
 2. 提供原子写入与结构校验，供三个板块公开接口共用。
+3. 保存地区名称表，以及股票归属接口按需补齐的地区归属；不改变六类目录。
 
 边界：
 1. 不联网；不缓存空码表或不完整的源文件。
@@ -31,9 +32,12 @@ from zsdtdx.parser.block_index_catalog import (
 from zsdtdx.parser.infoharbor_block import (
     build_stock_concept_payload,
     prepare_concept_blocks_from_parsed,
+    read_zip_entry,
 )
+from zsdtdx.parser.stock_regions import stock_region_targets
+from zsdtdx.parser.tdxstat import parse_region_map_from_tdxzs
 
-BLOCK_CATALOG_CACHE_VERSION = 7
+BLOCK_CATALOG_CACHE_VERSION = 8
 BLOCK_CATALOG_CACHE_FILENAME = "block_catalog.pkl"
 
 
@@ -68,6 +72,11 @@ def build_block_catalog_snapshot(
         "code_name": dict(code_name),
         "stock_blocks": stock_blocks,
         "stock_concepts": build_stock_concept_payload(stock_blocks, code_name),
+        "region_names": parse_region_map_from_tdxzs(
+            read_zip_entry(files["zhb.zip"], "tdxzs.cfg")
+        ),
+        # None 表示尚未查询或查询失败；空字典表示查询成功但没有可映射地区。
+        "stock_regions": None,
     }
     if not validate_block_catalog_snapshot(snapshot):
         raise ValueError("板块映射缓存结构或股票码表无效")
@@ -189,6 +198,25 @@ def validate_block_catalog_snapshot(snapshot):
                     or code == "000000"
                 ):
                     return False
+        region_names = snapshot["region_names"]
+        if not isinstance(region_names, dict) or any(
+            type(code) is not int
+            or code < 0
+            or not isinstance(name, str)
+            or not name.strip()
+            for code, name in region_names.items()
+        ):
+            return False
+        regions = snapshot["stock_regions"]
+        if regions is not None:
+            if not isinstance(regions, dict):
+                return False
+            targets = stock_region_targets(names)
+            if any(
+                code not in targets or name not in region_names.values()
+                for code, name in regions.items()
+            ):
+                return False
         return concepts == build_stock_concept_payload(stock_blocks, names)
     except (KeyError, TypeError, ValueError, OverflowError, OSError):
         return False

@@ -73,6 +73,13 @@ from zsdtdx.parser.infoharbor_block import (
     build_stock_concepts_from_named_files,
     read_zip_entry,
 )
+from zsdtdx.parser.get_finance_info_batch import MAX_FINANCE_INFO_BATCH
+from zsdtdx.parser.stock_regions import (
+    build_stock_region_map,
+    merge_stock_regions,
+    stock_region_targets,
+)
+from zsdtdx.parser.tdxstat import parse_region_map_from_tdxzs
 from zsdtdx.util.helper import parse_future_symbol
 from zsdtdx.util.errors import CompanyInfoFetchError
 from zsdtdx.util.log import log
@@ -5463,6 +5470,56 @@ class UnifiedTdxClient:
             )
         return routed
 
+    def _fetch_stock_regions(self, code_name, region_names):
+        """按当前股票码表批查 DY；失败交由调用方容错，不将残缺归属缓存为成功。"""
+        targets = stock_region_targets(code_name)
+        if not region_names or not targets:
+            return {}
+        cfg = getattr(self, "config", {}).get("stock_stat", {}) or {}
+        batch_size = min(
+            max(1, int(cfg.get("finance_batch_size", MAX_FINANCE_INFO_BATCH))),
+            MAX_FINANCE_INFO_BATCH,
+        )
+        workers = min(max(1, int(cfg.get("finance_workers", 4))), 8)
+        finance_map = self.get_finance_info_batch_map(
+            list(targets.values()), batch_size, workers
+        )
+        return build_stock_region_map(targets, finance_map, region_names)
+
+    def _ensure_stock_regions(self, snapshot):
+        """仅股票归属接口按需补齐地区；线程及进程间复用同源六小时缓存。"""
+        if snapshot["stock_regions"] is not None:
+            return snapshot["stock_regions"]
+        cache_dir = self._block_file_cache_dir()
+        guard = (
+            cache_refresh_lock(cache_dir, "block_catalog")
+            if cache_dir is not None
+            else nullcontext()
+        )
+        with guard:
+            if cache_dir is not None:
+                disk = load_block_catalog_snapshot(
+                    cache_dir,
+                    name_scope=snapshot["name_scope"],
+                    source_fetched_at=snapshot["source_fetched_at"],
+                    source_hashes=snapshot["source_hashes"],
+                )
+                if disk is not None and disk["stock_regions"] is not None:
+                    snapshot["stock_regions"] = disk["stock_regions"]
+                    return snapshot["stock_regions"]
+            regions = self._fetch_stock_regions(
+                snapshot["code_name"], snapshot["region_names"]
+            )
+            snapshot["stock_regions"] = regions
+            if cache_dir is not None and block_catalog_snapshot_matches(
+                snapshot, name_scope=snapshot["name_scope"]
+            ):
+                try:
+                    save_block_catalog_snapshot(snapshot, cache_dir)
+                except OSError as exc:
+                    self._record_block_cache_failure("derived_write_failed", exc)
+            return regions
+
     def get_stock_concepts(self) -> Dict[str, Any]:
         """
         输入无，输出 `{names, map}`；板块来自标准行情命名文件，名称来自建图时有效码表。
@@ -5481,6 +5538,8 @@ class UnifiedTdxClient:
         4. 原文名称和不同的目录全称都保留；成分不同的同名板块不并成一套成分。
         5. 不返回补充成分。
         6. 相同成分的不同板块名都返回。研究行业小类有名称时归入小类，否则归入上一级中类。
+        7. 地区来自 0010 的 DY 与 tdxzs.cfg，仅本接口按需查询；成功归属随原文缓存六小时。
+        8. 地区查询失败时记录失败并返回其它分类，下次调用重试；不改变板块目录与 K 线接口。
         """
         # 暂存原文属于本次调用；锁覆盖回退与清理，避免并发请求覆盖已成功的来源。
         with self._block_catalog_lock:
@@ -5494,20 +5553,37 @@ class UnifiedTdxClient:
                     code_name = (
                         self.get_stock_code_name_map() if pending is None else pending
                     )
-                    return build_stock_concepts_from_named_files(
+                    payload = build_stock_concepts_from_named_files(
                         files.get(TDXParams.INFOHARBOR_BLOCK_REMOTE_FILE, b""),
                         files.get(TDXParams.TDXHY_REMOTE_FILE, b""),
                         files.get(TDXParams.ZHB_ZIP_REMOTE_FILE, b""),
                         code_name,
                     )
-                payload = snapshot["stock_concepts"]
-                # 二元组叶子不可变，只复制会被调用方修改的容器。
-                return {
-                    "names": list(payload["names"]),
-                    "map": {
-                        name: list(blocks) for name, blocks in payload["map"].items()
-                    },
-                }
+                    region_names = parse_region_map_from_tdxzs(
+                        read_zip_entry(
+                            files.get(TDXParams.ZHB_ZIP_REMOTE_FILE, b""),
+                            TDXParams.TDXZS_ZIP_MEMBER,
+                        )
+                    )
+                    snapshot = None
+                else:
+                    payload = snapshot["stock_concepts"]
+                    code_name = snapshot["code_name"]
+                try:
+                    regions = (
+                        self._ensure_stock_regions(snapshot)
+                        if snapshot is not None
+                        else self._fetch_stock_regions(code_name, region_names)
+                    )
+                except Exception as exc:
+                    try:
+                        self._record_failure(
+                            "stock_concepts", "regions", "exception", str(exc)
+                        )
+                    except Exception:
+                        log.error("[stock_concepts] 地区查询失败: %s", exc)
+                    regions = {}
+                return merge_stock_regions(payload, code_name, regions)
             finally:
                 self._block_pending_code_name = None
                 self._block_partial_named_files = {}
