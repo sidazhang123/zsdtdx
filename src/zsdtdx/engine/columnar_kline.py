@@ -77,7 +77,7 @@ def _page(client, route, code, category, start, kind, qfq):
         else "get_instrument_bars"
     )
     size = client._kline_page_size(source)
-    kwargs = {"qfq": bool(qfq)} if kind == "stock" else {}
+    kwargs = {"qfq": bool(qfq)} if kind in ("stock", "block") else {}
     token = columnar_decode.set(True)
     try:
         host_group = (

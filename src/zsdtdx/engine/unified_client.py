@@ -2354,6 +2354,7 @@ class UnifiedTdxClient:
         route: Dict[str, Any],
         symbol_field: str = "index_name",
         include_code: bool = True,
+        qfq: bool = True,
     ) -> List[Dict[str, Any]]:
         """输入标准化任务和路由，输出指数或板块 K 线；板块路由失败时不改查指数目录。"""
         symbol = (
@@ -2380,6 +2381,11 @@ class UnifiedTdxClient:
 
             def _fetch_index_page(start: int) -> Any:
                 if source == "std":
+                    extra = (
+                        {"qfq": bool(qfq)}
+                        if self._is_block_bars_route(current_route)
+                        else {}
+                    )
                     return self._pool_call_allow_none(
                         self.std_pool,
                         self._std_bars_api_name(current_route),
@@ -2388,6 +2394,7 @@ class UnifiedTdxClient:
                         str(code),
                         int(start),
                         int(page_size),
+                        **extra,
                     )
                 return self._pool_call_allow_none(
                     self.ex_pool,
@@ -3148,6 +3155,7 @@ class UnifiedTdxClient:
         category: int,
         start: int,
         page_size: int,
+        qfq: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         按分页偏移抓取单页指数原始 K 线。
@@ -3155,6 +3163,7 @@ class UnifiedTdxClient:
         输入：
         1. route: 指数路由（source/market/code）。
         2. category/start/page_size: TDX 分页参数。
+        3. qfq: 板块指数前复权开关（普通指数忽略）。
         输出：
         1. 原始行字典列表。
         用途：
@@ -3168,6 +3177,7 @@ class UnifiedTdxClient:
         if market < 0 or code == "":
             raise ValueError(f"指数路由配置非法: {route}")
         if source_key == "std":
+            extra = {"qfq": bool(qfq)} if self._is_block_bars_route(route) else {}
             rows = self._pool_call_allow_none(
                 self.std_pool,
                 self._std_bars_api_name(route),
@@ -3176,6 +3186,7 @@ class UnifiedTdxClient:
                 str(code),
                 int(start),
                 int(page_size),
+                **extra,
             )
             return list(rows or [])
         if source_key == "ex":
@@ -3522,11 +3533,12 @@ class UnifiedTdxClient:
         self,
         tasks: List[Dict[str, Any]],
         enable_cache: bool,
+        qfq: bool = True,
     ) -> Dict[str, Any]:
         """
         输入同一板块的 chunk 任务，输出逐任务 K 线。
 
-        输入：tasks 含 block_name/freq/start_time/end_time 与已解析路由。
+        输入：tasks 含 block_name/freq/start_time/end_time 与已解析路由；qfq 为前复权开关。
         输出：与指数 chunk 相同的结果字典，行字段为 block_name。
         用途：复用指数分页，请求命令为 get_block_bars。
         边界条件：任务缺少路由时抛 ValueError，不走指数名称目录。
@@ -3537,6 +3549,7 @@ class UnifiedTdxClient:
             symbol_field="block_name",
             bars_api="get_block_bars",
             include_code=False,
+            qfq=bool(qfq),
         )
         # 合法空页/区间无行情不是任务失败；网络和解析异常仍保留原错误。
         for item in result["results"]:
@@ -3551,6 +3564,7 @@ class UnifiedTdxClient:
         symbol_field: str = "index_name",
         bars_api: str = "get_index_bars",
         include_code: bool = True,
+        qfq: bool = True,
     ) -> Dict[str, Any]:
         """
         执行同 `index_name+freq` 的指数 chunk 任务并返回逐任务结果。
@@ -3635,6 +3649,7 @@ class UnifiedTdxClient:
                         route=route,
                         symbol_field=symbol_field,
                         include_code=include_code,
+                        qfq=bool(qfq),
                     )
                 except Exception as exc:
                     results.append({"task": task, "rows": [], "error": str(exc)[:200]})
@@ -3715,6 +3730,7 @@ class UnifiedTdxClient:
                             category=category,
                             start=page_start,
                             page_size=page_size,
+                            qfq=bool(qfq),
                         )
                     except Exception:
                         if self._is_block_bars_route(route) or route_refreshed:
@@ -3733,6 +3749,7 @@ class UnifiedTdxClient:
                             category=category,
                             start=page_start,
                             page_size=page_size,
+                            qfq=bool(qfq),
                         )
                     fetched_pages += 1
                     chunk_network_page_calls += 1

@@ -489,7 +489,7 @@ with get_client():
 
 - task: `BlockKlineTask` 或等价 dict，字段 `{block_name, freq, start_time, end_time}`；`block_name` 必须是二元组，例如 `("通达信基础行业", "元器件")`。也接受 JSON 二元素数组，拒绝旧版裸名称。
 - queue / preprocessor_operator / mode：与 `get_index_kline` 相同。
-- 无 `qfq`。底层命令为板块指数 `0x0523`；回包 OHLC 为绝对价（与个股/指数 `0x052D` 差分不同）。
+- qfq: `True` 前复权（默认，`reserved0=1`），`False` 不复权（`reserved0=0`）。底层命令为板块指数 `0x0523`；回包 OHLC 为绝对价（与个股/指数 `0x052D` 差分不同）。
 - 当前“指数成分”目录未提供可确定的K线代码，返回空行情。不解析、不返回补充成分。目录保留不代表保证有行情。
 - 地区指数代码来自 `zhb.zip` 内 `tdxzs.cfg` 的分类3。周线使用 `freq="w"`，月线使用 `freq="m"`；均通过 `0x0523` 请求服务器原生周期，不以日线本地聚合，也不拉股票财务。
 - 地区的周期与其它板块完全相同，支持 `d/w/m/5/15/30/60`，以及 `5min/15min/30min/60min` 别名。

@@ -263,19 +263,26 @@ def test_stock_concepts_reads_existing_fresh_block_snapshot(tmp_path):
 
 
 def test_block_kline_packet_matches_index_layout_except_command():
-    """输入同一分页参数。输出 54 字节，且仅命令号从 0x052D 换成 0x0523。"""
+    """输入同一分页参数。输出 54 字节，支持 qfq=True（默认）与 qfq=False，且仅命令号从 0x052D 换成 0x0523。"""
     index_pkg = pack_standard_kline_request(4, 1, "880744", 0, 420, qfq=False)
-    block_pkg = bytes(
+    block_pkg_raw = bytes(
         pack_standard_kline_request(4, 1, "880744", 0, 420, qfq=False, command=0x0523)
+    )
+    block_pkg_qfq = bytes(
+        pack_standard_kline_request(4, 1, "880744", 0, 420, qfq=True, command=0x0523)
     )
     cmd = GetBlockBarsCmd(client=None)
     cmd.setParams(4, 1, "880744", 0, 420)
-    assert bytes(cmd.send_pkg) == block_pkg
-    assert len(block_pkg) == 54
-    assert struct.unpack_from("<H", block_pkg, 10)[0] == 0x0523
+    assert bytes(cmd.send_pkg) == block_pkg_qfq
+    assert struct.unpack_from("<I", cmd.send_pkg, 28)[0] == 1
+    cmd.setParams(4, 1, "880744", 0, 420, qfq=False)
+    assert bytes(cmd.send_pkg) == block_pkg_raw
+    assert struct.unpack_from("<I", cmd.send_pkg, 28)[0] == 0
+    assert len(block_pkg_raw) == 54
+    assert struct.unpack_from("<H", block_pkg_raw, 10)[0] == 0x0523
     assert struct.unpack_from("<H", index_pkg, 10)[0] == 0x052D
-    assert block_pkg[:10] == bytes(index_pkg[:10])
-    assert block_pkg[12:] == bytes(index_pkg[12:])
+    assert block_pkg_raw[:10] == bytes(index_pkg[:10])
+    assert block_pkg_raw[12:] == bytes(index_pkg[12:])
 
 
 def test_block_bars_parse_absolute_ohlc_not_differential():

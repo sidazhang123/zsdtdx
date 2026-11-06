@@ -1,3 +1,8 @@
+## v3.0.11 - 2026-11-06
+
+- `get_block_kline()`、`fetch_block_kline()`、`ParallelKlineFetcher.fetch_block_tasks_sync/async`、`TdxHq_API.get_block_bars()` 与 `GetBlockBarsCmd.setParams()` 全链路支持 `qfq: bool = True` 参数入口（与 `get_stock_kline()` 签名对齐）。
+- 版本号：`pyproject.toml` 与 `__init__.__version__` 对齐为 `3.0.11`。
+
 ## v3.0.10 - 2026-11-06
 
 - 同分类且同 `88xxxx`（`880xxx` / `881xxx`）板块编码在底层统一合并为单一板块身份，名称取字符长度更长者（等长时优先 `tdxzs.cfg`/`tdxzs3.cfg` 目录名），成分按出现顺序去重合并；`get_block_names()`、`get_block_kline()`、`get_stock_concepts()` 三接口统一只保留合并后的长名，不再返回同编码短名重复项（共消除 53 个概念/风格短名重复）。

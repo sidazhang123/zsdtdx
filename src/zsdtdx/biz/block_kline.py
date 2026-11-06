@@ -34,11 +34,12 @@ def fetch_block_kline(
         Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
     ] = None,
     mode: str = "async",
+    qfq: bool = True,
 ) -> Any:
     """
     输入板块任务，输出 K 线结果。
 
-    输入：task 为 dict 或 BlockKlineTask 列表；其余参数与 get_block_kline 相同。
+    输入：task 为 dict 或 BlockKlineTask 列表；queue/preprocessor_operator/mode/qfq 与 get_block_kline 相同。
     输出：sync 为 payload 列表；async 为 StockKlineJob。
     用途：名称解析后按板块任务抓取，分页仍复用指数实现。
     边界条件：
@@ -65,4 +66,5 @@ def fetch_block_kline(
         preprocessor_operator=preprocessor_operator,
         sync_method="fetch_block_tasks_sync",
         async_method="fetch_block_tasks_async",
+        extra_kwargs={"qfq": bool(qfq)},
     )

@@ -2108,21 +2108,22 @@ class ParallelKlineFetcher:
         preprocessor_operator: Optional[
             Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
         ] = None,
+        qfq: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         输入板块任务，输出同步结果列表。
 
-        输入：tasks 含 block_name 与路由。
+        输入：tasks 含 block_name 与路由；queue、preprocessor_operator、qfq 可选。
         输出：payload 列表。
         用途：板块 K 线 sync 入口。
-        边界条件：空任务返回空列表并发送 done。
+        边界条件：空任务返回空列表并发送 done；qfq 默认 True。
         """
         return self._fetch_tasks_sync(
             task_kind="block",
             tasks=tasks,
             queue=queue,
             preprocessor_operator=preprocessor_operator,
-            qfq=False,
+            qfq=bool(qfq),
         )
 
     def _fetch_tasks_async(
@@ -2317,11 +2318,12 @@ class ParallelKlineFetcher:
         preprocessor_operator: Optional[
             Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
         ] = None,
+        qfq: bool = True,
     ) -> StockKlineJob:
         """
         输入板块任务，输出异步句柄。
 
-        输入：tasks 含 block_name 与路由；queue 与 preprocessor_operator 可选。
+        输入：tasks 含 block_name 与路由；queue、preprocessor_operator、qfq 可选。
         输出：StockKlineJob。
         用途：板块 K 线 async 入口。
         边界条件：带队列时 result() 为计数摘要，未带队列时为 payload 列表；异常由 job.result() 抛出。
@@ -2331,7 +2333,7 @@ class ParallelKlineFetcher:
             tasks=tasks,
             queue=queue,
             preprocessor_operator=preprocessor_operator,
-            qfq=False,
+            qfq=bool(qfq),
         )
 
     def fetch_future_kline(

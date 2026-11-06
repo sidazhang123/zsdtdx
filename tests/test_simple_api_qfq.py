@@ -3,7 +3,12 @@
 import inspect
 from unittest.mock import MagicMock, patch
 
-from zsdtdx.simple_api import get_future_kline, get_index_kline, get_stock_kline
+from zsdtdx.simple_api import (
+    get_block_kline,
+    get_future_kline,
+    get_index_kline,
+    get_stock_kline,
+)
 
 
 _STOCK_TASK = {
@@ -18,11 +23,31 @@ _INDEX_TASK = {
     "start_time": "2026-02-13",
     "end_time": "2026-02-13",
 }
+_BLOCK_TASK = {
+    "block_name": ("概念", "液冷服务器"),
+    "freq": "d",
+    "start_time": "2026-02-13",
+    "end_time": "2026-02-13",
+}
 
 
 def test_get_stock_kline_qfq_is_last_param_default_true():
     """输入：函数签名；输出：qfq 在末尾且默认 True，原位置参数顺序不变。"""
     params = inspect.signature(get_stock_kline).parameters
+    assert list(params) == [
+        "task",
+        "queue",
+        "preprocessor_operator",
+        "mode",
+        "qfq",
+    ]
+    assert params["qfq"].default is True
+    assert params["qfq"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+
+
+def test_get_block_kline_qfq_is_last_param_default_true():
+    """输入：板块 K 线函数签名；输出：与 get_stock_kline 对齐，qfq 在末尾且默认 True。"""
+    params = inspect.signature(get_block_kline).parameters
     assert list(params) == [
         "task",
         "queue",
@@ -172,3 +197,59 @@ def test_ex_page_fetch_honors_qfq():
         qfq=False,
     )
     assert mock_pool.call.call_args.kwargs.get("qfq") is False
+
+
+def test_get_block_kline_forwards_qfq_and_columnar_page_passes_qfq():
+    """输入：get_block_kline 与 columnar_kline._page；输出：qfq 透传至 fetcher 与 get_block_bars。"""
+    import numpy as np
+    from zsdtdx.engine.columnar_kline import _page
+    from zsdtdx.parser.kline_columns import KlineColumns
+
+    fake_client = MagicMock()
+    fake_client.prepare_block_kline_tasks.side_effect = lambda tasks: tasks
+
+    def _run_with_client(fn, **_kwargs):
+        return fn(fake_client)
+
+    with (
+        patch("zsdtdx.biz.block_kline._ensure_active_config_ready"),
+        patch("zsdtdx.engine.parallel_fetcher.get_fetcher") as get_fetcher,
+        patch(
+            "zsdtdx.biz.block_kline.call_with_main_client",
+            side_effect=_run_with_client,
+        ),
+    ):
+        fetcher = MagicMock()
+        fetcher.fetch_block_tasks_sync.return_value = []
+        get_fetcher.return_value = fetcher
+        get_block_kline(task=[dict(_BLOCK_TASK)], mode="sync")
+        assert fetcher.fetch_block_tasks_sync.call_args.kwargs["qfq"] is True
+        get_block_kline(task=[dict(_BLOCK_TASK)], mode="sync", qfq=False)
+        assert fetcher.fetch_block_tasks_sync.call_args.kwargs["qfq"] is False
+
+    page_client = MagicMock()
+    page_client._kline_page_size.return_value = 800
+    page_client.std_pool.call.return_value = KlineColumns(
+        {"_ts": np.array([], dtype=np.int64)}
+    )
+    _page(
+        page_client,
+        {"source": "std", "market": 1},
+        "880685",
+        4,
+        0,
+        "block",
+        True,
+    )
+    assert page_client.std_pool.call.call_args.args[0] == "get_block_bars"
+    assert page_client.std_pool.call.call_args.kwargs.get("qfq") is True
+    _page(
+        page_client,
+        {"source": "std", "market": 1},
+        "880685",
+        4,
+        0,
+        "block",
+        False,
+    )
+    assert page_client.std_pool.call.call_args.kwargs.get("qfq") is False

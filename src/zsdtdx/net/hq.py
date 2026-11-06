@@ -136,7 +136,7 @@ class TdxHq_API(BaseSocketClient):
         return cmd.call_api()
 
     @update_last_ack_time
-    def get_block_bars(self, category, market, code, start, count):
+    def get_block_bars(self, category, market, code, start, count, qfq: bool = True):
         """
         输入：
         1. category: K 线周期；1 分钟=7，日线=4。
@@ -144,16 +144,17 @@ class TdxHq_API(BaseSocketClient):
         3. code: 板块指数代码，如 880744。
         4. start: 分页偏移，0 表示从最新一段起取。
         5. count: 本页条数，服务端硬上限 800。
+        6. qfq: True 请求前复权（reserved0=1），False 请求不复权（reserved0=0）。
         输出：
         1. 已解析的板块 K 线 dict 列表；失败时为 `None`。
         用途：
         1. 发送 54 字节 0x0523 请求；回包 OHLC 为绝对价（与 0x052D 差分不同）。
         边界条件：
-        1. 无复权语义，reserved0 固定为 0。
+        1. qfq 默认为 True；透传给 GetBlockBarsCmd.setParams。
         2. 不解析板块名称；名称到代码由上层目录完成。
         """
         cmd = GetBlockBarsCmd(self.client, lock=self.lock)
-        cmd.setParams(category, market, code, start, count)
+        cmd.setParams(category, market, code, start, count, qfq=qfq)
         return cmd.call_api()
 
     @update_last_ack_time

@@ -554,6 +554,7 @@ def get_block_kline(
         Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
     ] = None,
     mode: str = "async",
+    qfq: bool = True,
 ) -> Any:
     """获取板块指数 K 线（按板块名称，支持 sync/async）。
 
@@ -571,7 +572,7 @@ def get_block_kline(
       不接受旧版裸名称。目录中无代码、代码有歧义或服务端无行情时返回 rows=[]、error=None；
       未知分类/名称、非法参数和真实请求失败仍报告错误。
     - queue / preprocessor_operator / mode：与 get_index_kline 相同（空 dict 亦丢弃）。
-    - 无复权参数；底层命令为板块指数 0x0523；回包 OHLC 为绝对价（非 0x052D 差分）。
+    - qfq: True 前复权（默认，reserved0=1），False 不复权（reserved0=0）；底层命令为板块指数 0x0523；回包 OHLC 为绝对价（非 0x052D 差分）。
     - 分类限制：当前「指数成分」目录未提供可确定的 K 线代码，返回空 rows。
       不解析、不返回补充成分。
 
@@ -587,6 +588,7 @@ def get_block_kline(
         queue=queue,
         preprocessor_operator=preprocessor_operator,
         mode=mode,
+        qfq=qfq,
     )
 
 

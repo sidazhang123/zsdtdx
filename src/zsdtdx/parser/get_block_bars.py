@@ -8,7 +8,7 @@
 边界：
 1. 仅负责单页解析，不承担分页与板块名称解析。
 2. 回包含涨跌家数；OHLC 为绝对价（`absolute_ohlc=True`），与 0x052D 差分不同。
-3. 无复权语义；reserved0 固定为 0。
+3. 支持 `qfq: bool = True` 前复权开关（`reserved0 = 1 if qfq else 0`）。
 """
 
 # coding=utf-8
@@ -22,12 +22,12 @@ BLOCK_KLINE_COMMAND = 0x0523
 
 
 class GetBlockBarsCmd(BaseParser):
-    def setParams(self, category, market, code, start, count):
+    def setParams(self, category, market, code, start, count, qfq: bool = True):
         """
-        输入：category/market/code/start/count。
+        输入：category/market/code/start/count/qfq。
         输出：无；构造 54 字节 send_pkg。
         用途：组装板块指数 K 线请求（0x0523，布局与 0x052D 相同）。
-        边界条件：reserved0 固定为 0；code 为 str 时由组包函数转 bytes。
+        边界条件：qfq=True 时 reserved0=1，qfq=False 时 reserved0=0；code 为 str 时由组包函数转 bytes。
         """
         self.category = category
         self.send_pkg = pack_standard_kline_request(
@@ -36,7 +36,7 @@ class GetBlockBarsCmd(BaseParser):
             code,
             start,
             count,
-            qfq=False,
+            qfq=bool(qfq),
             command=BLOCK_KLINE_COMMAND,
         )
 
