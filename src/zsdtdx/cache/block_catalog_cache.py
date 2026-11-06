@@ -2,9 +2,9 @@
 模块：`cache/block_catalog_cache.py`。
 
 职责：
-1. 按原始文件的6小时生命周期保存完整六类目录、路由、成分和股票归属。不含补充成分。
+1. 按原始文件的6小时生命周期保存六类公开目录、地区内部路由、成分和股票归属。不含补充成分。
 2. 提供原子写入与结构校验，供三个板块公开接口共用。
-3. 保存地区名称表，以及股票归属接口按需补齐的地区归属；不改变六类目录。
+3. 保存地区名称表，以及股票归属接口按需补齐的地区归属；公开名单仍为六类。
 
 边界：
 1. 不联网；不缓存空码表或不完整的源文件。
@@ -37,7 +37,7 @@ from zsdtdx.parser.infoharbor_block import (
 from zsdtdx.parser.stock_regions import stock_region_targets
 from zsdtdx.parser.tdxstat import parse_region_map_from_tdxzs
 
-BLOCK_CATALOG_CACHE_VERSION = 8
+BLOCK_CATALOG_CACHE_VERSION = 9
 BLOCK_CATALOG_CACHE_FILENAME = "block_catalog.pkl"
 
 

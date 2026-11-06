@@ -2,13 +2,13 @@
 模块：`parser/block_index_catalog.py`。
 
 职责：
-1. 从三份命名文件建立概念、风格、指数成分、基础行业、研究中类、研究小类目录。不解析补充成分。
+1. 从三份命名文件建立六类公开板块及地区的内部路由目录。不解析补充成分。
 2. 按（中文分类名称，板块名称）解析 K 线路由。
 
 边界：
 1. 不访问网络，不读写缓存；空成分、无代码板块仍进入目录。
 2. 同分类同名仅保留一项；不同代码冲突或缺少代码时不猜测路由。
-3. 不纳入地区分类；风格不再过滤统计板块。
+3. 地区只供显式 K 线任务解析，不进入 get_block_names 的公开名单；风格包含统计板块。
 """
 
 from collections import defaultdict
@@ -39,7 +39,7 @@ def _pipe_rows(raw: bytes):
 
 
 class BlockIndexCatalog:
-    """六类板块目录；names 与 by_name 均以中文分类和名称的二元组为键。不含补充成分。"""
+    """七类内部板块目录；names 与 by_name 以中文分类和名称的二元组为键。不含补充成分。"""
 
     def __init__(self, records: Sequence[dict], *, source_blocks=None, full_names=None):
         """输入目录记录及原始归属来源，输出按分类名称索引；歧义代码仅保留身份不猜路由。"""
@@ -88,7 +88,7 @@ class BlockIndexCatalog:
 
 
 def parse_block_index_catalog(files: Dict[str, bytes]) -> BlockIndexCatalog:
-    """输入三件套，输出全部六类目录；不解析补充成分。目录不要求成分非空或具备K线代码。研究行业大类不进入。"""
+    """输入三件套，输出六类板块及地区的内部目录；不解析补充成分。无成分仍可路由，研究行业大类不进入。"""
     for name in REQUIRED_BLOCK_FILES:
         if not files.get(name):
             raise ValueError(f"板块文件为空: {name}")
@@ -100,7 +100,7 @@ def parse_block_index_catalog(files: Dict[str, bytes]) -> BlockIndexCatalog:
     selected = []
     typed_name_codes = defaultdict(set)
     for row in _pipe_rows(zs):
-        kind = {"4": "GN", "5": "FG", "2": "HY"}.get(row[2])
+        kind = {"4": "GN", "5": "FG", "2": "HY", "3": "DQ"}.get(row[2])
         if kind == "HY" and re.fullmatch(r"T\d+", row[5]) is None:
             continue
         if kind and row[0]:
@@ -162,14 +162,14 @@ def published_block_names(catalog: BlockIndexCatalog) -> List[Tuple[str, str]]:
     """输入完整目录，输出公开板块名单。
 
     输入：
-    1. catalog: 已入库的六类目录，研究行业中类和小类都在其中。不含补充成分。
+    1. catalog: 含地区的内部目录，研究行业中类和小类都在其中。不含补充成分。
     输出：
     1. （中文分类名称，板块名称）。有小类的研究行业中类不出现；没有小类的中类和小类都出现。
     用途：
     1. `get_block_names` 的返回值。目录缓存仍保留全部二级和三级。
     边界条件：
     1. 缺少研究行业 X 码的中类视为没有小类，仍返回。
-    2. 其它分类不筛选。
+    2. 地区不进入公开名单，其余分类不筛选。
     """
     covered_mids = set()
     for record in catalog.by_name.values():
@@ -179,6 +179,8 @@ def published_block_names(catalog: BlockIndexCatalog) -> List[Tuple[str, str]]:
     names: List[Tuple[str, str]] = []
     for identity in catalog.names:
         record = catalog.by_name[identity]
+        if record.get("kind") == "DQ":
+            continue
         industry_code = str(record.get("industry_code") or "")
         if record.get("kind") == "RS" and industry_code in covered_mids:
             continue

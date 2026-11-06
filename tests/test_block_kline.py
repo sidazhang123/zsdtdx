@@ -114,6 +114,7 @@ def test_block_catalog_keeps_all_board_subset():
         ("通达信基础行业", "煤炭"),
         ("研究行业中类", "精细化工"),
         ("研究行业小类", "煤炭开采"),
+        ("地区", "黑龙江"),
     ]
     assert catalog.by_name[("概念", "汽车拆解")]["code"] == "880744"
     assert catalog.by_name[("概念", "汽车拆解")]["market"] == 1
@@ -138,7 +139,9 @@ def test_block_catalog_keeps_all_board_subset():
     )
     assert tasks[0]["_index_route_code"] == "881002"
     assert tasks[0]["_block_no_kline"] == ""
-    assert published_block_names(catalog) == catalog.names
+    assert published_block_names(catalog) == [
+        i for i in catalog.names if i[0] != "地区"
+    ]
 
 
 def test_published_names_keep_minor_and_leaf_mid_only():

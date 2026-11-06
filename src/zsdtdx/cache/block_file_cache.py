@@ -161,13 +161,14 @@ def load_fresh_block_files(
             mtime_age = current - path.stat().st_mtime
         except OSError:
             return None
-        if not math.isfinite(current) or not math.isfinite(mtime_age) or mtime_age < 0:
+        if not math.isfinite(current) or not math.isfinite(mtime_age):
             try:
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
             return None
-        # 文件修改时间不会早于原子写入完成时间。先挡住显然过期的旧文件，
+        # Windows 文件时间精度与 time.time 不同，mtime 略晚不能据此删除有效原文。
+        # 先挡住显然过期的旧文件，
         # 避免为已过期的大型 pickle 支付反序列化成本；最终仍以下方 fetched_at 为准。
         if mtime_age >= BLOCK_FILE_TTL_SECONDS:
             return None
@@ -187,6 +188,8 @@ def load_fresh_block_files(
             pass
         return None
     fetched_at = float(snapshot["fetched_at"])
+    # 读取期间可能完成原子替换，以读完时刻检查来源时间，避免误删刚刷新的快照。
+    current = time.time() if now is None else current
     age = current - fetched_at
     if not math.isfinite(current) or not math.isfinite(age) or age < 0:
         try:

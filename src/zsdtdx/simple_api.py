@@ -192,7 +192,7 @@ def get_stock_concepts() -> Dict[str, Any]:
     - 码表中没有名称的代码不进入 map。三个板块接口共用 block_catalog.pkl 完整6小时缓存，跟随原文下载时间到期，原文更新即重建。
     - 地区以（"地区", "深圳板块"）等二元组返回，成功查询随完整缓存复用；沿用 stock_stat 的 finance_batch_size / finance_workers。
       港股通不请求标准行情财务；零码和未知地区码不猜测。查询失败保留其它分类并记录运行时失败，下次调用重试。
-      get_block_names 与板块 K 线不增加地区分类或财务查询。
+      get_block_names 不返回地区；板块 K 线可显式传入地区身份，且不增加财务查询。
 
     调用示例:
     ```python
@@ -565,7 +565,10 @@ def get_block_kline(
 
     输入:
     - task: dict 或 `BlockKlineTask`，字段 `block_name/freq/start_time/end_time`；
-      `block_name` 为（中文分类名称，板块名称），取自 `get_block_names`；也接受二元素 list。
+      `block_name` 为（中文分类名称，板块名称），取自 `get_block_names` 或显式地区身份；也接受二元素 list。
+      地区如（"地区", "深圳板块"），名称取自 get_stock_concepts；通过 tdxzs.cfg 分类3解析指数代码。
+      周线用 freq="w"，月线用 freq="m"，均请求服务器原生周期，不由日线本地聚合。
+      地区支持与其它板块相同的全部周期：d/w/m/5/15/30/60，以及5min/15min/30min/60min别名。
       不接受旧版裸名称。目录中无代码、代码有歧义或服务端无行情时返回 rows=[]、error=None；
       未知分类/名称、非法参数和真实请求失败仍报告错误。
     - queue / preprocessor_operator / mode：与 get_index_kline 相同（空 dict 亦丢弃）。

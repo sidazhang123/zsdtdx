@@ -151,7 +151,7 @@ class BlockKlineTask(KlineTask):
 
     输入：block_name 为（中文分类名称，板块名称），以及 freq/start_time/end_time。
     输出：`to_dict()` 为标准化任务字典。
-    用途：传给 get_block_kline；block_name 来自 get_block_names。
+    用途：传给 get_block_kline；block_name 来自 get_block_names，或显式传入（地区，地区板块名）。
     边界条件：校验与时间补齐由 `KlineTask` 完成；不接受空 task 自动展开全部板块。
     """
 

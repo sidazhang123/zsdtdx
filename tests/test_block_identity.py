@@ -45,7 +45,8 @@ def _files():
 def test_all_six_categories_and_same_name_routes():
     """目录保留无成分/无代码，双行业同名分别路由；不产生补充成分。"""
     catalog = parse_block_index_catalog(_files())
-    assert {r["kind"] for r in catalog.by_name.values()} == set(BLOCK_KIND_NAMES)
+    # 本夹具覆盖六类公开板块，不含仅用于显式 K 线路由的地区。
+    assert {r["kind"] for r in catalog.by_name.values()} == set(BLOCK_KIND_NAMES) - {"DQ"}
     assert catalog.by_name[("通达信基础行业", "元器件")]["code"] == "880492"
     assert catalog.by_name[("研究行业中类", "元器件")]["code"] == "881333"
     assert catalog.by_name[("研究行业小类", "锂")]["code"] == "881079"

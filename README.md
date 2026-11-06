@@ -74,7 +74,7 @@ pip install zsdtdx
 
 - `StockKlineTask`: `code`, `freq`, `start_time`, `end_time`
 - `IndexKlineTask`: `index_name`, `freq`, `start_time`, `end_time`
-- `BlockKlineTask`: `block_name`, `freq`, `start_time`, `end_time`（`block_name` 取自 `get_block_names`）
+- `BlockKlineTask`: `block_name`, `freq`, `start_time`, `end_time`（`block_name` 取自 `get_block_names`，或显式传入地区身份）
 
 **时间窗口:**
 
@@ -203,7 +203,7 @@ with get_client():
 
 获取股票所属板块（成分归属）。概念、风格、指数来自 `infoharbor_block.dat`；通达信基础行业来自 `tdxhy.cfg` + `zhb.zip`/`tdxzs.cfg`；研究行业来自 `tdxhy.cfg` 的 X 码 + `zhb.zip`/`tdxzs3.cfg`：小类有名称时归入小类，否则归入上一级中类。不解析、不返回补充成分。以（中文分类名称，板块名称）作为身份。原文名称保留，目录全称与原文不同时另外保留。成分相同的不同板块名都返回；板块名相同但成分不同时不合并成分。股票名称用当日码表，完整映射写入共享6小时缓存。
 
-地区来自批量财务 `0x0010` 的 DY 字段与 `tdxzs.cfg` 的地区名称表，同时返回到 `names` 和 `map`，例如 `("地区", "深圳板块")`。仅本接口按需查询沪深北股票，成功结果写入 `block_catalog.pkl`，与原始文件共用六小时生命周期；首次查询增加财务请求，批大小与并发沿用 `stock_stat.finance_batch_size` / `finance_workers`。地区查询失败时保留其它分类并记录运行时失败，下次调用重试；部分命名文件缺失时地区仍尽力返回，但不写完整缓存。港股通不请求标准行情财务，零码和未知地区码不猜测。`get_block_names` 与板块 K 线的分类、路由和查询行为保持不变。
+地区来自批量财务 `0x0010` 的 DY 字段与 `tdxzs.cfg` 的地区名称表，同时返回到 `names` 和 `map`，例如 `("地区", "深圳板块")`。仅本接口按需查询沪深北股票，成功结果写入 `block_catalog.pkl`，与原始文件共用六小时生命周期；首次查询增加财务请求，批大小与并发沿用 `stock_stat.finance_batch_size` / `finance_workers`。地区查询失败时保留其它分类并记录运行时失败，下次调用重试；部分命名文件缺失时地区仍尽力返回，但不写完整缓存。港股通不请求标准行情财务，零码和未知地区码不猜测。`get_block_names` 仍不返回地区；`get_block_kline` 支持显式地区身份，指数路由解析不查询股票财务。
 
 与 `get_block_names` 文件同源，但语义不同：本接口回答「股票属于哪些板块」；完整六类板块目录请用 `get_block_names`；目录中允许包含无 K 线的板块。不含补充成分。
 
@@ -443,7 +443,7 @@ result = get_index_kline(
 
 获取全部六类板块的（中文分类名称，板块名称）二元组列表，保留空成分和无代码板块。不含补充成分。
 
-与 `get_stock_concepts`、`get_block_kline` 共用 `block_catalog.pkl` 完整6小时缓存，包含六类目录、板块代码路由、原始证券成分、股票码名和带分类的股票归属；本接口返回目录，股票归属接口返回映射。缓存期限与原始三文件一致，从原文下载时间起计6小时；有效原文优先复用，原文失效先刷新，原文提前更新也会触发映射重建。不含补充成分。
+与 `get_stock_concepts`、`get_block_kline` 共用 `block_catalog.pkl` 完整6小时缓存，包含六类公开目录、地区内部路由、原始证券成分、股票码名和带分类的股票归属；本接口返回目录，股票归属接口返回映射。缓存期限与原始三文件一致，从原文下载时间起计6小时；有效原文优先复用，原文失效先刷新，原文提前更新也会触发映射重建。不含补充成分。
 
 **调用前置约定:**
 
@@ -483,7 +483,7 @@ with get_client():
 - sync/async 均不要求前置 `with get_client()`；无 with 时名称解析会临时建连。
 - 抓取连接由并行层常驻 client 管理（与 `get_stock_kline` 相同）。
 - 必须显式传入非空 task；不会自动拉全部板块。
-- `block_name` 使用 `get_block_names` 的返回值；三个板块接口共用与原始文件同生命周期的6小时完整映射磁盘缓存。
+- `block_name` 使用 `get_block_names` 的返回值，或显式传入地区身份，如 `("地区", "深圳板块")`。地区名称可从 `get_stock_concepts()["names"]` 筛选；`get_block_names` 仍不返回地区。三个板块接口共用与原始文件同生命周期的6小时完整映射磁盘缓存。
 
 **输入:**
 
@@ -491,6 +491,8 @@ with get_client():
 - queue / preprocessor_operator / mode：与 `get_index_kline` 相同。
 - 无 `qfq`。底层命令为板块指数 `0x0523`；回包 OHLC 为绝对价（与个股/指数 `0x052D` 差分不同）。
 - 当前“指数成分”目录未提供可确定的K线代码，返回空行情。不解析、不返回补充成分。目录保留不代表保证有行情。
+- 地区指数代码来自 `zhb.zip` 内 `tdxzs.cfg` 的分类3。周线使用 `freq="w"`，月线使用 `freq="m"`；均通过 `0x0523` 请求服务器原生周期，不以日线本地聚合，也不拉股票财务。
+- 地区的周期与其它板块完全相同，支持 `d/w/m/5/15/30/60`，以及 `5min/15min/30min/60min` 别名。
 
 **调用示例:**
 
@@ -503,6 +505,8 @@ with get_client():
 result = get_block_kline(
     task=[
         BlockKlineTask(block_name=names[0], freq="d", start_time="2026-03-01", end_time="2026-03-31"),
+        BlockKlineTask(block_name=("地区", "深圳板块"), freq="w", start_time="2025-01-01", end_time="2026-11-06"),
+        BlockKlineTask(block_name=("地区", "深圳板块"), freq="m", start_time="2025-01-01", end_time="2026-11-06"),
     ],
     mode="sync",
 )
@@ -1030,7 +1034,7 @@ index_kline:
 - `catalog_cache` 说明：
   - 标准行情（深沪京 `get_security_list`）、扩展行情（`get_instrument_info`）与 ETF/LOF 名称板块分文件按自然日缓存。
   - ETF/LOF 缓存文件为 `etf_code_name.pkl`；`get_etf_code_name` 仅在本地没有当日文件时下载 `0x02C5/0x06B9`。
-  - `block_catalog.pkl` 为三个板块接口共用的完整映射缓存，保存六类目录、代码路由、原始成分、股票码名和股票归属，不含补充成分。有效期从原始文件下载时间起计6小时，建图不重新计时；原文来源变化、旧版本、损坏、未来时间和空码表不会命中。首次重建受跨进程锁保护，原子写入，目录沿用 `catalog_cache.path`。
+  - `block_catalog.pkl` 为三个板块接口共用的完整映射缓存，保存六类公开目录、地区内部路由、原始成分、股票码名和股票归属，不含补充成分。有效期从原始文件下载时间起计6小时，建图不重新计时；原文来源变化、旧版本、损坏、未来时间和空码表不会命中。首次重建受跨进程锁保护，原子写入，目录沿用 `catalog_cache.path`。
   - 原始三文件 `block_named_files.pkl` 按6小时供股票统计和映射构建共用。有效原文优先复用，包括跨午夜仍未满6小时的文件；原文失效则先重新下载再建图，股票统计等其它调用提前刷新原文也会使旧图失效。常用路径只检查原文内存、期限和文件元数据，不重复解析原文或计算哈希。
   - 股票 / 期货 / 指数在使用时从对应侧过滤；指数会同时确保 std 与 ex 当日缓存最新。
   - 同一缓存冷启动使用进程内与跨进程 single-flight，避免并发重复下载；缓存写失败只影响该次持久化，不影响已取得的业务数据和其它缓存。

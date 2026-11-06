@@ -3,7 +3,7 @@
 
 职责：
 1. 验证股票地区归属、缓存复用、来源刷新与查询失败重试。
-2. 验证地区不进入板块目录与 K 线路由。
+2. 验证地区不进入公开名单，且与同名概念的 K 线路由隔离。
 
 边界：
 1. 使用真实缓存和客户端业务路径，仅替换码表、命名文件与财务查询，不联网。
@@ -104,8 +104,7 @@ def test_region_memberships_are_lazy_and_do_not_change_block_routes(tmp_path):
     assert (size, workers) == (100, 8)
     assert client.get_block_names() == before
     assert client.resolve_block_index_route(("概念", "深圳板块"))["code"] == "880999"
-    with pytest.raises(ValueError, match="未知板块分类"):
-        client.resolve_block_index_route(("地区", "深圳板块"))
+    assert client.resolve_block_index_route(("地区", "深圳板块"))["code"] == "880203"
 
 
 def test_region_cache_reused_across_clients_and_mutation_isolated(tmp_path):
