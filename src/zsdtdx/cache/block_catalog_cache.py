@@ -37,7 +37,7 @@ from zsdtdx.parser.infoharbor_block import (
 from zsdtdx.parser.stock_regions import stock_region_targets
 from zsdtdx.parser.tdxstat import parse_region_map_from_tdxzs
 
-BLOCK_CATALOG_CACHE_VERSION = 9
+BLOCK_CATALOG_CACHE_VERSION = 10
 BLOCK_CATALOG_CACHE_FILENAME = "block_catalog.pkl"
 
 
@@ -130,6 +130,7 @@ def validate_block_catalog_snapshot(snapshot):
         ):
             return False
         identities = set()
+        kind_codes = set()
         records = snapshot["records"]
         if not isinstance(records, list) or not records:
             return False
@@ -145,6 +146,11 @@ def validate_block_catalog_snapshot(snapshot):
                 return False
             if record["code"] and not re.fullmatch(r"88\d{4}", record["code"]):
                 return False
+            if record["code"]:
+                kind_code = (record["kind"], record["code"])
+                if kind_code in kind_codes:
+                    return False
+                kind_codes.add(kind_code)
             if record["empty_reason"] not in {"", "no_code", "ambiguous_code"} or bool(
                 record["code"]
             ) != (record["empty_reason"] == ""):

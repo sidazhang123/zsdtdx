@@ -45,15 +45,15 @@ def _client(directory, files):
     "text, expected",
     [
         (
-            "#GN_甲名字,1,880999,\n0#000001,\n#GN_乙名字,1,880999,\n0#000002,\n",
-            {"甲股": [("概念", "甲名字")], "乙股": [("概念", "乙名字")]},
+            "#GN_液冷服务,1,880685,\n0#000001,\n#GN_液冷服务器,1,880685,\n0#000002,\n",
+            {"甲股": [("概念", "液冷服务器")], "乙股": [("概念", "液冷服务器")]},
         ),
         (
-            "#GN_甲名字,1,880999,\n0#000001,\n#GN_甲名字,1,880998,\n0#000002,\n#GN_乙名字,1,880999,\n1#600000,\n",
+            "#GN_甲名字,1,880999,\n0#000001,\n#GN_甲名字,1,880998,\n0#000002,\n#GN_乙名字longer,1,880999,\n1#600000,\n",
             {
-                "甲股": [("概念", "甲名字")],
+                "甲股": [("概念", "乙名字longer")],
                 "乙股": [("概念", "甲名字")],
-                "丙股": [("概念", "乙名字")],
+                "丙股": [("概念", "乙名字longer")],
             },
         ),
         (
@@ -124,12 +124,39 @@ def test_empty_code_names_not_fetched_twice_or_cached(tmp_path):
     assert not block_catalog_cache_path(tmp_path).exists()
 
 
+def test_same_code_merges_across_catalog_kline_and_concepts(tmp_path):
+    """同分类同88编码在目录、K线路由与股票归属三处统一合并为长名，不再保留短名。"""
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w") as archive:
+        archive.writestr(
+            "tdxzs.cfg",
+            "液冷服务器|880685|4|2|0|液冷服务\n".encode("gbk"),
+        )
+        archive.writestr("tdxzs3.cfg", "液冷服务器|880685|4|2|0|液冷服务\n".encode("gbk"))
+    files = {
+        "infoharbor_block.dat": "#GN_液冷服务,1,880685,\n0#000001,\n".encode("gbk"),
+        "tdxhy.cfg": b"header",
+        "zhb.zip": stream.getvalue(),
+    }
+    client = _client(tmp_path, files)
+    names = client.get_block_names()
+    assert names == [("概念", "液冷服务器")]
+    assert ("概念", "液冷服务") not in names
+    concepts = client.get_stock_concepts()
+    assert concepts["names"] == [("概念", "液冷服务器")]
+    assert concepts["map"] == {"甲股": [("概念", "液冷服务器")]}
+    route = client.resolve_block_index_route(("概念", "液冷服务器"))
+    assert route["code"] == "880685"
+    with pytest.raises(ValueError, match="未知板块"):
+        client.resolve_block_index_route(("概念", "液冷服务"))
+
+
 def test_old_derived_schema_not_used_after_semantic_fix(tmp_path):
-    """旧v2没有规范化归属块，不能在修复后继续命中旧结果。"""
+    """旧v9没有合并同编码块，不能在修复后继续命中旧结果。"""
     client = _client(tmp_path, _files("#GN_正常概念,1,880999,\n0#000001,\n"))
     client.get_stock_concepts()
     path = block_catalog_cache_path(tmp_path)
     snapshot = pickle.loads(path.read_bytes())
-    snapshot["version"] = 2
+    snapshot["version"] = 9
     path.write_bytes(pickle.dumps(snapshot))
     assert load_block_catalog_snapshot(tmp_path, name_scope="{}") is None

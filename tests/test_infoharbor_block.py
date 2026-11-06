@@ -155,16 +155,22 @@ def test_get_stock_concepts_merges_industry():
     assert all(name[1] != "浙江板块" for name in payload["names"])
 
 
-def test_catalog_full_name_keeps_both_names():
-    """输入简称和目录全称。输出两个名称都保留。边界：不解析补充成分。"""
+def test_catalog_full_name_merges_same_code_and_picks_longer_name():
+    """输入同编码简称和目录全称。输出合并为较长名称且不保留短名。边界：不解析补充成分。"""
     info = (
         "#GN_智能机器,1,880904,20050607,20260922,,\n"
+        "0#000001,\n"
+        "#GN_液冷服务,1,880685,20050607,20260922,,\n"
         "0#000001,\n"
         "#GN_含可转债,0,880524,20050610,20260921,,\n"
         "#FG_融资融券,1,880001,20050607,20260922,,\n"
         "0#000002,\n"
     ).encode("gbk")
-    zs = "机器人概念|880904|4|1|0|智能机器\n含可转债|880524|4|1|0|含可转债\n"
+    zs = (
+        "机器人概念|880904|4|1|0|智能机器\n"
+        "液冷服务器|880685|4|2|0|液冷服务\n"
+        "含可转债|880524|4|1|0|含可转债\n"
+    )
     sp = "#含可转债\n0000001\n1600000\n#中证500\n0000001\n#深债ETF\n0512345\n"
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as archive:
@@ -178,9 +184,11 @@ def test_catalog_full_name_keeps_both_names():
     )
     assert all(name[1] != "深债ETF" for name in payload["names"])
     assert payload["map"]["平安银行"] == [
-        ("概念", "智能机器"),
         ("概念", "机器人概念"),
+        ("概念", "液冷服务器"),
     ]
+    assert ("概念", "智能机器") not in payload["names"]
+    assert ("概念", "液冷服务") not in payload["names"]
     assert "浦发银行" not in payload["map"]
     assert payload["map"]["万科Ａ"] == [("风格", "融资融券")]
     assert all(name[0] != "补充成分" for name in payload["names"])

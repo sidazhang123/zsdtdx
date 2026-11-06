@@ -3,7 +3,7 @@
 
 职责：
 1. 从三份命名文件建立六类公开板块及地区的内部路由目录。不解析补充成分。
-2. 按（中文分类名称，板块名称）解析 K 线路由。
+2. 按（中文分类名称，板块名称）解析 K 线路由；同分类且同 `88xxxx` 编码的板块合并为单一身份，名称取字符长度更长者（等长时优先目录全称）。
 
 边界：
 1. 不访问网络，不读写缓存；空成分、无代码板块仍进入目录。
@@ -18,6 +18,7 @@ from typing import Dict, List, Sequence, Tuple
 from zsdtdx.block_identity import BLOCK_KIND_NAMES, block_identity
 from zsdtdx.parser.infoharbor_block import (
     catalog_full_names,
+    choose_longer_block_name,
     parse_infoharbor_block,
     parse_research_industry_blocks,
     parse_tdx_industry_blocks,
@@ -42,18 +43,46 @@ class BlockIndexCatalog:
     """七类内部板块目录；names 与 by_name 以中文分类和名称的二元组为键。不含补充成分。"""
 
     def __init__(self, records: Sequence[dict], *, source_blocks=None, full_names=None):
-        """输入目录记录及原始归属来源，输出按分类名称索引；歧义代码仅保留身份不猜路由。"""
+        """输入目录记录及原始归属来源，输出按分类名称索引；同分类同编码合并为较长名称，歧义代码仅保留身份不猜路由。"""
         self.names = []
         self.by_name = {}
         # 展示目录会合并同名代码，归属处理仍需保留原始代码/成分对应及出现顺序。
         self.source_blocks = source_blocks or []
         self.full_names = full_names or {}
+        canon_by_kind_code: Dict[Tuple[str, str], str] = {}
+        for record in records:
+            kind = str(record.get("kind") or "").strip()
+            code = str(record.get("code") or "").strip()
+            name = str(record.get("name") or "").strip()
+            if (
+                not kind
+                or not code
+                or not name
+                or record.get("empty_reason") == "ambiguous_code"
+            ):
+                continue
+            key = (kind, code)
+            existing = canon_by_kind_code.get(key, "")
+            full_name = str(self.full_names.get(code) or "").strip()
+            if not existing:
+                canon_by_kind_code[key] = choose_longer_block_name(name, full_name)
+            elif len(name) > len(existing) or (
+                len(name) == len(existing) and full_name and name == full_name
+            ):
+                canon_by_kind_code[key] = name
         candidates = defaultdict(set)
         members = defaultdict(set)
         ambiguous = set()
         for record in records:
             kind = record["kind"]
-            identity = block_identity(kind, record["name"])
+            code = str(record.get("code") or "").strip()
+            raw_name = str(record.get("name") or "").strip()
+            resolved_name = (
+                canon_by_kind_code.get((kind, code), raw_name)
+                if code and record.get("empty_reason") != "ambiguous_code"
+                else raw_name
+            )
+            identity = block_identity(kind, resolved_name)
             if record.get("empty_reason") == "ambiguous_code":
                 ambiguous.add(identity)
             if identity not in self.by_name:
@@ -70,8 +99,8 @@ class BlockIndexCatalog:
             if industry_code and not self.by_name[identity].get("industry_code"):
                 self.by_name[identity]["industry_code"] = industry_code
             members[identity].update(tuple(pair) for pair in record.get("members", []))
-            if record.get("code"):
-                candidates[identity].add(str(record["code"]))
+            if code:
+                candidates[identity].add(code)
         for identity, record in self.by_name.items():
             codes = sorted(candidates[identity])
             if identity in ambiguous:
@@ -104,8 +133,12 @@ def parse_block_index_catalog(files: Dict[str, bytes]) -> BlockIndexCatalog:
         if kind == "HY" and re.fullmatch(r"T\d+", row[5]) is None:
             continue
         if kind and row[0]:
-            selected.append({"name": row[0], "code": row[1], "kind": kind})
+            name = choose_longer_block_name(row[0], full_names.get(row[1], ""))
+            selected.append({"name": name, "code": row[1], "kind": kind})
             typed_name_codes[(kind, row[0])].add(row[1])
+            typed_name_codes[(kind, name)].add(row[1])
+            if row[5]:
+                typed_name_codes[(kind, row[5])].add(row[1])
     for row in _pipe_rows(zs3):
         if row[2] != "12" or not row[0]:
             continue
@@ -116,15 +149,17 @@ def parse_block_index_catalog(files: Dict[str, bytes]) -> BlockIndexCatalog:
             kind = "RL"
         else:
             continue
+        name = choose_longer_block_name(row[0], full_names.get(row[1], ""))
         selected.append(
             {
-                "name": row[0],
+                "name": name,
                 "code": row[1],
                 "kind": kind,
                 "industry_code": row[5],
             }
         )
         typed_name_codes[(kind, row[0])].add(row[1])
+        typed_name_codes[(kind, name)].add(row[1])
     blocks = parse_infoharbor_block(files["infoharbor_block.dat"])
     blocks += parse_tdx_industry_blocks(files["tdxhy.cfg"], zs)
     blocks += parse_research_industry_blocks(files["tdxhy.cfg"], zs3)
@@ -136,23 +171,20 @@ def parse_block_index_catalog(files: Dict[str, bytes]) -> BlockIndexCatalog:
         raw_name = str(block.get("name") or "").strip()
         if not raw_name:
             continue
-        full_name = str(full_names.get(code, "") or "").strip() if code else ""
-        labels = [raw_name]
-        if full_name and full_name != raw_name:
-            labels.append(full_name)
-        for name in labels:
-            resolved = code
-            candidates = typed_name_codes[(kind, name)]
-            if not resolved and len(candidates) == 1:
-                resolved = next(iter(candidates))
-            selected.append(
-                {
-                    "name": name,
-                    "code": resolved,
-                    "kind": kind,
-                    "members": block["codes"],
-                }
-            )
+        resolved = code
+        candidates = typed_name_codes[(kind, raw_name)]
+        if not resolved and len(candidates) == 1:
+            resolved = next(iter(candidates))
+        full_name = str(full_names.get(resolved, "") or "").strip() if resolved else ""
+        chosen_name = choose_longer_block_name(raw_name, full_name)
+        selected.append(
+            {
+                "name": chosen_name,
+                "code": resolved,
+                "kind": kind,
+                "members": block["codes"],
+            }
+        )
     order = {kind: index for index, kind in enumerate(BLOCK_KIND_NAMES)}
     selected.sort(key=lambda r: (order[r["kind"]], r.get("code") or "~", r["name"]))
     return BlockIndexCatalog(selected, source_blocks=blocks, full_names=full_names)

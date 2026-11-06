@@ -6,7 +6,7 @@
 2. 解析 `tdxhy.cfg` 与 `tdxzs.cfg`，得到通达信基础行业板块与成分代码。
 3. 解析 `tdxzs3.cfg` 的研究行业中类和小类。小类名称存在时归入小类，否则归入上一级中类。
 4. 不解析 `spblock.dat`，不产生补充成分。
-5. 原文板块名与不同的目录全称都保留；成分不同的同名板块不合并成分。
+5. 同分类且同板块编码（`880xxx`/`881xxx`）的板块合并成分，名称取字符长度更长者（等长时优先目录全称）；无编码或不同编码的同名板块不合并成分。
 6. 用股票代码名称表收成 `{names, map}`，板块身份为（中文分类名称，板块名称）。
 
 边界：
@@ -302,6 +302,29 @@ def parse_research_industry_blocks(hy_raw: bytes, zs3_raw: bytes) -> List[dict]:
     ]
 
 
+def choose_longer_block_name(raw_name: str, full_name: str = "") -> str:
+    """
+    输入原文板块名与目录全称，输出字符长度更长的规范板块名。
+
+    输入：
+    1. raw_name: 原文或既有板块名称。
+    2. full_name: `tdxzs.cfg` / `tdxzs3.cfg` 中的目录名称（可为空）。
+    输出：
+    1. 去除首尾空白后的规范名称；两者均非空时取字符长度更长者，等长时优先目录全称 `full_name`。
+    用途：
+    1. 同板块编码（`880xxx`/`881xxx`）在原文与目录间统一名称口径。
+    边界条件：
+    1. 任一侧为空时返回另一侧；均为空时返回空串。
+    """
+    raw_text = str(raw_name or "").strip()
+    full_text = str(full_name or "").strip()
+    if not full_text:
+        return raw_text
+    if not raw_text:
+        return full_text
+    return full_text if len(full_text) >= len(raw_text) else raw_text
+
+
 def catalog_full_names(*raws: bytes) -> Dict[str, str]:
     """
     输入板块目录原文，输出板块代码到目录名称。
@@ -309,12 +332,12 @@ def catalog_full_names(*raws: bytes) -> Dict[str, str]:
     输入：
     1. raws: `tdxzs.cfg`、`tdxzs3.cfg` 的 GBK 字节，可缺省。
     输出：
-    1. `88xxxx -> 名称`。同一代码只保留第一次出现的名称。
+    1. `88xxxx -> 名称`。同一代码出现不同名称时保留字符长度更长者。
     用途：
-    1. 把 infoharbor 简称换成目录全称。
+    1. 把 infoharbor 简称对齐合并为更完整的目录名称。
     边界条件：
     1. 代码不是 `88` 加四位数字、或名称为空的行丢弃。
-    2. 同一代码若出现不同名称，保留先读到的名称。
+    2. 同一代码若出现等长不同名称，保留先读到的目录名称。
     """
     names: Dict[str, str] = {}
     for raw in raws:
@@ -323,42 +346,89 @@ def catalog_full_names(*raws: bytes) -> Dict[str, str]:
             if len(parts) < 2 or not parts[0]:
                 continue
             code = parts[1]
-            if _BLOCK_CODE.fullmatch(code) is None or code in names:
+            if _BLOCK_CODE.fullmatch(code) is None:
                 continue
-            names[code] = parts[0]
+            candidate = parts[0]
+            existing = names.get(code, "")
+            if not existing or len(candidate) > len(existing):
+                names[code] = candidate
     return names
 
 
 def prepare_concept_blocks_from_parsed(
     blocks: Sequence[dict], full_names: Dict[str, str]
 ) -> List[dict]:
-    """输入原文顺序的板块及目录全称，输出未合并成分的归属块。
+    """输入原文顺序的板块及目录全称，输出按同分类同编码合并并选长名后的归属块。
 
     输入：
-    1. blocks: 各来源解析出的板块，含 name、kind、codes。
+    1. blocks: 各来源解析出的板块，含 name、kind、block_code、codes。
     2. full_names: 板块代码到目录名称。
     输出：
-    1. 保留原文名称。目录全称与原文不同时再追加同成分的一条。
+    1. 同分类且同 `88xxxx` 编码的板块合并为一条，名称取字符长度更长者（等长时优先目录全称），成分按出现顺序去重合并。
     用途：
-    1. 股票归属按文件中的映射原样进入 `{names, map}`。
+    1. 股票归属按编码合并同义板块后进入 `{names, map}`。
     边界条件：
     1. 未知分类跳过，补充成分不进入。没有成分的板块不进入归属。
-    2. 不按板块代码或名称合并成分，也不按名称长短删板块。
+    2. 无编码板块不按编码合并；不同编码的板块即使成分相同或同名也不合并彼此的成分。
     """
     prepared: List[dict] = []
+    by_kind_code: Dict[Tuple[str, str], dict] = {}
+    seen_by_kind_code: Dict[Tuple[str, str], set] = {}
     for block in blocks:
-        if block.get("kind") not in BLOCK_KIND_NAMES:
+        kind = str(block.get("kind") or "").strip()
+        if kind not in BLOCK_KIND_NAMES:
             continue
-        if not block.get("codes"):
+        raw_codes = block.get("codes") or []
+        if not raw_codes:
             continue
-        prepared.append(block)
         raw_name = str(block.get("name") or "").strip()
         block_code = str(block.get("block_code") or "").strip()
-        full_name = str(full_names.get(block_code) or "").strip()
-        if full_name and full_name != raw_name:
-            alias = dict(block)
-            alias["name"] = full_name
-            prepared.append(alias)
+        if _BLOCK_CODE.fullmatch(block_code) is None:
+            block_code = ""
+        full_name = str(full_names.get(block_code) or "").strip() if block_code else ""
+        chosen_name = choose_longer_block_name(raw_name, full_name)
+        if not chosen_name:
+            continue
+        if not block_code:
+            item = dict(block)
+            item["name"] = chosen_name
+            item["kind"] = kind
+            item["block_code"] = ""
+            item["codes"] = list(raw_codes)
+            prepared.append(item)
+            continue
+        key = (kind, block_code)
+        target = by_kind_code.get(key)
+        if target is None:
+            dedup_codes: List[Tuple[int, str]] = []
+            seen: set = set()
+            for market, code in raw_codes:
+                pair = (int(market), str(code).strip())
+                if pair[1] not in seen:
+                    seen.add(pair[1])
+                    dedup_codes.append(pair)
+            target = {
+                "name": chosen_name,
+                "kind": kind,
+                "block_code": block_code,
+                "codes": dedup_codes,
+            }
+            by_kind_code[key] = target
+            seen_by_kind_code[key] = seen
+            prepared.append(target)
+        else:
+            if len(chosen_name) > len(target["name"]) or (
+                len(chosen_name) == len(target["name"])
+                and full_name
+                and chosen_name == full_name
+            ):
+                target["name"] = chosen_name
+            seen = seen_by_kind_code[key]
+            for market, code in raw_codes:
+                pair = (int(market), str(code).strip())
+                if pair[1] not in seen:
+                    seen.add(pair[1])
+                    target["codes"].append(pair)
     return prepared
 
 
@@ -368,12 +438,12 @@ def prepare_concept_blocks(
     zip_raw: bytes,
 ) -> List[dict]:
     """
-    输入三份命名文件，输出未合并成分的板块。
+    输入三份命名文件，输出按同分类同编码合并后的板块。
 
     输入：
     1. block_raw、hy_raw、zip_raw: 概念文件、行业归属和 zhb.zip。
     输出：
-    1. 板块列表。相同成分的不同名称都保留，同名板块不合并彼此的成分。
+    1. 板块列表。同分类同编码板块合并并取较长名称；不同编码板块不合并彼此的成分。
     用途：
     1. 概念函数和对照脚本共用这一条组装路径。
     边界条件：
@@ -410,9 +480,9 @@ def build_stock_concepts_from_named_files(
     边界条件：
     1. zip 缺少成员时该来源为空，其它来源仍参与。
     2. 不解析 `spblock.dat`。
-    3. 原文名称保留；目录全称不同时另外保留一条相同成分。
+    3. 同分类同 `88xxxx` 编码的板块合并为一条，名称取字符长度更长者（等长时优先目录全称）。
     4. 研究行业小类有名称时归入小类；小类名称不存在时归入上一级中类。
-    5. 成分相同的不同板块名都返回；板块名相同但成分不同时不合并成分。
+    5. 不同编码但成分相同的不同板块名都返回；不同编码但板块名相同时不合并成分。
     """
     return build_stock_concept_payload(
         prepare_concept_blocks(block_raw, hy_raw, zip_raw),
